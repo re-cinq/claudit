@@ -1,0 +1,3 @@
+- [x] Create todo.txt
+- [x] Add it to git
+- [x] Commit it

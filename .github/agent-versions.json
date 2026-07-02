@@ -1,0 +1,29 @@
+{
+  "agents": {
+    "claude-code": {
+      "package": "@anthropic-ai/claude-code",
+      "constraint": "~2.1",
+      "last-known-good": "2.1.138"
+    },
+    "copilot": {
+      "package": "@github/copilot",
+      "constraint": null,
+      "last-known-good": "1.0.44"
+    },
+    "gemini-cli": {
+      "package": "@google/gemini-cli",
+      "constraint": "~0.29",
+      "last-known-good": "0.29.7"
+    },
+    "opencode-ai": {
+      "package": "opencode-ai",
+      "constraint": null,
+      "last-known-good": "1.14.41"
+    },
+    "codex": {
+      "package": "@openai/codex",
+      "constraint": null,
+      "last-known-good": "0.130.0"
+    }
+  }
+}

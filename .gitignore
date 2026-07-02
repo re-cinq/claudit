@@ -1,0 +1,14 @@
+# Binary
+shiftlog
+
+# Claude Code local settings (user-specific permissions)
+.claude/settings.local.json
+
+# IDE
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+.shiftlog/

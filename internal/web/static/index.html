@@ -1,0 +1,1728 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shiftlog - Conversation History</title>
+    <style>
+        :root {
+            --bg-primary: #1a1a2e;
+            --bg-secondary: #16213e;
+            --bg-tertiary: #0f3460;
+            --text-primary: #e4e4e7;
+            --text-secondary: #a1a1aa;
+            --accent: #e94560;
+            --accent-hover: #ff6b6b;
+            --user-bg: #2d3748;
+            --assistant-bg: #1e293b;
+            --border-color: #374151;
+            --success: #10b981;
+            --warning: #f59e0b;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background-color: var(--bg-primary);
+            color: var(--text-primary);
+            height: 100vh;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* Nav bar */
+        .navbar {
+            display: flex;
+            align-items: center;
+            padding: 0 16px;
+            height: 48px;
+            background-color: var(--bg-secondary);
+            border-bottom: 1px solid var(--border-color);
+            flex-shrink: 0;
+        }
+
+        .navbar-brand {
+            font-size: 16px;
+            font-weight: 700;
+            color: var(--accent);
+            margin-right: 24px;
+        }
+
+        .navbar-tabs {
+            display: flex;
+            gap: 4px;
+        }
+
+        .navbar-tab {
+            background: none;
+            border: 1px solid transparent;
+            color: var(--text-secondary);
+            padding: 6px 14px;
+            border-radius: 4px;
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .navbar-tab:hover {
+            color: var(--text-primary);
+            background-color: var(--bg-tertiary);
+        }
+
+        .navbar-tab.active {
+            background-color: var(--bg-tertiary);
+            color: var(--text-primary);
+            border-color: var(--border-color);
+        }
+
+        .navbar-branch-indicator {
+            margin-left: auto;
+            font-size: 13px;
+            color: var(--text-secondary);
+            font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+        }
+
+        /* Overview container — scrollable viewport */
+        #overview-container {
+            flex: 1;
+            overflow: auto;
+            position: relative;
+        }
+
+        #overview-container.hidden { display: none; }
+        #detail-container.hidden { display: none; }
+
+        #overview-canvas {
+            padding: 0 24px 24px 24px;
+        }
+
+        /* Column headers — sticky while scrolling */
+        .column-headers {
+            display: flex;
+            gap: 0;
+            margin-bottom: 4px;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+            background-color: var(--bg-primary);
+            padding-top: 24px;
+        }
+
+        .col-header {
+            width: 200px;
+            min-width: 200px;
+            padding: 10px 16px;
+            text-align: center;
+            border-bottom: 2px solid var(--border-color);
+            cursor: pointer;
+        }
+
+        .col-header:hover {
+            background-color: var(--bg-secondary);
+        }
+
+        .col-header-name {
+            font-size: 14px;
+            font-weight: 600;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .col-header-name.current {
+            color: var(--accent);
+        }
+
+        .col-header-count {
+            font-size: 11px;
+            color: var(--text-secondary);
+            margin-top: 2px;
+        }
+
+        /* Commit grid */
+        .grid-wrapper {
+            position: relative;
+        }
+
+        .commit-grid {
+            display: grid;
+            gap: 0;
+        }
+
+        .grid-cell {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 3px 10px;
+        }
+
+        /* Scroll indicators — sticky at bottom of viewport */
+        .scroll-indicators {
+            position: sticky;
+            bottom: 0;
+            display: flex;
+            z-index: 10;
+            pointer-events: none;
+            background: linear-gradient(transparent, var(--bg-primary) 60%);
+            padding: 20px 0 8px 0;
+        }
+
+        .scroll-arrow {
+            width: 200px;
+            min-width: 200px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-secondary);
+            font-size: 13px;
+            opacity: 0;
+            transition: opacity 0.2s;
+            gap: 4px;
+        }
+
+        .scroll-arrow.visible {
+            opacity: 0.6;
+        }
+
+        /* Down-arrow hints in empty grid cells */
+        .grid-cell-hint {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-secondary);
+            font-size: 14px;
+            opacity: 0.12;
+        }
+
+        /* Commit box */
+        .commit-box {
+            width: 180px;
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-size: 11px;
+            line-height: 1.4;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            cursor: pointer;
+            position: relative;
+            z-index: 1;
+        }
+
+        .commit-box:hover {
+            filter: brightness(1.2);
+        }
+
+        .commit-box.has-conv {
+            border-width: 2px;
+            border-style: solid;
+        }
+
+        .commit-box.no-conv {
+            border-width: 1px;
+            border-style: solid;
+            opacity: 0.5;
+        }
+
+        .commit-box.no-conv:hover {
+            opacity: 0.75;
+        }
+
+        .commit-box-sha {
+            font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+            font-size: 10px;
+            opacity: 0.7;
+            margin-bottom: 2px;
+        }
+
+        .commit-box-msg {
+            overflow: hidden;
+            display: -webkit-box;
+            -webkit-line-clamp: 1;
+            -webkit-box-orient: vertical;
+        }
+
+        /* Detail container (existing layout) */
+        #detail-container {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }
+
+        /* Left Panel - Commit Graph */
+        .commit-panel {
+            width: 400px;
+            min-width: 300px;
+            background-color: var(--bg-secondary);
+            border-right: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+        }
+
+        .panel-header {
+            padding: 16px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .panel-header h2 {
+            font-size: 14px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-secondary);
+        }
+
+        .commit-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px;
+        }
+
+        .commit-item {
+            padding: 12px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            margin-bottom: 4px;
+        }
+
+        .commit-item:hover {
+            background-color: var(--bg-tertiary);
+        }
+
+        .commit-item.selected {
+            background-color: var(--bg-tertiary);
+            border-left: 3px solid var(--accent);
+        }
+
+        .commit-item.has-conversation {
+            position: relative;
+        }
+
+        .commit-item.has-conversation::before {
+            content: '';
+            position: absolute;
+            left: -8px;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 8px;
+            height: 8px;
+            background-color: var(--accent);
+            border-radius: 50%;
+        }
+
+        .commit-sha {
+            font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+            font-size: 12px;
+            color: var(--accent);
+            margin-bottom: 4px;
+        }
+
+        .commit-message {
+            font-size: 14px;
+            color: var(--text-primary);
+            margin-bottom: 4px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .commit-meta {
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 500;
+            background-color: var(--accent);
+            color: white;
+            margin-left: 8px;
+        }
+
+        /* Right Panel - Conversation Viewer */
+        .conversation-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background-color: var(--bg-primary);
+        }
+
+        .conversation-header {
+            padding: 16px 24px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .conversation-title {
+            font-size: 16px;
+            font-weight: 600;
+        }
+
+        .resume-btn {
+            background-color: var(--accent);
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .resume-btn:hover:not(:disabled) {
+            background-color: var(--accent-hover);
+        }
+
+        .resume-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .view-toggle {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-right: 16px;
+        }
+
+        .view-toggle-btn {
+            background-color: var(--bg-tertiary);
+            color: var(--text-secondary);
+            border: 1px solid var(--border-color);
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .view-toggle-btn:hover {
+            background-color: var(--bg-secondary);
+            color: var(--text-primary);
+        }
+
+        .view-toggle-btn.active {
+            background-color: var(--accent);
+            color: white;
+            border-color: var(--accent);
+        }
+
+        .incremental-info {
+            font-size: 12px;
+            color: var(--text-secondary);
+            padding: 8px 16px;
+            background-color: var(--bg-secondary);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .incremental-info .parent-link {
+            color: var(--accent);
+            cursor: pointer;
+        }
+
+        .incremental-info .parent-link:hover {
+            text-decoration: underline;
+        }
+
+        .conversation-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 24px;
+        }
+
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: var(--text-secondary);
+        }
+
+        .empty-state-icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+            opacity: 0.5;
+        }
+
+        .message {
+            margin-bottom: 24px;
+            padding: 16px;
+            border-radius: 8px;
+            max-width: 80%;
+        }
+
+        .message.user {
+            background-color: var(--user-bg);
+            margin-left: auto;
+        }
+
+        .message.assistant {
+            background-color: var(--assistant-bg);
+            border: 1px solid var(--border-color);
+        }
+
+        .message-role {
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 8px;
+            color: var(--text-secondary);
+        }
+
+        .message-content {
+            font-size: 14px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+
+        .message-content code {
+            background-color: rgba(0, 0, 0, 0.3);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+            font-size: 13px;
+        }
+
+        .message-content pre {
+            background-color: rgba(0, 0, 0, 0.3);
+            padding: 12px;
+            border-radius: 6px;
+            overflow-x: auto;
+            margin: 12px 0;
+        }
+
+        .message-content pre code {
+            background: none;
+            padding: 0;
+        }
+
+        .tool-use {
+            margin: 12px 0;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            overflow: hidden;
+        }
+
+        .tool-header {
+            background-color: var(--bg-tertiary);
+            padding: 8px 12px;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 13px;
+        }
+
+        .tool-header:hover {
+            background-color: var(--bg-secondary);
+        }
+
+        .tool-name {
+            font-weight: 500;
+            color: var(--accent);
+        }
+
+        .tool-content {
+            display: none;
+            padding: 12px;
+            background-color: rgba(0, 0, 0, 0.2);
+            font-size: 13px;
+            font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+            white-space: pre-wrap;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .tool-content.expanded {
+            display: block;
+        }
+
+        .tool-summary {
+            color: var(--text-secondary);
+            font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+            font-size: 12px;
+            margin-left: 12px;
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .tool-result {
+            margin: 12px 0;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            overflow: hidden;
+        }
+
+        .tool-result-header {
+            background-color: var(--bg-tertiary);
+            padding: 8px 12px;
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+
+        .tool-result-content {
+            padding: 12px;
+            background-color: rgba(0, 0, 0, 0.2);
+            font-size: 13px;
+            font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+            white-space: pre-wrap;
+            max-height: 300px;
+            overflow-y: auto;
+            color: var(--text-secondary);
+        }
+
+        .thinking-block {
+            margin: 8px 0;
+            border-left: 2px solid var(--border-color);
+            padding-left: 12px;
+        }
+
+        .thinking-header {
+            font-size: 12px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 4px;
+        }
+
+        .thinking-preview {
+            font-size: 13px;
+            color: var(--text-secondary);
+            font-style: italic;
+            white-space: pre-wrap;
+        }
+
+        .thinking-full {
+            display: none;
+            font-size: 13px;
+            color: var(--text-secondary);
+            font-style: italic;
+            white-space: pre-wrap;
+            margin-top: 8px;
+        }
+
+        .thinking-block.expanded .thinking-preview {
+            display: none;
+        }
+
+        .thinking-block.expanded .thinking-full {
+            display: block;
+        }
+
+        .thinking-block.expanded .toggle-icon {
+            transform: rotate(90deg);
+        }
+
+        .message.system {
+            background-color: var(--bg-tertiary);
+            border: 1px dashed var(--border-color);
+            opacity: 0.7;
+        }
+
+        .loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 40px;
+        }
+
+        .spinner {
+            width: 32px;
+            height: 32px;
+            border: 3px solid var(--border-color);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .status-message {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            padding: 12px 20px;
+            border-radius: 6px;
+            font-size: 14px;
+            animation: slideIn 0.3s ease;
+        }
+
+        .status-message.success {
+            background-color: var(--success);
+            color: white;
+        }
+
+        .status-message.error {
+            background-color: var(--accent);
+            color: white;
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateY(100px);
+                opacity: 0;
+            }
+            to {
+                transform: translateY(0);
+                opacity: 1;
+            }
+        }
+
+        /* Scrollbar styling */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg-secondary);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--border-color);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--text-secondary);
+        }
+
+        .conversation-meta {
+            display: none;
+            gap: 8px;
+            padding: 8px 16px;
+            border-bottom: 1px solid var(--border-color);
+            font-size: 12px;
+            color: var(--text-secondary);
+            align-items: center;
+        }
+
+        .conversation-meta.visible {
+            display: flex;
+        }
+
+        .meta-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 2px 8px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            font-size: 11px;
+        }
+
+        .meta-badge .meta-label {
+            color: var(--text-secondary);
+        }
+
+        .meta-badge .meta-value {
+            color: var(--text-primary);
+        }
+    </style>
+</head>
+<body>
+    <!-- Nav bar -->
+    <nav class="navbar">
+        <span class="navbar-brand">Shiftlog</span>
+        <div class="navbar-tabs" id="navbar-tabs">
+            <button class="navbar-tab active" id="nav-branches" onclick="switchView('overview')">Branches</button>
+        </div>
+        <span class="navbar-branch-indicator" id="branch-indicator"></span>
+    </nav>
+
+    <!-- Overview container (vertical columns) -->
+    <div id="overview-container">
+        <div id="overview-canvas">
+            <div id="overview-content">
+                <div class="loading">
+                    <div class="spinner"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Detail container (existing layout) -->
+    <div id="detail-container" class="hidden">
+        <div class="commit-panel">
+            <div class="panel-header">
+                <h2>Commits</h2>
+                <span id="commit-count"></span>
+            </div>
+            <div class="commit-list" id="commit-list">
+                <div class="loading">
+                    <div class="spinner"></div>
+                </div>
+            </div>
+        </div>
+        <div class="conversation-panel">
+            <div class="conversation-header">
+                <span class="conversation-title" id="conversation-title">Select a commit</span>
+                <div style="display: flex; align-items: center;">
+                    <div class="view-toggle" id="view-toggle" style="display: none;">
+                        <button class="view-toggle-btn active" id="incremental-btn" onclick="setViewMode('incremental')">This Commit</button>
+                        <button class="view-toggle-btn" id="full-btn" onclick="setViewMode('full')">Full Session</button>
+                    </div>
+                    <button class="resume-btn" id="resume-btn" disabled>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                        </svg>
+                        Resume Session
+                    </button>
+                </div>
+            </div>
+            <div class="conversation-meta" id="conversation-meta">
+                <span class="meta-badge" id="meta-agent" style="display: none;">
+                    <span class="meta-label">agent</span>
+                    <span class="meta-value" id="meta-agent-value"></span>
+                </span>
+                <span class="meta-badge" id="meta-model" style="display: none;">
+                    <span class="meta-label">model</span>
+                    <span class="meta-value" id="meta-model-value"></span>
+                </span>
+                <span class="meta-badge" id="meta-turns" style="display: none;">
+                    <span class="meta-label">turns</span>
+                    <span class="meta-value" id="meta-turns-value"></span>
+                </span>
+                <span class="meta-badge" id="meta-input-tokens" style="display: none;">
+                    <span class="meta-label">in</span>
+                    <span class="meta-value" id="meta-input-tokens-value"></span>
+                </span>
+                <span class="meta-badge" id="meta-output-tokens" style="display: none;">
+                    <span class="meta-label">out</span>
+                    <span class="meta-value" id="meta-output-tokens-value"></span>
+                </span>
+            </div>
+            <div class="incremental-info" id="incremental-info" style="display: none;">
+                <span id="incremental-info-text"></span>
+            </div>
+            <div class="conversation-content" id="conversation-content">
+                <div class="empty-state">
+                    <div class="empty-state-icon">&#x1F4AC;</div>
+                    <p>Select a commit with a conversation to view it</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let selectedCommit = null;
+        let commits = [];
+        let viewMode = 'incremental'; // 'incremental' or 'full'
+        let currentConversationData = null;
+        let currentView = 'overview'; // 'overview' or 'detail'
+        let currentBranch = null;
+        let branchData = [];
+
+        const LANE_COLORS = [
+            '#e94560', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6',
+            '#ec4899', '#06b6d4', '#84cc16', '#f97316', '#6366f1'
+        ];
+
+        // --- View switching ---
+
+        function switchView(view) {
+            currentView = view;
+            const overviewEl = document.getElementById('overview-container');
+            const detailEl = document.getElementById('detail-container');
+            const navBranches = document.getElementById('nav-branches');
+            const indicator = document.getElementById('branch-indicator');
+
+            if (view === 'overview') {
+                overviewEl.classList.remove('hidden');
+                detailEl.classList.add('hidden');
+                navBranches.classList.add('active');
+                indicator.textContent = '';
+                // Reset scroll position
+                const oc = document.getElementById('overview-container');
+                if (oc) { oc.scrollTop = 0; oc.scrollLeft = 0; }
+            } else {
+                overviewEl.classList.add('hidden');
+                detailEl.classList.remove('hidden');
+                navBranches.classList.remove('active');
+                indicator.textContent = currentBranch ? currentBranch : '';
+            }
+        }
+
+        function drillIntoBranch(branchName) {
+            currentBranch = branchName;
+            switchView('detail');
+            fetchCommitsForBranch(branchName);
+        }
+
+        function drillIntoCommit(branchName, sha) {
+            currentBranch = branchName;
+            switchView('detail');
+            fetchCommitsForBranch(branchName).then(() => {
+                selectCommit(sha);
+            });
+        }
+
+        function scrollToBranchStart(branchName) {
+            const selector = `.commit-box[data-branch="${CSS.escape(branchName)}"]`;
+            const box = document.querySelector(selector);
+            if (box) {
+                box.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                box.style.outline = '2px solid var(--accent)';
+                setTimeout(() => { box.style.outline = ''; }, 1500);
+            }
+        }
+
+        // --- Overview mode ---
+
+        async function fetchBranches() {
+            try {
+                const response = await fetch('/api/branches');
+                branchData = await response.json();
+                return branchData;
+            } catch (error) {
+                console.error('Failed to fetch branches:', error);
+                showStatus('Failed to load branches', 'error');
+                return [];
+            }
+        }
+
+        async function fetchBranchGraph() {
+            try {
+                const response = await fetch('/api/graph/branches?per_branch=30');
+                const data = await response.json();
+                renderOverview(data);
+            } catch (error) {
+                console.error('Failed to fetch branch graph:', error);
+                showStatus('Failed to load branch graph', 'error');
+            }
+        }
+
+        const COL_WIDTH = 200; // px per branch column
+        const ROW_HEIGHT = 76; // px per timeline row
+
+        // Topological sort: children before parents (newest at top).
+        // Unrelated commits sorted by date.
+        function topoSortNewestFirst(allNodes) {
+            const nodeMap = new Map();
+            for (const n of allNodes) nodeMap.set(n.sha, n);
+
+            // childrenOf[sha] = SHAs that list sha as a parent
+            const childrenOf = new Map();
+            for (const n of allNodes) {
+                for (const p of (n.parents || [])) {
+                    if (nodeMap.has(p)) {
+                        if (!childrenOf.has(p)) childrenOf.set(p, []);
+                        childrenOf.get(p).push(n.sha);
+                    }
+                }
+            }
+
+            // In-degree = number of children in our set
+            const inDeg = new Map();
+            for (const n of allNodes) {
+                inDeg.set(n.sha, (childrenOf.get(n.sha) || []).length);
+            }
+
+            // Start with branch tips (no children)
+            let queue = [];
+            for (const n of allNodes) {
+                if (inDeg.get(n.sha) === 0) queue.push(n.sha);
+            }
+            queue.sort((a, b) => new Date(nodeMap.get(b).date) - new Date(nodeMap.get(a).date));
+
+            const result = [];
+            while (queue.length > 0) {
+                const sha = queue.shift();
+                result.push(sha);
+                const node = nodeMap.get(sha);
+                for (const p of (node.parents || [])) {
+                    if (!inDeg.has(p)) continue;
+                    inDeg.set(p, inDeg.get(p) - 1);
+                    if (inDeg.get(p) === 0) queue.push(p);
+                }
+                // Re-sort to keep newest-first tie-breaking
+                queue.sort((a, b) => new Date(nodeMap.get(b).date) - new Date(nodeMap.get(a).date));
+            }
+            return result;
+        }
+
+        function renderOverview(graphData) {
+            const container = document.getElementById('overview-content');
+
+            if (!graphData.branches || graphData.branches.length === 0) {
+                container.innerHTML = '<div class="empty-state"><p>No branches found</p></div>';
+                return;
+            }
+
+            lastGraphData = graphData;
+
+            // 1. Build unified node map
+            const nodeMap = new Map();
+            for (const branch of graphData.branches) {
+                for (const node of branch.nodes) {
+                    if (!nodeMap.has(node.sha)) {
+                        nodeMap.set(node.sha, node);
+                    }
+                }
+            }
+
+            // 2. Topological sort (newest first)
+            const timeline = topoSortNewestFirst([...nodeMap.values()]);
+            const rowOf = new Map();
+            timeline.forEach((sha, idx) => rowOf.set(sha, idx));
+
+            const numCols = graphData.branches.length;
+            const numRows = timeline.length;
+
+            // 3. Column headers
+            const headersHtml = graphData.branches.map((branch, idx) => {
+                const color = LANE_COLORS[idx % LANE_COLORS.length];
+                const summary = branchData.find(b => b.name === branch.name);
+                const convCount = summary ? summary.conversation_count : 0;
+                const nameClass = branch.is_current ? 'col-header-name current' : 'col-header-name';
+                const branchNameAttr = escapeAttr(branch.name);
+                return `<div class="col-header" onclick="scrollToBranchStart('${branchNameAttr}')" style="border-bottom-color:${color}">
+                    <div class="${nameClass}">${escapeHtml(branch.name)}${branch.is_current ? ' *' : ''}</div>
+                    <div class="col-header-count">${convCount} conversation${convCount !== 1 ? 's' : ''}</div>
+                </div>`;
+            }).join('');
+
+            // 4. Grid cells — one per (branch, row) where branch has that commit
+            let cellsHtml = '';
+            for (const branch of graphData.branches) {
+                const colIdx = graphData.branches.indexOf(branch);
+                const color = LANE_COLORS[colIdx % LANE_COLORS.length];
+                const branchNameAttr = escapeAttr(branch.name);
+
+                for (const node of branch.nodes) {
+                    const row = rowOf.get(node.sha);
+                    const shortSha = node.sha.substring(0, 7);
+                    const hasConv = node.has_conversation;
+                    const cls = hasConv ? 'commit-box has-conv' : 'commit-box no-conv';
+                    const bg = hasConv ? color + '22' : 'transparent';
+                    const borderColor = hasConv ? color : color + '66';
+                    const textColor = hasConv ? 'var(--text-primary)' : 'var(--text-secondary)';
+
+                    cellsHtml += `<div class="grid-cell" style="grid-column:${colIdx + 1};grid-row:${row + 1}">
+                        <div class="${cls}" data-sha="${node.sha}" data-branch="${branchNameAttr}" data-col="${colIdx}" data-row="${row}" style="background:${bg};border-color:${borderColor};color:${textColor}" title="${escapeAttr(node.message)}" onclick="event.stopPropagation();drillIntoCommit('${branchNameAttr}','${node.sha}')">
+                            <div class="commit-box-sha" style="color:${color}">${shortSha}</div>
+                            <div class="commit-box-msg">${escapeHtml(node.message)}</div>
+                        </div>
+                    </div>`;
+                }
+            }
+
+            // 5. Down-arrow hints in empty cells where a commit exists below
+            for (const branch of graphData.branches) {
+                const colIdx = graphData.branches.indexOf(branch);
+                const occupiedRows = new Set(
+                    branch.nodes.map(n => rowOf.get(n.sha)).filter(r => r !== undefined)
+                );
+                if (occupiedRows.size === 0) continue;
+                const maxRow = Math.max(...occupiedRows);
+                for (let r = 0; r < maxRow; r++) {
+                    if (!occupiedRows.has(r)) {
+                        cellsHtml += `<div class="grid-cell-hint" style="grid-column:${colIdx + 1};grid-row:${r + 1}">&#x25BC;</div>`;
+                    }
+                }
+            }
+
+            // Build scroll indicator arrows (one per column)
+            const arrowsHtml = graphData.branches.map((branch, idx) => {
+                const ba = escapeAttr(branch.name);
+                return `<div class="scroll-arrow" data-col="${idx}" data-branch="${ba}">&#x25BC; more</div>`;
+            }).join('');
+
+            container.innerHTML = `
+                <div class="column-headers">${headersHtml}</div>
+                <div class="grid-wrapper">
+                    <div class="commit-grid" style="grid-template-columns:repeat(${numCols},${COL_WIDTH}px);grid-auto-rows:${ROW_HEIGHT}px">
+                        ${cellsHtml}
+                    </div>
+                    <svg class="grid-connectors" style="position:absolute;top:0;left:0;width:${numCols * COL_WIDTH}px;height:${numRows * ROW_HEIGHT}px;pointer-events:none;overflow:visible"></svg>
+                </div>
+                <div class="scroll-indicators" id="scroll-indicators">${arrowsHtml}</div>
+            `;
+
+            requestAnimationFrame(() => {
+                drawConnectors(graphData, rowOf);
+                setupScrollIndicators();
+            });
+        }
+
+        // --- Detail mode ---
+
+        async function fetchCommits() {
+            try {
+                const response = await fetch('/api/commits');
+                commits = await response.json();
+                renderCommits();
+            } catch (error) {
+                console.error('Failed to fetch commits:', error);
+                showStatus('Failed to load commits', 'error');
+            }
+        }
+
+        async function fetchCommitsForBranch(branchName) {
+            try {
+                const url = `/api/commits?branch=${encodeURIComponent(branchName)}`;
+                const response = await fetch(url);
+                commits = await response.json();
+                renderCommits();
+            } catch (error) {
+                console.error('Failed to fetch commits for branch:', error);
+                showStatus('Failed to load commits', 'error');
+            }
+        }
+
+        function renderCommits() {
+            const list = document.getElementById('commit-list');
+
+            if (!commits || commits.length === 0) {
+                list.innerHTML = '<div class="empty-state"><p>No commits found</p></div>';
+                return;
+            }
+
+            const conversationCount = commits.filter(c => c.has_conversation).length;
+            document.getElementById('commit-count').textContent = `${conversationCount} with conversations`;
+
+            list.innerHTML = commits.map(commit => `
+                <div class="commit-item ${commit.has_conversation ? 'has-conversation' : ''}"
+                     data-sha="${commit.sha}"
+                     onclick="selectCommit('${commit.sha}')">
+                    <div class="commit-sha">
+                        ${commit.sha.substring(0, 7)}
+                        ${commit.has_conversation ? `<span class="badge">${commit.message_count} msgs</span>` : ''}
+                        ${commit.effort && commit.effort.turns > 0 ? `<span class="badge" style="background-color: var(--bg-tertiary);">${commit.effort.turns} turns</span>` : ''}
+                    </div>
+                    <div class="commit-message">${escapeHtml(commit.message)}</div>
+                    <div class="commit-meta">${formatDate(commit.date)} by ${escapeHtml(commit.author)}</div>
+                </div>
+            `).join('');
+        }
+
+        async function selectCommit(sha) {
+            selectedCommit = sha;
+
+            // Update UI
+            document.querySelectorAll('.commit-item').forEach(el => {
+                el.classList.toggle('selected', el.dataset.sha === sha);
+            });
+
+            const commit = commits.find(c => c.sha === sha);
+            if (!commit) return;
+
+            document.getElementById('conversation-title').textContent =
+                `${commit.message.substring(0, 50)}${commit.message.length > 50 ? '...' : ''}`;
+
+            const resumeBtn = document.getElementById('resume-btn');
+            resumeBtn.disabled = !commit.has_conversation;
+
+            if (!commit.has_conversation) {
+                document.getElementById('conversation-meta').classList.remove('visible');
+                document.getElementById('conversation-content').innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-state-icon">&#x1F4ED;</div>
+                        <p>No conversation recorded for this commit</p>
+                    </div>
+                `;
+                return;
+            }
+
+            // Fetch conversation
+            await fetchConversation(sha, viewMode === 'incremental');
+        }
+
+        async function fetchConversation(sha, incremental) {
+            document.getElementById('conversation-content').innerHTML = `
+                <div class="loading"><div class="spinner"></div></div>
+            `;
+
+            try {
+                const url = incremental
+                    ? `/api/commits/${sha}?incremental=true`
+                    : `/api/commits/${sha}`;
+                const response = await fetch(url);
+                const data = await response.json();
+                currentConversationData = data;
+                renderConversation(data);
+                updateViewToggle(data);
+            } catch (error) {
+                console.error('Failed to fetch conversation:', error);
+                showStatus('Failed to load conversation', 'error');
+            }
+        }
+
+        function updateViewToggle(data) {
+            const toggle = document.getElementById('view-toggle');
+            const info = document.getElementById('incremental-info');
+            const infoText = document.getElementById('incremental-info-text');
+
+            // Show toggle if there's a parent conversation
+            const hasParent = data.parent_commit_sha && data.parent_commit_sha !== '';
+            toggle.style.display = hasParent ? 'flex' : 'none';
+
+            // Update toggle button states
+            document.getElementById('incremental-btn').classList.toggle('active', viewMode === 'incremental');
+            document.getElementById('full-btn').classList.toggle('active', viewMode === 'full');
+
+            // Show incremental info
+            if (data.is_incremental && hasParent) {
+                const parentSha = data.parent_commit_sha.substring(0, 7);
+                // Count only displayed entries (user/assistant messages, excluding tool results)
+                const displayedCount = countDisplayedMessages(data.transcript);
+                info.style.display = 'flex';
+                infoText.innerHTML = `Showing ${displayedCount} messages since <span class="parent-link" onclick="selectCommit('${data.parent_commit_sha}')">${parentSha}</span>`;
+            } else if (viewMode === 'full' && hasParent) {
+                info.style.display = 'flex';
+                const displayedCount = countDisplayedMessages(data.transcript);
+                infoText.textContent = `Showing full session (${displayedCount} messages)`;
+            } else {
+                info.style.display = 'none';
+            }
+        }
+
+        function setViewMode(mode) {
+            if (mode === viewMode) return;
+            viewMode = mode;
+            if (selectedCommit) {
+                fetchConversation(selectedCommit, mode === 'incremental');
+            }
+        }
+
+        function renderConversation(data) {
+            const content = document.getElementById('conversation-content');
+
+            // Update agent/model metadata badges
+            const metaBar = document.getElementById('conversation-meta');
+            const agentBadge = document.getElementById('meta-agent');
+            const modelBadge = document.getElementById('meta-model');
+            const agentVal = document.getElementById('meta-agent-value');
+            const modelVal = document.getElementById('meta-model-value');
+
+            const hasAgent = data.agent && data.agent !== '';
+            const hasModel = data.model && data.model !== '';
+            const effort = data.effort;
+            const hasTurns = effort && effort.turns > 0;
+            const hasInputTokens = effort && effort.input_tokens > 0;
+            const hasOutputTokens = effort && effort.output_tokens > 0;
+
+            agentBadge.style.display = hasAgent ? 'inline-flex' : 'none';
+            modelBadge.style.display = hasModel ? 'inline-flex' : 'none';
+
+            const turnsBadge = document.getElementById('meta-turns');
+            const inputTokensBadge = document.getElementById('meta-input-tokens');
+            const outputTokensBadge = document.getElementById('meta-output-tokens');
+
+            turnsBadge.style.display = hasTurns ? 'inline-flex' : 'none';
+            inputTokensBadge.style.display = hasInputTokens ? 'inline-flex' : 'none';
+            outputTokensBadge.style.display = hasOutputTokens ? 'inline-flex' : 'none';
+
+            metaBar.classList.toggle('visible', hasAgent || hasModel || hasTurns || hasInputTokens || hasOutputTokens);
+
+            if (hasAgent) agentVal.textContent = data.agent;
+            if (hasModel) modelVal.textContent = data.model;
+            if (hasTurns) document.getElementById('meta-turns-value').textContent = effort.turns;
+            if (hasInputTokens) document.getElementById('meta-input-tokens-value').textContent = formatTokenCount(effort.input_tokens);
+            if (hasOutputTokens) document.getElementById('meta-output-tokens-value').textContent = formatTokenCount(effort.output_tokens);
+
+            if (!data.transcript || data.transcript.length === 0) {
+                content.innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-state-icon">&#x1F4ED;</div>
+                        <p>Conversation is empty</p>
+                    </div>
+                `;
+                return;
+            }
+
+            content.innerHTML = data.transcript
+                .filter(entry => entry.type === 'user' || entry.type === 'assistant' || entry.type === 'system')
+                .map(entry => {
+                    if (entry.type === 'user') {
+                        return renderUserMessage(entry);
+                    } else if (entry.type === 'assistant') {
+                        return renderAssistantMessage(entry);
+                    } else if (entry.type === 'system') {
+                        return renderSystemMessage(entry);
+                    }
+                    return '';
+                }).filter(html => html !== '').join('');
+
+            // Add click handlers for tool toggles
+            content.querySelectorAll('.tool-header').forEach(header => {
+                header.addEventListener('click', () => {
+                    const toolContent = header.nextElementSibling;
+                    toolContent.classList.toggle('expanded');
+                    header.querySelector('.toggle-icon').textContent =
+                        toolContent.classList.contains('expanded') ? '\u25BC' : '\u25B6';
+                });
+            });
+        }
+
+        function renderUserMessage(entry) {
+            const content = entry.message?.content || [];
+
+            // Handle string content (first user message)
+            if (typeof entry.message?.content === 'string') {
+                return `
+                    <div class="message user">
+                        <div class="message-role">User</div>
+                        <div class="message-content">${formatContent(entry.message.content)}</div>
+                    </div>
+                `;
+            }
+
+            // Check if this is a tool result message
+            const toolResult = content.find(c => c.type === 'tool_result');
+            if (toolResult) {
+                return renderToolResult(toolResult);
+            }
+
+            // Regular user text message
+            const text = content.find(c => c.type === 'text')?.text || '';
+            if (!text) return '';
+
+            return `
+                <div class="message user">
+                    <div class="message-role">User</div>
+                    <div class="message-content">${formatContent(text)}</div>
+                </div>
+            `;
+        }
+
+        function renderAssistantMessage(entry) {
+            const content = entry.message?.content || [];
+            let html = '<div class="message assistant"><div class="message-role">Assistant</div>';
+
+            for (const block of content) {
+                if (block.type === 'text' && block.text) {
+                    html += `<div class="message-content">${formatContent(block.text)}</div>`;
+                } else if (block.type === 'thinking' && block.thinking) {
+                    html += renderThinking(block.thinking);
+                } else if (block.type === 'tool_use') {
+                    html += renderToolUse(block);
+                }
+            }
+
+            html += '</div>';
+            return html;
+        }
+
+        function renderThinking(thinking) {
+            const lines = thinking.split('\n');
+            const preview = lines.slice(0, 3).join('\n');
+            const hasMore = lines.length > 3;
+
+            return `
+                <div class="thinking-block">
+                    <div class="thinking-header" onclick="this.parentElement.classList.toggle('expanded')">
+                        <span>&#x1F4AD; Thinking</span>
+                        <span class="toggle-icon">${hasMore ? '\u25B6' : ''}</span>
+                    </div>
+                    <div class="thinking-preview">${escapeHtml(preview)}${hasMore ? '...' : ''}</div>
+                    ${hasMore ? `<div class="thinking-full">${escapeHtml(thinking)}</div>` : ''}
+                </div>
+            `;
+        }
+
+        function renderSystemMessage(entry) {
+            const content = entry.message?.content || [];
+            const text = typeof content === 'string' ? content :
+                         content.find(c => c.type === 'text')?.text || '';
+            if (!text) return '';
+
+            return `
+                <div class="message system">
+                    <div class="message-role">System</div>
+                    <div class="message-content">${formatContent(text)}</div>
+                </div>
+            `;
+        }
+
+        function renderToolUse(block) {
+            const input = block.input || {};
+            const summary = formatToolInput(block.name, input);
+            const fullInput = typeof input === 'string'
+                ? input
+                : JSON.stringify(input, null, 2);
+
+            return `
+                <div class="tool-use">
+                    <div class="tool-header">
+                        <span class="tool-name">&#x1F527; ${escapeHtml(block.name)}</span>
+                        <span class="tool-summary">${escapeHtml(summary)}</span>
+                        <span class="toggle-icon">\u25B6</span>
+                    </div>
+                    <div class="tool-content">${escapeHtml(fullInput)}</div>
+                </div>
+            `;
+        }
+
+        function formatToolInput(toolName, input) {
+            if (!input || typeof input === 'string') return '';
+
+            switch (toolName) {
+                case 'Bash':
+                    const cmd = input.command || '';
+                    // Show first line or truncate
+                    const firstLine = cmd.split('\n')[0];
+                    return firstLine.length > 60 ? firstLine.substring(0, 60) + '...' : firstLine;
+                case 'Write':
+                    return input.file_path || '';
+                case 'Read':
+                    return input.file_path || '';
+                case 'Edit':
+                    return input.file_path || '';
+                case 'Grep':
+                    return input.pattern ? `pattern: ${input.pattern}` : '';
+                case 'Glob':
+                    return input.pattern || '';
+                default:
+                    return '';
+            }
+        }
+
+        function renderToolResult(block) {
+            let content = block.content;
+
+            // Handle different content types
+            if (typeof content === 'object' && content !== null) {
+                // Array of content blocks
+                if (Array.isArray(content)) {
+                    content = content.map(c => c.text || '').join('\n');
+                } else {
+                    content = JSON.stringify(content, null, 2);
+                }
+            }
+
+            if (!content) return '';
+
+            // Truncate very long results
+            const lines = content.split('\n');
+            const truncated = lines.length > 20;
+            const displayContent = truncated ? lines.slice(0, 20).join('\n') + '\n...' : content;
+
+            return `
+                <div class="tool-result">
+                    <div class="tool-result-header">&#x1F4E4; Tool Result</div>
+                    <div class="tool-result-content">${escapeHtml(displayContent)}</div>
+                </div>
+            `;
+        }
+
+        async function resumeSession() {
+            if (!selectedCommit) return;
+
+            const resumeBtn = document.getElementById('resume-btn');
+            resumeBtn.disabled = true;
+            resumeBtn.innerHTML = '<div class="spinner" style="width:16px;height:16px;border-width:2px"></div> Resuming...';
+
+            try {
+                const response = await fetch(`/api/resume/${selectedCommit}`, {
+                    method: 'POST'
+                });
+
+                if (response.ok) {
+                    showStatus('Session resumed! Claude is starting...', 'success');
+                } else if (response.status === 409) {
+                    showStatus('Cannot resume: uncommitted changes in working directory', 'error');
+                } else {
+                    const data = await response.json();
+                    showStatus(data.error || 'Failed to resume session', 'error');
+                }
+            } catch (error) {
+                showStatus('Failed to resume session', 'error');
+            } finally {
+                resumeBtn.disabled = false;
+                resumeBtn.innerHTML = `
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                    </svg>
+                    Resume Session
+                `;
+            }
+        }
+
+        function showStatus(message, type) {
+            const existing = document.querySelector('.status-message');
+            if (existing) existing.remove();
+
+            const el = document.createElement('div');
+            el.className = `status-message ${type}`;
+            el.textContent = message;
+            document.body.appendChild(el);
+
+            setTimeout(() => el.remove(), 5000);
+        }
+
+        function formatContent(text) {
+            if (!text) return '';
+            // Basic markdown-like formatting
+            let html = escapeHtml(text);
+            // Code blocks
+            html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
+            // Inline code
+            html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+            return html;
+        }
+
+        function escapeHtml(text) {
+            if (!text) return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function escapeAttr(text) {
+            if (!text) return '';
+            return text.replace(/&/g, '&amp;').replace(/'/g, '&#39;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        function countDisplayedMessages(transcript) {
+            if (!transcript) return 0;
+            return transcript.filter(entry => {
+                if (entry.type === 'assistant') return true;
+                if (entry.type === 'user') {
+                    // Exclude tool result messages, count only actual user input
+                    const content = entry.message?.content;
+                    if (typeof content === 'string') return true;
+                    if (Array.isArray(content)) {
+                        return !content.some(c => c.type === 'tool_result');
+                    }
+                }
+                return false;
+            }).length;
+        }
+
+        function formatTokenCount(n) {
+            if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+            if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+            return String(n);
+        }
+
+        function formatDate(dateStr) {
+            const date = new Date(dateStr);
+            return date.toLocaleDateString('en-US', {
+                month: 'short',
+                day: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit'
+            });
+        }
+
+        // --- Initialize ---
+        async function init() {
+            document.getElementById('resume-btn').addEventListener('click', resumeSession);
+
+            const branches = await fetchBranches();
+            if (!branches || branches.length <= 1) {
+                // Single branch: skip overview, go straight to detail
+                currentBranch = (branches && branches.length === 1) ? branches[0].name : null;
+                switchView('detail');
+                if (currentBranch) {
+                    fetchCommitsForBranch(currentBranch);
+                } else {
+                    fetchCommits();
+                }
+                // Hide the branches tab for single-branch repos
+                document.getElementById('nav-branches').style.display = 'none';
+            } else {
+                switchView('overview');
+                fetchBranchGraph();
+            }
+        }
+
+        let lastGraphData = null;
+
+        // --- Draw connector lines (vertical within columns + horizontal fork lines) ---
+
+        function drawConnectors(graphData, rowOf) {
+            const svg = document.querySelector('.grid-connectors');
+            if (!svg) return;
+            svg.innerHTML = '';
+
+            const branches = graphData.branches || [];
+
+            // For each branch column, draw vertical lines between consecutive commits
+            branches.forEach((branch, colIdx) => {
+                const color = LANE_COLORS[colIdx % LANE_COLORS.length];
+                const x = colIdx * COL_WIDTH + COL_WIDTH / 2;
+
+                // Get this branch's commits sorted by row (newest first = lowest row number)
+                const rows = branch.nodes
+                    .map(n => rowOf.get(n.sha))
+                    .filter(r => r !== undefined)
+                    .sort((a, b) => a - b);
+
+                for (let i = 0; i < rows.length - 1; i++) {
+                    const r1 = rows[i];     // newer (higher up)
+                    const r2 = rows[i + 1]; // older (lower down)
+                    const y1 = r1 * ROW_HEIGHT + ROW_HEIGHT - 3; // bottom of newer cell
+                    const y2 = r2 * ROW_HEIGHT + 3;              // top of older cell
+
+                    // Vertical line from older toward newer
+                    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                    line.setAttribute('x1', x);
+                    line.setAttribute('y1', y2);
+                    line.setAttribute('x2', x);
+                    line.setAttribute('y2', y1);
+                    line.setAttribute('stroke', color);
+                    line.setAttribute('stroke-width', '2');
+                    line.setAttribute('stroke-opacity', '0.4');
+                    svg.appendChild(line);
+
+                    // Arrowhead pointing up (toward newer commit)
+                    const arrow = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                    arrow.setAttribute('d', `M ${x - 4} ${y1 + 7} L ${x} ${y1} L ${x + 4} ${y1 + 7}`);
+                    arrow.setAttribute('fill', 'none');
+                    arrow.setAttribute('stroke', color);
+                    arrow.setAttribute('stroke-width', '2');
+                    arrow.setAttribute('stroke-opacity', '0.5');
+                    arrow.setAttribute('stroke-linecap', 'round');
+                    arrow.setAttribute('stroke-linejoin', 'round');
+                    svg.appendChild(arrow);
+                }
+            });
+
+            // Fork connectors: from side of parent box to bottom of child's first unique commit
+            const BOX_HALF = 90; // half of 180px box width
+
+            branches.forEach((branch, colIdx) => {
+                if (!branch.fork_point) return;
+                const forkSHA = branch.fork_point.commit_sha;
+                const parentName = branch.fork_point.parent_branch;
+                const parentIdx = branches.findIndex(b => b.name === parentName);
+                if (parentIdx < 0) return;
+
+                const forkRow = rowOf.get(forkSHA);
+                if (forkRow === undefined) return;
+
+                const childColor = LANE_COLORS[colIdx % LANE_COLORS.length];
+                const parentCX = parentIdx * COL_WIDTH + COL_WIDTH / 2;
+                const childCX = colIdx * COL_WIDTH + COL_WIDTH / 2;
+
+                // Find the parent branch box at or nearest the fork row
+                const parentBranch = branches[parentIdx];
+                const parentNodeRows = parentBranch.nodes
+                    .map(n => rowOf.get(n.sha))
+                    .filter(r => r !== undefined)
+                    .sort((a, b) => a - b);
+                // Nearest parent box at or just above fork row
+                let startRow = forkRow;
+                const atOrAbove = parentNodeRows.filter(r => r <= forkRow);
+                if (atOrAbove.length > 0) {
+                    startRow = atOrAbove[atOrAbove.length - 1]; // largest row <= forkRow
+                } else if (parentNodeRows.length > 0) {
+                    startRow = parentNodeRows[parentNodeRows.length - 1];
+                }
+
+                // Find child's first unique commit (closest to fork, above fork row)
+                const childNodeRows = branch.nodes
+                    .map(n => rowOf.get(n.sha))
+                    .filter(r => r !== undefined)
+                    .sort((a, b) => a - b);
+                const uniqueAboveFork = childNodeRows.filter(r => r < forkRow);
+                let endRow;
+                if (uniqueAboveFork.length > 0) {
+                    endRow = uniqueAboveFork[uniqueAboveFork.length - 1]; // largest row < forkRow
+                } else if (childNodeRows.length > 0) {
+                    endRow = childNodeRows[0]; // fallback: topmost child commit
+                } else {
+                    return;
+                }
+
+                // Start: side of child box facing parent, at child's Y midpoint
+                const x1 = parentIdx < colIdx
+                    ? childCX - BOX_HALF    // parent is left, child's left edge
+                    : childCX + BOX_HALF;   // parent is right, child's right edge
+                const y1 = endRow * ROW_HEIGHT + ROW_HEIGHT / 2;
+
+                // End: center X of parent box, at its bottom
+                const x2 = parentCX;
+                const y2 = startRow * ROW_HEIGHT + ROW_HEIGHT - 3;
+
+                // L-path: horizontal from child side to parent center, vertical to parent bottom
+                const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                path.setAttribute('d', `M ${x1} ${y1} L ${x2} ${y1} L ${x2} ${y2}`);
+                path.setAttribute('fill', 'none');
+                path.setAttribute('stroke', childColor);
+                path.setAttribute('stroke-width', '2');
+                path.setAttribute('stroke-opacity', '0.4');
+                path.setAttribute('stroke-dasharray', '4 3');
+                svg.appendChild(path);
+            });
+        }
+
+        // --- Scroll indicators for overview columns ---
+
+        function setupScrollIndicators() {
+            const container = document.getElementById('overview-container');
+            if (!container || container._scrollSetup) return;
+            container._scrollSetup = true;
+            container.addEventListener('scroll', updateScrollIndicators);
+            updateScrollIndicators();
+        }
+
+        function updateScrollIndicators() {
+            const container = document.getElementById('overview-container');
+            const arrows = document.querySelectorAll('.scroll-arrow');
+            if (!container || !arrows.length) return;
+
+            const containerRect = container.getBoundingClientRect();
+
+            arrows.forEach(arrow => {
+                const branchName = arrow.dataset.branch;
+                const selector = `.commit-box[data-branch="${CSS.escape(branchName)}"]`;
+                const boxes = document.querySelectorAll(selector);
+
+                if (!boxes.length) {
+                    arrow.classList.remove('visible');
+                    return;
+                }
+
+                // Check if any commit box is below the visible area
+                let anyBelow = false;
+                for (const box of boxes) {
+                    if (box.getBoundingClientRect().top > containerRect.bottom) {
+                        anyBelow = true;
+                        break;
+                    }
+                }
+                arrow.classList.toggle('visible', anyBelow);
+            });
+        }
+
+        init();
+    </script>
+</body>
+</html>

@@ -1,0 +1,87 @@
+name: Check Agent Versions
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_test:
+        description: 'Force compatibility test even if no version changes'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  check-versions:
+    name: Poll npm for new agent versions
+    runs-on: ubuntu-latest
+    outputs:
+      has_new_versions: ${{ steps.check.outputs.has_new_versions }}
+      resolved_versions: ${{ steps.check.outputs.resolved_versions }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Check npm versions
+        id: check
+        run: |
+          python3 << 'PYEOF'
+          import json, subprocess, os
+
+          with open('.github/agent-versions.json') as f:
+              data = json.load(f)
+
+          versions = {}
+          has_new = False
+
+          for name, info in data['agents'].items():
+              pkg = info['package']
+              constraint = info.get('constraint')
+              known = info['last-known-good']
+
+              pkg_spec = f"{pkg}@{constraint}" if constraint else pkg
+              result = subprocess.run(
+                  ['npm', 'view', pkg_spec, 'version', '--json'],
+                  capture_output=True, text=True
+              )
+
+              raw = result.stdout.strip()
+              try:
+                  parsed = json.loads(raw)
+                  latest = parsed[-1] if isinstance(parsed, list) else parsed
+              except (json.JSONDecodeError, IndexError):
+                  latest = raw.strip('"')
+
+              if not latest:
+                  print(f"WARNING: Could not resolve version for {name} ({pkg_spec}), falling back to known-good")
+                  latest = known
+
+              versions[name] = latest
+              if latest != known:
+                  has_new = True
+                  print(f"New version detected: {name} {known} -> {latest}")
+              else:
+                  print(f"Unchanged: {name} {latest}")
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"has_new_versions={'true' if has_new else 'false'}\n")
+              f.write(f"resolved_versions={json.dumps(versions)}\n")
+          PYEOF
+
+  run-compat-test:
+    name: Run compatibility tests
+    needs: check-versions
+    if: needs.check-versions.outputs.has_new_versions == 'true' || github.event.inputs.force_test == 'true'
+    uses: ./.github/workflows/compat-test.yml
+    with:
+      versions: ${{ needs.check-versions.outputs.resolved_versions }}
+    secrets: inherit

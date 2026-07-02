@@ -1,0 +1,5 @@
+# Default platform for act (nektos/act) local testing
+-P ubuntu-latest=catthehacker/ubuntu:act-latest
+
+# Reuse containers for faster execution
+--reuse

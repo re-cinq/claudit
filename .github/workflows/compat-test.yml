@@ -1,0 +1,279 @@
+name: Agent Compatibility Test
+
+on:
+  workflow_call:
+    inputs:
+      versions:
+        description: 'JSON string mapping agent name to resolved version'
+        required: false
+        type: string
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: 'JSON string of resolved agent versions (leave empty to use npm latest)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  compat-test:
+    name: Install, test, and auto-fix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Resolve agent versions
+        id: resolve
+        env:
+          INPUT_VERSIONS: ${{ inputs.versions }}
+        run: |
+          python3 << 'PYEOF'
+          import json, subprocess, os
+
+          input_versions = os.environ.get('INPUT_VERSIONS', '').strip()
+
+          if input_versions:
+              versions = json.loads(input_versions)
+              print("Using provided versions:")
+          else:
+              print("No versions provided, resolving latest from npm:")
+              with open('.github/agent-versions.json') as f:
+                  data = json.load(f)
+              versions = {}
+              for name, info in data['agents'].items():
+                  pkg = info['package']
+                  constraint = info.get('constraint')
+                  pkg_spec = f"{pkg}@{constraint}" if constraint else pkg
+                  result = subprocess.run(
+                      ['npm', 'view', pkg_spec, 'version', '--json'],
+                      capture_output=True, text=True
+                  )
+                  raw = result.stdout.strip()
+                  try:
+                      parsed = json.loads(raw)
+                      latest = parsed[-1] if isinstance(parsed, list) else parsed
+                  except (json.JSONDecodeError, IndexError):
+                      latest = raw.strip('"')
+                  versions[name] = latest
+
+          for name, ver in versions.items():
+              print(f"  {name}: {ver}")
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"versions={json.dumps(versions)}\n")
+          PYEOF
+
+      - name: Install agent CLIs at resolved versions
+        env:
+          VERSIONS: ${{ steps.resolve.outputs.versions }}
+        run: |
+          python3 << 'PYEOF'
+          import json, subprocess, os
+
+          versions = json.loads(os.environ['VERSIONS'])
+
+          pkg_bases = {
+              'claude-code': '@anthropic-ai/claude-code',
+              'copilot': '@github/copilot',
+              'gemini-cli': '@google/gemini-cli',
+              'opencode-ai': 'opencode-ai',
+              'codex': '@openai/codex',
+          }
+
+          for name, pkg_base in pkg_bases.items():
+              version = versions.get(name)
+              pkg = f"{pkg_base}@{version}" if version else pkg_base
+              print(f"Installing {pkg}...")
+              subprocess.run(['npm', 'install', '-g', pkg], check=True)
+          PYEOF
+
+      - name: Authenticate Codex CLI
+        if: env.OPENAI_API_KEY != ''
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: printenv OPENAI_API_KEY | codex login --with-api-key
+
+      - name: Build shiftlog
+        run: CGO_ENABLED=0 go build -o shiftlog .
+
+      - name: Run integration tests
+        id: test
+        continue-on-error: true
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SHIFTLOG_BINARY: ${{ github.workspace }}/shiftlog
+        run: |
+          go test ./tests/integration/... -v -timeout 600s 2>&1 | tee /tmp/test-output.txt
+          exit ${PIPESTATUS[0]}
+
+      - name: Update last-known-good versions
+        if: steps.test.outcome == 'success'
+        env:
+          VERSIONS: ${{ steps.resolve.outputs.versions }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+
+          versions = json.loads(os.environ['VERSIONS'])
+
+          with open('.github/agent-versions.json') as f:
+              data = json.load(f)
+
+          for name, version in versions.items():
+              if name in data['agents']:
+                  data['agents'][name]['last-known-good'] = version
+                  print(f"Updated {name} -> {version}")
+
+          with open('.github/agent-versions.json', 'w') as f:
+              json.dump(data, f, indent=2)
+              f.write('\n')
+          PYEOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/agent-versions.json
+          git diff --staged --quiet && echo "No version changes to commit." || \
+            git commit -m "chore: update agent last-known-good versions [skip ci]"
+          git push origin HEAD
+
+      - name: Auto-fix via Claude
+        if: steps.test.outcome == 'failure'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSIONS: ${{ steps.resolve.outputs.versions }}
+        run: |
+          BRANCH="compat/fix-${GITHUB_SHA::8}-$(date +%s)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+
+          # Build the diagnosis prompt
+          cat > /tmp/fix-prompt.txt << 'PROMPTEOF'
+          You are fixing a Go compatibility issue in shiftlog, a CLI tool that integrates with AI coding agent CLIs.
+
+          The integration tests are failing. Test output:
+          PROMPTEOF
+
+          cat /tmp/test-output.txt >> /tmp/fix-prompt.txt
+
+          cat >> /tmp/fix-prompt.txt << 'PROMPTEOF'
+
+          Agent versions under test:
+          PROMPTEOF
+
+          echo "$VERSIONS" >> /tmp/fix-prompt.txt
+
+          cat >> /tmp/fix-prompt.txt << 'PROMPTEOF'
+
+          Review the Go source files in internal/agent/ and fix the compatibility issue.
+          For each file that needs modification, output it using this EXACT format:
+
+          === FILE: relative/path/to/file.go ===
+          <complete corrected file content>
+          === END FILE ===
+
+          Output ONLY the files that changed, in the format above. No explanation.
+          PROMPTEOF
+
+          # Ask Claude to generate a fix
+          echo "Running Claude auto-fix..."
+          claude --print "$(cat /tmp/fix-prompt.txt)" > /tmp/claude-fix.txt 2>/dev/null || true
+
+          # Apply Claude's output: extract files from structured output
+          python3 << 'PYEOF'
+          import re, os
+
+          try:
+              content = open('/tmp/claude-fix.txt').read()
+          except FileNotFoundError:
+              print("No Claude output to apply.")
+              raise SystemExit(0)
+
+          pattern = r'=== FILE: (.+?) ===\n(.*?)=== END FILE ==='
+          files_written = 0
+          for match in re.finditer(pattern, content, re.DOTALL):
+              path = match.group(1).strip()
+              file_content = match.group(2)
+              # Safety: only write .go files, no path traversal
+              if not path.endswith('.go') or '..' in path or path.startswith('/'):
+                  print(f"Skipping unsafe path: {path}")
+                  continue
+              dirpath = os.path.dirname(path)
+              if dirpath:
+                  os.makedirs(dirpath, exist_ok=True)
+              with open(path, 'w') as f:
+                  f.write(file_content)
+              print(f"Wrote {path}")
+              files_written += 1
+
+          print(f"Total files written: {files_written}")
+          PYEOF
+
+          # Commit and open PR if Claude made changes
+          git add -A
+          if git diff --staged --quiet; then
+            echo "Claude generated no file changes. Opening issue for manual triage."
+            FAILURE_SUMMARY=$(head -80 /tmp/test-output.txt 2>/dev/null || echo 'No output captured')
+            gh issue create \
+              --title "Agent compatibility failure requires manual fix" \
+              --body "## Automated fix could not be generated
+
+          **Agent versions tested:** \`$VERSIONS\`
+          **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          **Test failure summary:**
+          \`\`\`
+          $FAILURE_SUMMARY
+          \`\`\`
+
+          Please investigate and fix manually."
+          else
+            git commit -m "fix: restore agent CLI compatibility
+
+          Auto-generated by Claude. Agent versions: $VERSIONS
+          Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            git push origin "$BRANCH"
+
+            FAILURE_SUMMARY=$(head -80 /tmp/test-output.txt 2>/dev/null || echo 'No output captured')
+            gh pr create \
+              --title "fix: restore agent CLI compatibility" \
+              --body "## Agent Compatibility Fix
+
+          Automated fix generated by Claude for failing integration tests.
+
+          **Agent versions tested:** \`$VERSIONS\`
+          **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          **Test failure summary:**
+          \`\`\`
+          $FAILURE_SUMMARY
+          \`\`\`
+
+          🤖 Auto-generated by Claude via compat-test workflow" \
+              --head "$BRANCH" \
+              --base master
+          fi
+
+      - name: Fail job if tests failed
+        if: steps.test.outcome == 'failure'
+        run: |
+          echo "Integration tests failed. See above for auto-fix PR or issue."
+          exit 1
