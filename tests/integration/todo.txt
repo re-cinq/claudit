@@ -1,1 +1,2 @@
 - [x] Add todo list
+- [ ] Create a new task
