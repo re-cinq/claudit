@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -229,9 +230,74 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 	return &agent.Transcript{Entries: entries}, nil
 }
 
+// activeSessionFileName is where the shiftlog OpenCode plugin persists a
+// pointer to the most recently active session on every tool call (see
+// plugin.go). OpenCode's own on-disk session storage layout has changed
+// across releases (flat files, then SQLite, and beyond), so rather than
+// chasing each new layout we maintain our own bookkeeping file that does
+// not depend on OpenCode's internals at all.
+const activeSessionFileName = "opencode-active-session.json"
+
+// activeSessionRecord is the JSON structure written by the plugin template.
+type activeSessionRecord struct {
+	SessionID      string `json:"session_id"`
+	ProjectPath    string `json:"project_path"`
+	UpdatedAt      string `json:"updated_at"`
+	TranscriptData string `json:"transcript_data"`
+}
+
+// discoverFromActiveSessionFile reads the session pointer written by the
+// shiftlog OpenCode plugin. This is tried before any format-specific
+// discovery since it is independent of OpenCode's internal storage layout.
+func discoverFromActiveSessionFile(projectPath string) (*agent.SessionInfo, error) {
+	path := filepath.Join(projectPath, ".shiftlog", activeSessionFileName)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil
+	}
+
+	var record activeSessionRecord
+	if err := json.Unmarshal(data, &record); err != nil {
+		return nil, nil
+	}
+
+	if record.SessionID == "" {
+		return nil, nil
+	}
+
+	if updatedAt, err := time.Parse(time.RFC3339, record.UpdatedAt); err == nil {
+		if time.Since(updatedAt) > agent.RecentSessionTimeout {
+			return nil, nil
+		}
+	}
+
+	info := &agent.SessionInfo{
+		SessionID:   record.SessionID,
+		StartedAt:   record.UpdatedAt,
+		ProjectPath: projectPath,
+	}
+
+	if record.TranscriptData != "" {
+		info.TranscriptData = []byte(record.TranscriptData)
+	} else if msgDir, err := GetMessageDir(record.SessionID); err == nil {
+		info.TranscriptPath = msgDir
+	}
+
+	return info, nil
+}
+
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first tries the shiftlog plugin's own bookkeeping file (independent of
+// OpenCode's storage internals), then flat file storage (pre-v1.2), then
+// falls back to SQLite (v1.2+).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	// Try the pointer written by the shiftlog plugin first — it survives
+	// changes to OpenCode's own on-disk session format.
+	if session, err := discoverFromActiveSessionFile(projectPath); err == nil && session != nil {
+		return session, nil
+	}
+
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
@@ -497,4 +563,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
