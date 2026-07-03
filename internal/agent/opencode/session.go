@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -8,6 +9,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -73,6 +77,144 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// FindMessageDir locates the message directory for sessionID. It first tries
+// the conventional storage/message/<sessionID> path, then falls back to a
+// recursive search under the data directory in case a newer OpenCode
+// release nests message storage differently (e.g. under a project or
+// worktree subdirectory).
+func FindMessageDir(sessionID string) (string, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return "", err
+	}
+
+	direct := filepath.Join(dataDir, "storage", "message", sessionID)
+	if info, err := os.Stat(direct); err == nil && info.IsDir() {
+		return direct, nil
+	}
+
+	storageRoot := filepath.Join(dataDir, "storage")
+	var found string
+	_ = filepath.WalkDir(storageRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil || found != "" {
+			return nil
+		}
+		if d.IsDir() && d.Name() == sessionID {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+
+	if found != "" {
+		return found, nil
+	}
+
+	return direct, nil
+}
+
+// ScanAllSessionDirs scans every project directory under the session storage
+// root for the most recent session belonging to projectPath. It is used as a
+// fallback when GetProjectID's git-root-commit hash no longer matches how
+// OpenCode groups sessions on disk (e.g. after a storage layout change in a
+// newer release). It prefers a session whose recorded directory/path/cwd
+// field matches projectPath, and falls back to the single most recently
+// modified session across all projects when no field match is found.
+func ScanAllSessionDirs(projectPath string) (*agent.SessionInfo, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return nil, nil
+	}
+
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	projectDirs, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		return nil, nil
+	}
+
+	now := time.Now()
+	var bestSessionID string
+	var bestModTime time.Time
+	var bestMatched bool
+	found := false
+
+	for _, pd := range projectDirs {
+		if !pd.IsDir() {
+			continue
+		}
+		dir := filepath.Join(sessionRoot, pd.Name())
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			modTime := info.ModTime()
+			if now.Sub(modTime) > agent.RecentSessionTimeout {
+				continue
+			}
+
+			path := filepath.Join(dir, e.Name())
+			data, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+
+			var header struct {
+				ID        string `json:"id"`
+				Directory string `json:"directory"`
+				Path      string `json:"path"`
+				Cwd       string `json:"cwd"`
+				Worktree  string `json:"worktree"`
+			}
+			_ = json.Unmarshal(data, &header)
+
+			matched := header.Directory == projectPath || header.Path == projectPath ||
+				header.Cwd == projectPath || header.Worktree == projectPath
+
+			// Prefer field-matched sessions over unmatched ones; among
+			// sessions with the same match status, prefer the most recent.
+			if found {
+				if bestMatched && !matched {
+					continue
+				}
+				if bestMatched == matched && !modTime.After(bestModTime) {
+					continue
+				}
+			}
+
+			sessionID := header.ID
+			if sessionID == "" {
+				sessionID = strings.TrimSuffix(e.Name(), ".json")
+			}
+
+			bestSessionID = sessionID
+			bestModTime = modTime
+			bestMatched = matched
+			found = true
+		}
+	}
+
+	if !found {
+		return nil, nil
+	}
+
+	msgDir, _ := FindMessageDir(bestSessionID)
+
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: msgDir,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
@@ -127,3 +269,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
