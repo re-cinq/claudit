@@ -284,7 +284,7 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		}
 
 		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			bestSessionID = sessionIDFromFile(sessionDir, entry.Name())
 			bestModTime = modTime
 		}
 	}
@@ -302,6 +302,27 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// sessionIDFromFile resolves the canonical session ID for a discovered session
+// file. OpenCode's on-disk session filename is not always the session's "id"
+// field (e.g. the filename may use a different slug while messages are
+// stored under the internal id), so the file's own content takes precedence
+// over the filename whenever it can be read and parsed.
+func sessionIDFromFile(sessionDir, fileName string) string {
+	fallback := strings.TrimSuffix(fileName, ".json")
+
+	data, err := os.ReadFile(filepath.Join(sessionDir, fileName))
+	if err != nil {
+		return fallback
+	}
+
+	var parsed sessionInfo
+	if err := json.Unmarshal(data, &parsed); err != nil || parsed.ID == "" {
+		return fallback
+	}
+
+	return parsed.ID
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +518,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
