@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -252,42 +253,58 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
+//
+// OpenCode's on-disk project/session identifier scheme has changed across
+// versions, so instead of trusting our own computed project ID to locate the
+// right subdirectory (which silently finds nothing if it no longer matches),
+// this walks the entire session storage tree and picks the best candidate by
+// matching the working directory recorded inside each session's metadata,
+// falling back to recency alone when no such field is found.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
-	if err != nil {
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	if _, err := os.Stat(sessionRoot); err != nil {
 		return nil, nil
 	}
+
+	absProjectPath := resolvePath(projectPath)
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
 	var bestSessionID string
 	var bestModTime time.Time
+	var bestMatchesDir bool
 
-	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-
-		info, err := entry.Info()
-		if err != nil {
-			continue
+	_ = filepath.Walk(sessionRoot, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info.IsDir() || !strings.HasSuffix(info.Name(), ".json") {
+			return nil
 		}
 
 		modTime := info.ModTime()
 		if now.Sub(modTime) > recentTimeout {
-			continue
+			return nil
 		}
 
-		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
-			bestModTime = modTime
+		matchesDir := false
+		if data, err := os.ReadFile(path); err == nil {
+			matchesDir = sessionDirectoryMatches(data, absProjectPath)
 		}
-	}
+
+		better := bestSessionID == "" ||
+			(matchesDir && !bestMatchesDir) ||
+			(matchesDir == bestMatchesDir && modTime.After(bestModTime))
+
+		if better {
+			bestSessionID = strings.TrimSuffix(info.Name(), ".json")
+			bestModTime = modTime
+			bestMatchesDir = matchesDir
+		}
+		return nil
+	})
 
 	if bestSessionID == "" {
 		return nil, nil
@@ -302,6 +319,47 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// resolvePath returns an absolute, symlink-resolved form of p for path
+// comparison purposes. If resolution fails, it falls back to the best
+// available form rather than erroring.
+func resolvePath(p string) string {
+	abs := p
+	if a, err := filepath.Abs(p); err == nil {
+		abs = a
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return resolved
+	}
+	return abs
+}
+
+// sessionDirectoryMatches reports whether a session metadata JSON blob
+// records a working directory matching projectPath. The field name OpenCode
+// uses for this has varied across versions, so several candidates are
+// checked.
+func sessionDirectoryMatches(data []byte, projectPath string) bool {
+	var meta struct {
+		Directory   string `json:"directory"`
+		Path        string `json:"path"`
+		Cwd         string `json:"cwd"`
+		Worktree    string `json:"worktree"`
+		ProjectPath string `json:"projectPath"`
+	}
+	if json.Unmarshal(data, &meta) != nil {
+		return false
+	}
+
+	for _, candidate := range []string{meta.Directory, meta.Path, meta.Cwd, meta.Worktree, meta.ProjectPath} {
+		if candidate == "" {
+			continue
+		}
+		if resolvePath(candidate) == projectPath {
+			return true
+		}
+	}
+	return false
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +555,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
