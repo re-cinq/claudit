@@ -73,6 +73,15 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// GetProjectDBPath returns the path to OpenCode's project-local SQLite
+// database. Newer OpenCode releases store session data per-project in
+// <project>/.opencode/opencode.db rather than under the global XDG data
+// directory, mirroring where the shiftlog plugin itself is installed
+// (see .opencode/plugins/ in plugin.go).
+func GetProjectDBPath(projectPath string) string {
+	return filepath.Join(projectPath, ".opencode", "opencode.db")
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
