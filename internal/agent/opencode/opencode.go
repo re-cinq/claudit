@@ -316,24 +316,17 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
-	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+	sessionID := findRecentSQLiteSessionID(dbPath, projectID, projectPath)
+	if sessionID == "" {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
 		`SELECT time_updated FROM session WHERE id='%s';`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
+	cmd := exec.Command("sqlite3", dbPath, timeQuery)
 	timeOutput, err := cmd.Output()
 	if err == nil {
 		timeStr := strings.TrimSpace(string(timeOutput))
@@ -377,6 +370,48 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// findRecentSQLiteSessionID locates the most relevant session ID in OpenCode's
+// SQLite database. Newer OpenCode releases identify a project by its worktree
+// path via a separate "project" table rather than by the git-root-commit hash
+// this package computes, so a plain project_id match is tried first (for older
+// schemas), then a worktree-path join, and finally the most recently updated
+// session overall (still bounded by the caller's recency-timeout check) as a
+// last resort so a schema this code doesn't recognize doesn't hard-fail discovery.
+func findRecentSQLiteSessionID(dbPath, projectID, projectPath string) string {
+	if id := querySQLiteScalar(dbPath, fmt.Sprintf(
+		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
+		escapeSQLiteString(projectID),
+	)); id != "" {
+		return id
+	}
+
+	if id := querySQLiteScalar(dbPath, fmt.Sprintf(
+		`SELECT s.id FROM session s JOIN project p ON s.project_id = p.id WHERE p.worktree='%s' ORDER BY s.time_updated DESC LIMIT 1;`,
+		escapeSQLiteString(projectPath),
+	)); id != "" {
+		return id
+	}
+
+	return querySQLiteScalar(dbPath, `SELECT id FROM session ORDER BY time_updated DESC LIMIT 1;`)
+}
+
+// querySQLiteScalar runs a single-value SQLite query, returning "" on any
+// error (e.g. a missing table/column from a schema this code doesn't know
+// about) so callers can fall through to the next discovery strategy.
+func querySQLiteScalar(dbPath, query string) string {
+	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, query)
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+
+// escapeSQLiteString escapes single quotes for safe inclusion in a SQLite string literal.
+func escapeSQLiteString(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -497,4 +532,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
