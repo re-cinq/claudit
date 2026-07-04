@@ -252,19 +252,38 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
+//
+// Older OpenCode versions nest session files under a per-project subdirectory
+// named after the project ID (root commit hash). Newer versions have been
+// observed to change how sessions are keyed on disk while still embedding a
+// "projectID"/"directory" field in each session file, so if the per-project
+// subdirectory yields nothing we fall back to scanning the whole session
+// storage tree and matching on that embedded metadata instead.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	projectID := GetProjectID(projectPath)
 
-	dirEntries, err := os.ReadDir(sessionDir)
+	if info, _ := scanSessionDir(filepath.Join(sessionRoot, projectID), projectPath); info != nil {
+		return info, nil
+	}
+
+	return scanSessionTreeForProject(sessionRoot, projectID, projectPath)
+}
+
+// scanSessionDir scans a flat directory of session JSON files (one file per
+// session, named "<sessionID>.json") and returns the most recently modified
+// one within the recent-session timeout.
+func scanSessionDir(dir, projectPath string) (*agent.SessionInfo, error) {
+	dirEntries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, nil
+		return nil, err
 	}
 
 	now := time.Now()
-	recentTimeout := agent.RecentSessionTimeout
 	var bestSessionID string
 	var bestModTime time.Time
 
@@ -279,7 +298,7 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		}
 
 		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
 			continue
 		}
 
@@ -294,6 +313,75 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}
 
 	// The transcript path for OpenCode is the message directory
+	msgDir, _ := GetMessageDir(bestSessionID)
+
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: msgDir,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
+}
+
+// scanSessionTreeForProject recursively scans the session storage tree for
+// the most recently modified session belonging to the given project,
+// matching by the "projectID" or "directory" field embedded in each session
+// file rather than by directory nesting. This tolerates OpenCode versions
+// that no longer nest sessions under a per-project subdirectory named after
+// the project ID.
+func scanSessionTreeForProject(sessionRoot, projectID, projectPath string) (*agent.SessionInfo, error) {
+	now := time.Now()
+	var bestSessionID string
+	var bestModTime time.Time
+
+	_ = filepath.WalkDir(sessionRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return nil
+		}
+		if bestSessionID != "" && !modTime.After(bestModTime) {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		var session sessionInfo
+		if err := json.Unmarshal(data, &session); err != nil {
+			return nil
+		}
+
+		matches := (session.ProjectID != "" && session.ProjectID == projectID) ||
+			(session.Directory != "" && agent.PathsEqual(session.Directory, projectPath))
+		if !matches {
+			return nil
+		}
+
+		id := session.ID
+		if id == "" {
+			id = strings.TrimSuffix(d.Name(), ".json")
+		}
+
+		bestSessionID = id
+		bestModTime = modTime
+		return nil
+	})
+
+	if bestSessionID == "" {
+		return nil, nil
+	}
+
 	msgDir, _ := GetMessageDir(bestSessionID)
 
 	return &agent.SessionInfo{
@@ -497,4 +585,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
