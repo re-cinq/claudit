@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +129,121 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// ScanAllProjectDirs scans every bucket under the session storage root for
+// the most recently modified session file. Our GetSessionDir/GetProjectID
+// scheme assumes OpenCode buckets a project's sessions by a git-root-commit
+// hash, but OpenCode's own project directory encoding has changed across
+// releases (mirroring the same kind of hash/slug rename Gemini CLI went
+// through — see gemini/session.go's ScanAllProjectDirs). This fallback does
+// not depend on our own GetProjectID computation matching OpenCode's: it
+// walks every bucket directory (and tolerates a flat, non-bucketed layout
+// too) and prefers a session file whose recorded working directory matches
+// projectPath, falling back to the most recently modified session overall
+// if no file records a matching directory.
+func ScanAllProjectDirs(projectPath string) (*agent.SessionInfo, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return nil, nil
+	}
+
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	rootEntries, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		return nil, nil
+	}
+
+	var candidates []string
+	for _, entry := range rootEntries {
+		if entry.IsDir() {
+			bucketDir := filepath.Join(sessionRoot, entry.Name())
+			files, err := os.ReadDir(bucketDir)
+			if err != nil {
+				continue
+			}
+			for _, f := range files {
+				if !f.IsDir() && strings.HasSuffix(f.Name(), ".json") {
+					candidates = append(candidates, filepath.Join(bucketDir, f.Name()))
+				}
+			}
+			continue
+		}
+		if strings.HasSuffix(entry.Name(), ".json") {
+			candidates = append(candidates, filepath.Join(sessionRoot, entry.Name()))
+		}
+	}
+
+	now := time.Now()
+	var bestPath string
+	var bestModTime time.Time
+	haveMatch := false
+
+	for _, path := range candidates {
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			continue
+		}
+
+		data, _ := os.ReadFile(path)
+		matches := sessionFileMatchesProject(data, projectPath)
+
+		switch {
+		case matches && !haveMatch:
+			bestPath, bestModTime, haveMatch = path, modTime, true
+		case matches == haveMatch:
+			if bestPath == "" || modTime.After(bestModTime) {
+				bestPath, bestModTime = path, modTime
+			}
+		}
+	}
+
+	if bestPath == "" {
+		return nil, nil
+	}
+
+	bestSessionID := strings.TrimSuffix(filepath.Base(bestPath), ".json")
+
+	msgDir, _ := GetMessageDir(bestSessionID)
+
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: msgDir,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
+}
+
+// sessionFileMatchesProject reports whether a session JSON file's recorded
+// working directory matches projectPath. OpenCode has used different field
+// names for this across releases, so several common keys are checked.
+func sessionFileMatchesProject(data []byte, projectPath string) bool {
+	if len(data) == 0 {
+		return false
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return false
+	}
+
+	for _, key := range []string{"directory", "cwd", "path", "projectPath", "root", "worktree"} {
+		raw, ok := fields[key]
+		if !ok {
+			continue
+		}
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil || value == "" {
+			continue
+		}
+		if agent.PathsEqual(value, projectPath) {
+			return true
+		}
+	}
+	return false
 }
