@@ -304,10 +304,28 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
+// sqliteHasColumn reports whether the given table in the SQLite database has
+// a column with the given name. OpenCode's SQLite schema (table and column
+// names) has changed across releases, so callers must probe before relying
+// on a column that isn't guaranteed to exist.
+func sqliteHasColumn(dbPath, table, column string) bool {
+	query := fmt.Sprintf(
+		`SELECT COUNT(*) FROM pragma_table_info('%s') WHERE name='%s';`,
+		table, column,
+	)
+	cmd := exec.Command("sqlite3", dbPath, query)
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == "1"
+}
+
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+	dbInfo, err := os.Stat(dbPath)
+	if err != nil {
 		return nil, nil
 	}
 
@@ -316,9 +334,18 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
+	// Gate recency on the database file's mtime rather than a specific
+	// timestamp column: OpenCode has renamed/dropped timestamp columns
+	// across releases, but every session/message write touches the file.
+	if time.Since(dbInfo.ModTime()) > agent.RecentSessionTimeout {
+		return nil, nil
+	}
+
+	// Find the most recent session for this project. rowid ordering reflects
+	// insertion order without depending on a timestamp column name that may
+	// no longer exist.
 	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
+		`SELECT id FROM session WHERE project_id='%s' ORDER BY rowid DESC LIMIT 1;`,
 		projectID,
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
@@ -328,36 +355,38 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	}
 	sessionID := strings.TrimSpace(string(sessionOutput))
 
-	// Check if this session was recent (within timeout)
-	timeQuery := fmt.Sprintf(
-		`SELECT time_updated FROM session WHERE id='%s';`,
-		sessionID,
-	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
-	timeOutput, err := cmd.Output()
-	if err == nil {
-		timeStr := strings.TrimSpace(string(timeOutput))
-		if t, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02T15:04:05.000Z", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02 15:04:05", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
+	// The message table's foreign key and id columns have varied across
+	// OpenCode releases; probe before building the query instead of assuming
+	// the legacy "session_id"/"id" naming.
+	sessionFKCol := ""
+	for _, candidate := range []string{"session_id", "sessionID", "sessionId"} {
+		if sqliteHasColumn(dbPath, "message", candidate) {
+			sessionFKCol = candidate
+			break
 		}
-		// If we can't parse the time, proceed anyway — better to try than skip
 	}
+	hasIDCol := sqliteHasColumn(dbPath, "message", "id")
 
-	// Get messages for this session as a JSON array
-	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
-	)
+	var msgQuery string
+	switch {
+	case sessionFKCol != "" && hasIDCol:
+		msgQuery = fmt.Sprintf(
+			`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE %s='%s' ORDER BY rowid;`,
+			sessionFKCol, sessionID,
+		)
+	case sessionFKCol != "":
+		msgQuery = fmt.Sprintf(
+			`SELECT json_group_array(data) FROM message WHERE %s='%s' ORDER BY rowid;`,
+			sessionFKCol, sessionID,
+		)
+	default:
+		// No dedicated foreign key column found; fall back to matching the
+		// session id embedded in the message JSON payload itself.
+		msgQuery = fmt.Sprintf(
+			`SELECT json_group_array(data) FROM message WHERE data LIKE '%%%s%%' ORDER BY rowid;`,
+			sessionID,
+		)
+	}
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
 	if err != nil {
@@ -497,4 +526,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
