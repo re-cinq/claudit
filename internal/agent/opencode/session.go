@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -50,6 +51,19 @@ func GetProjectID(projectPath string) string {
 		return strings.TrimSpace(lines[0])
 	}
 	return "global"
+}
+
+// sanitizedProjectSlug returns a directory-name-safe form of an absolute
+// path, matching the convention some agent CLIs use to key per-project
+// storage (e.g. "/home/user/repo" -> "-home-user-repo"). OpenCode has used
+// this scheme as an alternative to a git root-commit-hash project ID.
+func sanitizedProjectSlug(path string) string {
+	if path == "" {
+		return ""
+	}
+	slug := strings.ReplaceAll(path, string(filepath.Separator), "-")
+	slug = strings.ReplaceAll(slug, "_", "-")
+	return slug
 }
 
 // GetSessionDir returns the session storage directory for a project.
@@ -127,3 +141,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
