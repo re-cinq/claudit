@@ -304,6 +304,42 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
+// sqliteQueryRetries and sqliteQueryRetryDelay bound how long discoverFromSQLite
+// waits for OpenCode's SQLite writes to become visible. OpenCode's CLI process
+// can exit slightly before its session/message rows are flushed and checkpointed
+// (e.g. a background plugin server closing its DB connection asynchronously),
+// so a query issued immediately after the process exits can race the write and
+// see nothing. Newer OpenCode releases made this window noticeably wider, which
+// is why a manual git commit made right after a session ends can miss the data.
+const (
+	sqliteQueryRetries    = 6
+	sqliteQueryRetryDelay = 500 * time.Millisecond
+)
+
+// querySQLiteWithRetry runs a sqlite3 query against dbPath, retrying while the
+// result is empty (per isEmpty) or the query errors, up to sqliteQueryRetries
+// times with sqliteQueryRetryDelay between attempts.
+func querySQLiteWithRetry(dbPath, query string, isEmpty func(output string) bool) (string, error) {
+	var lastErr error
+	for attempt := 0; attempt < sqliteQueryRetries; attempt++ {
+		cmd := exec.Command("sqlite3", dbPath, query)
+		out, err := cmd.Output()
+		if err == nil {
+			output := strings.TrimSpace(string(out))
+			if !isEmpty(output) {
+				return output, nil
+			}
+		} else {
+			lastErr = err
+		}
+
+		if attempt < sqliteQueryRetries-1 {
+			time.Sleep(sqliteQueryRetryDelay)
+		}
+	}
+	return "", lastErr
+}
+
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
@@ -316,24 +352,25 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
+	// Find most recent session for this project, retrying briefly since
+	// OpenCode may still be flushing its SQLite writes when this runs.
 	sessionQuery := fmt.Sprintf(
 		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
 		projectID,
 	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+	sessionID, _ := querySQLiteWithRetry(dbPath, sessionQuery, func(out string) bool {
+		return out == ""
+	})
+	if sessionID == "" {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
 		`SELECT time_updated FROM session WHERE id='%s';`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
+	cmd := exec.Command("sqlite3", dbPath, timeQuery)
 	timeOutput, err := cmd.Output()
 	if err == nil {
 		timeStr := strings.TrimSpace(string(timeOutput))
@@ -353,22 +390,21 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
 
-	// Get messages for this session as a JSON array
+	// Get messages for this session as a JSON array, retrying briefly since
+	// message rows can be written just after the session row is visible.
 	msgQuery := fmt.Sprintf(
 		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, msgQuery)
-	msgOutput, err := cmd.Output()
-	if err != nil {
+	transcriptStr, err := querySQLiteWithRetry(dbPath, msgQuery, func(out string) bool {
+		// sqlite3 returns "[null]" when no rows match
+		return out == "" || out == "[null]" || out == "[]"
+	})
+	if err != nil || transcriptStr == "" {
 		return nil, nil
 	}
 
-	transcriptData := []byte(strings.TrimSpace(string(msgOutput)))
-	// sqlite3 returns "[null]" when no rows match
-	if string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
-		return nil, nil
-	}
+	transcriptData := []byte(transcriptStr)
 
 	return &agent.SessionInfo{
 		SessionID:      sessionID,
@@ -497,4 +533,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
