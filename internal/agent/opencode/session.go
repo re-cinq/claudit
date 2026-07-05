@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -35,9 +36,18 @@ func GetDataDir() (string, error) {
 }
 
 // GetProjectID returns the project identifier for OpenCode.
-// For git repos, this is the root commit hash. For non-git dirs, it's "global".
+// For git repos, this is the root commit hash of the current branch (HEAD).
+// For non-git dirs, it's "global".
+//
+// This intentionally resolves the root commit of HEAD rather than "--all" refs.
+// OpenCode CLI creates its own internal checkpoint/snapshot ref (a loose ref
+// with no shared history with the project, e.g. ".git/opencode") as a side
+// effect of running. Once that ref exists, "--max-parents=0 --all" returns
+// multiple, unordered root commits, making the computed project ID unstable
+// between the time OpenCode writes its session data and the time shiftlog
+// looks it up via the post-commit hook.
 func GetProjectID(projectPath string) string {
-	cmd := exec.Command("git", "rev-list", "--max-parents=0", "--all")
+	cmd := exec.Command("git", "rev-list", "--max-parents=0", "HEAD")
 	cmd.Dir = projectPath
 	output, err := cmd.Output()
 	if err != nil {
@@ -127,3 +137,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
