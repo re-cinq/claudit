@@ -3,11 +3,13 @@ package opencode
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +128,116 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// findRecentSession recursively walks dataDir/storage/session looking for the
+// most recently modified session within timeout. Newer OpenCode releases have
+// repeatedly reshuffled how sessions are laid out on disk (flat "<id>.json"
+// files directly under a project folder vs. per-session subdirectories like
+// "<id>/info.json"), so rather than hardcoding one exact shape this walks the
+// whole tree and infers the session ID from whichever level looks like a
+// leaf. When requireMatch is true, only sessions that appear to belong to
+// projectID/projectPath (by directory name or by a directory/cwd/worktree/
+// projectID field embedded in the JSON) are considered; when false, the
+// single most recently modified session anywhere is used as a last resort.
+func findRecentSession(dataDir, projectID, projectPath string, timeout time.Duration, requireMatch bool) (sessionID string, modTime time.Time, found bool) {
+	root := filepath.Join(dataDir, "storage", "session")
+	now := time.Now()
+
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		modified := info.ModTime()
+		if now.Sub(modified) > timeout {
+			return nil
+		}
+
+		parentDir := filepath.Dir(path)
+		parentName := filepath.Base(parentDir)
+
+		var id string
+		if parentName == projectID || parentName == "session" {
+			// Flat layout: storage/session/<projectID>/<sessionID>.json
+			id = strings.TrimSuffix(d.Name(), ".json")
+		} else {
+			// Nested layout: storage/session/<projectID>/<sessionID>/<file>.json
+			id = parentName
+		}
+
+		if requireMatch && !sessionBelongsToProject(path, parentName, projectID, projectPath) {
+			return nil
+		}
+
+		if !found || modified.After(modTime) {
+			sessionID, modTime, found = id, modified, true
+		}
+		return nil
+	})
+
+	return sessionID, modTime, found
+}
+
+// sessionBelongsToProject checks whether a session file is scoped to the
+// given project, either via a path component matching projectID or via a
+// directory/cwd/worktree/projectID field embedded in the JSON itself.
+func sessionBelongsToProject(path, parentName, projectID, projectPath string) bool {
+	if parentName == projectID {
+		return true
+	}
+	for _, part := range strings.Split(filepath.ToSlash(filepath.Dir(path)), "/") {
+		if part == projectID {
+			return true
+		}
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+
+	var meta struct {
+		Directory string `json:"directory"`
+		Cwd       string `json:"cwd"`
+		Worktree  string `json:"worktree"`
+		ProjectID string `json:"projectID"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return false
+	}
+
+	for _, v := range []string{meta.Directory, meta.Cwd, meta.Worktree} {
+		if v != "" && v == projectPath {
+			return true
+		}
+	}
+	return meta.ProjectID != "" && meta.ProjectID == projectID
+}
+
+// findMessageDirFallback recursively searches dataDir/storage/message for a
+// directory named after sessionID, for layouts that nest messages one level
+// deeper (e.g. under a project-scoped subfolder) than the flat
+// "storage/message/<sessionID>" path.
+func findMessageDirFallback(dataDir, sessionID string) (string, bool) {
+	root := filepath.Join(dataDir, "storage", "message")
+	var result string
+
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || result != "" {
+			return nil
+		}
+		if d.IsDir() && d.Name() == sessionID {
+			result = path
+			return filepath.SkipDir
+		}
+		return nil
+	})
+
+	return result, result != ""
 }
