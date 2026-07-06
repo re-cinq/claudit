@@ -252,13 +252,22 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
+//
+// OpenCode's project-ID scheme (currently: root git commit hash, or "global"
+// for non-git dirs) has changed across releases before, so rather than only
+// looking inside the single directory GetProjectID computes, we scan every
+// project directory under session storage. A session whose stored
+// "directory" field matches projectPath is preferred; otherwise we fall back
+// to the most recently modified session across all project directories.
+// This mirrors the ScanAllProjectDirs fallback used for the Gemini agent.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	projectDirs, err := os.ReadDir(sessionRoot)
 	if err != nil {
 		return nil, nil
 	}
@@ -267,25 +276,54 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	recentTimeout := agent.RecentSessionTimeout
 	var bestSessionID string
 	var bestModTime time.Time
+	var bestMatchesDir bool
 
-	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+	for _, pd := range projectDirs {
+		if !pd.IsDir() {
 			continue
 		}
 
-		info, err := entry.Info()
+		dir := filepath.Join(sessionRoot, pd.Name())
+		dirEntries, err := os.ReadDir(dir)
 		if err != nil {
 			continue
 		}
 
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
+		for _, entry := range dirEntries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
 
-		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
-			bestModTime = modTime
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+
+			modTime := info.ModTime()
+			if now.Sub(modTime) > recentTimeout {
+				continue
+			}
+
+			matchesDir := false
+			if data, err := os.ReadFile(filepath.Join(dir, entry.Name())); err == nil {
+				var header sessionInfo
+				if json.Unmarshal(data, &header) == nil && header.Directory == projectPath {
+					matchesDir = true
+				}
+			}
+
+			// A session confirmed to belong to this project (via its
+			// "directory" field) always outranks one that isn't confirmed,
+			// regardless of recency.
+			better := bestSessionID == "" ||
+				(matchesDir && !bestMatchesDir) ||
+				(matchesDir == bestMatchesDir && modTime.After(bestModTime))
+
+			if better {
+				bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+				bestModTime = modTime
+				bestMatchesDir = matchesDir
+			}
 		}
 	}
 
@@ -497,4 +535,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
