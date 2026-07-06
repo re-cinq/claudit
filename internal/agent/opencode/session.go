@@ -1,12 +1,15 @@
+```go
 package opencode
 
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 )
 
@@ -127,3 +130,84 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+
+// findSessionFiles recursively collects every JSON file under root, sorted
+// from most to least recently modified. It skips descending into any
+// directory named "message" or "part" so that only session-record files are
+// considered. OpenCode has changed how it nests session files across
+// versions (a per-project directory vs. a shared "info" directory), so we
+// search broadly instead of assuming one fixed layout.
+func findSessionFiles(root string) []string {
+	var files []string
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if d.Name() == "message" || d.Name() == "part" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(d.Name(), ".json") {
+			files = append(files, path)
+		}
+		return nil
+	})
+
+	sort.Slice(files, func(i, j int) bool {
+		iInfo, iErr := os.Stat(files[i])
+		jInfo, jErr := os.Stat(files[j])
+		if iErr != nil || jErr != nil {
+			return false
+		}
+		return iInfo.ModTime().After(jInfo.ModTime())
+	})
+
+	return files
+}
+
+// findMessageDir searches dataDir's storage tree for a message directory
+// belonging to sessionID, regardless of whether it lives directly under
+// "storage/message/<id>" (older layout) or nested under
+// "storage/session/message/<id>" (newer layout).
+func findMessageDir(dataDir, sessionID string) string {
+	root := filepath.Join(dataDir, "storage")
+	var found string
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || found != "" {
+			return nil
+		}
+		if d.IsDir() && d.Name() == sessionID && filepath.Base(filepath.Dir(path)) == "message" {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
+}
+
+// jsonStringField extracts a string value for key from a raw JSON object,
+// returning "" if the key is absent or not a string.
+func jsonStringField(raw map[string]json.RawMessage, key string) string {
+	v, ok := raw[key]
+	if !ok {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(v, &s); err != nil {
+		return ""
+	}
+	return s
+}
+
+// firstNonEmpty returns the first non-empty string among values.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+```
