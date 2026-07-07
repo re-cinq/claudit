@@ -230,9 +230,9 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first tries flat file storage, then falls back to SQLite.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
+	// Try flat file storage first
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
 		return nil, err
@@ -241,7 +241,7 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
+	// Fall back to SQLite
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
@@ -251,43 +251,87 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 	return discoverFromSQLite(dataDir, projectID, projectPath)
 }
 
-// discoverFromFlatFiles tries the legacy flat file session discovery.
+// discoverFromFlatFiles tries the flat file session discovery.
+//
+// OpenCode's on-disk layout for session JSON files has changed across
+// versions (e.g. project-partitioned directories vs. a flat directory with
+// a "directory"/"projectID" field inside each session file). Rather than
+// assuming one exact layout, this walks the whole session storage tree and
+// matches candidate files either by an embedded field or by the legacy
+// project-partitioned directory naming, so discovery keeps working across
+// layout changes.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
-	if err != nil {
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	if _, err := os.Stat(sessionRoot); err != nil {
 		return nil, nil
 	}
+
+	absProjectPath, err := filepath.Abs(projectPath)
+	if err != nil {
+		absProjectPath = projectPath
+	}
+	projectID := GetProjectID(projectPath)
+	partitionSegment := string(filepath.Separator) + projectID + string(filepath.Separator)
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
 	var bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-
-		info, err := entry.Info()
-		if err != nil {
-			continue
+	_ = filepath.Walk(sessionRoot, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info == nil || info.IsDir() || !strings.HasSuffix(info.Name(), ".json") {
+			return nil
 		}
 
 		modTime := info.ModTime()
 		if now.Sub(modTime) > recentTimeout {
-			continue
+			return nil
+		}
+
+		sessionID := strings.TrimSuffix(info.Name(), ".json")
+
+		// Legacy layout: session files partitioned under a <projectID> directory.
+		matched := false
+		if projectID != "" && projectID != "global" && strings.Contains(path, partitionSegment) {
+			matched = true
+		}
+
+		// Newer layout: flat files carrying a "directory"/"projectID" field.
+		if !matched {
+			if data, readErr := os.ReadFile(path); readErr == nil {
+				var sess sessionInfo
+				if json.Unmarshal(data, &sess) == nil {
+					switch {
+					case sess.Directory != "" && sess.Directory == absProjectPath:
+						matched = true
+					case sess.Directory != "" && sess.Directory == projectPath:
+						matched = true
+					case sess.ProjectID != "" && sess.ProjectID == projectID:
+						matched = true
+					}
+					if sess.ID != "" {
+						sessionID = sess.ID
+					}
+				}
+			}
+		}
+
+		if !matched {
+			return nil
 		}
 
 		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
-	}
+
+		return nil
+	})
 
 	if bestSessionID == "" {
 		return nil, nil
@@ -306,8 +350,22 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
-	dbPath := filepath.Join(dataDir, "opencode.db")
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+	// The SQLite database file name/location has varied across OpenCode
+	// versions, so probe a few known candidates rather than assuming
+	// "opencode.db" is the only possibility.
+	var dbPath string
+	for _, candidate := range []string{
+		filepath.Join(dataDir, "opencode.db"),
+		filepath.Join(dataDir, "storage", "opencode.db"),
+		filepath.Join(dataDir, "storage.db"),
+		filepath.Join(dataDir, "storage"),
+	} {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			dbPath = candidate
+			break
+		}
+	}
+	if dbPath == "" {
 		return nil, nil
 	}
 
@@ -497,4 +555,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
