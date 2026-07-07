@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -241,14 +242,45 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
-	dataDir, err := GetDataDir()
-	if err != nil {
-		return nil, nil
+	// Fall back to SQLite (OpenCode v1.2+). Newer OpenCode releases have moved
+	// session state out of the XDG data directory and into the XDG state
+	// directory, and may key sessions by working directory rather than a
+	// git-derived project ID, so we try each known data directory location
+	// and let discoverFromSQLite fall back across matching strategies.
+	projectID := GetProjectID(projectPath)
+
+	for _, dataDir := range sqliteDataDirCandidates() {
+		session, err := discoverFromSQLite(dataDir, projectID, projectPath)
+		if err != nil {
+			return nil, err
+		}
+		if session != nil {
+			return session, nil
+		}
 	}
 
-	projectID := GetProjectID(projectPath)
-	return discoverFromSQLite(dataDir, projectID, projectPath)
+	return nil, nil
+}
+
+// sqliteDataDirCandidates returns the directories to search for OpenCode's
+// SQLite database, in priority order. OpenCode has moved session state
+// between the XDG data directory and the XDG state directory across
+// releases, so both are checked to remain compatible across versions.
+func sqliteDataDirCandidates() []string {
+	var dirs []string
+	if d, err := GetDataDir(); err == nil {
+		dirs = append(dirs, d)
+	}
+
+	if runtime.GOOS != "darwin" {
+		if xdgState := os.Getenv("XDG_STATE_HOME"); xdgState != "" {
+			dirs = append(dirs, filepath.Join(xdgState, "opencode"))
+		} else if home, err := os.UserHomeDir(); err == nil {
+			dirs = append(dirs, filepath.Join(home, ".local", "state", "opencode"))
+		}
+	}
+
+	return dirs
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -316,24 +348,40 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
+	querySessionID := func(query string) string {
+		cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, query)
+		output, err := cmd.Output()
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(string(output))
+	}
+
+	// Find most recent session for this project. Older OpenCode releases key
+	// sessions by a git-derived project ID; newer releases have been observed
+	// to key sessions by their working directory instead, so fall back to
+	// matching on "directory" when the project_id lookup comes up empty.
+	sessionID := querySessionID(fmt.Sprintf(
 		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
 		projectID,
-	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+	))
+	if sessionID == "" {
+		escapedPath := strings.ReplaceAll(projectPath, "'", "''")
+		sessionID = querySessionID(fmt.Sprintf(
+			`SELECT id FROM session WHERE directory='%s' ORDER BY time_updated DESC LIMIT 1;`,
+			escapedPath,
+		))
+	}
+	if sessionID == "" {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
 		`SELECT time_updated FROM session WHERE id='%s';`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
+	cmd := exec.Command("sqlite3", dbPath, timeQuery)
 	timeOutput, err := cmd.Output()
 	if err == nil {
 		timeStr := strings.TrimSpace(string(timeOutput))
@@ -497,4 +545,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
