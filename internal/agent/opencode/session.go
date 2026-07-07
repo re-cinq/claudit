@@ -70,7 +70,25 @@ func GetMessageDir(sessionID string) (string, error) {
 		return "", err
 	}
 
-	return filepath.Join(dataDir, "storage", "message", sessionID), nil
+	return resolveMessageDir(dataDir, sessionID), nil
+}
+
+// resolveMessageDir picks the on-disk location of a session's messages.
+// OpenCode historically stored messages under a top-level "message" directory
+// (storage/message/<sessionID>), but newer releases (seen with opencode-ai
+// 1.17.x) nest it under "session" instead (storage/session/message/<sessionID>).
+// Prefer whichever actually exists on disk, falling back to the legacy layout
+// so behavior is unchanged when neither path exists yet (e.g. synthetic
+// fixtures in tests).
+func resolveMessageDir(dataDir, sessionID string) string {
+	legacy := filepath.Join(dataDir, "storage", "message", sessionID)
+	nested := filepath.Join(dataDir, "storage", "session", "message", sessionID)
+
+	if info, err := os.Stat(nested); err == nil && info.IsDir() {
+		return nested
+	}
+
+	return legacy
 }
 
 // sessionInfo represents an OpenCode session JSON file.
