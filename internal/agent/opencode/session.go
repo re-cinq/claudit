@@ -3,11 +3,15 @@ package opencode
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +130,142 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// scanRecord is the subset of fields used to sniff an arbitrary JSON file
+// under OpenCode's data directory: is it a session-info record or a message
+// record, and which project/session does it belong to. OpenCode's on-disk
+// layout (path nesting, project ID scheme) has changed across releases, so
+// discovery below matches on record content instead of a fixed directory
+// structure.
+type scanRecord struct {
+	ID        string `json:"id"`
+	Role      string `json:"role"`
+	Type      string `json:"type"`
+	SessionID string `json:"sessionID"`
+	Session   string `json:"session_id"`
+	Directory string `json:"directory"`
+	Path      string `json:"path"`
+	Worktree  string `json:"worktree"`
+	CWD       string `json:"cwd"`
+}
+
+func (r scanRecord) isMessage() bool {
+	return r.Role != "" || r.Type != ""
+}
+
+func (r scanRecord) matchesProject(projectPath string) bool {
+	for _, candidate := range []string{r.Directory, r.Path, r.Worktree, r.CWD} {
+		if candidate != "" && agent.PathsEqual(candidate, projectPath) {
+			return true
+		}
+	}
+	return false
+}
+
+// scanForSession walks the entire OpenCode data directory looking for a
+// recent session-info record, without assuming any particular directory
+// nesting or project ID scheme. This is a fallback for when the known flat
+// file and SQLite layouts (see discoverFromFlatFiles / discoverFromSQLite in
+// opencode.go) don't match what the installed OpenCode version actually
+// writes to disk.
+func scanForSession(dataDir, projectPath string) (*agent.SessionInfo, error) {
+	info, err := os.Stat(dataDir)
+	if err != nil || !info.IsDir() {
+		return nil, nil
+	}
+
+	now := time.Now()
+	recentTimeout := agent.RecentSessionTimeout
+
+	var bestSessionID string
+	var bestModTime time.Time
+	var bestMatched bool
+
+	_ = filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		fi, err := d.Info()
+		if err != nil || now.Sub(fi.ModTime()) > recentTimeout {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		var rec scanRecord
+		if json.Unmarshal(data, &rec) != nil || rec.ID == "" || rec.isMessage() {
+			return nil
+		}
+
+		matched := rec.matchesProject(projectPath)
+		modTime := fi.ModTime()
+
+		if bestSessionID == "" || (matched && !bestMatched) || (matched == bestMatched && modTime.After(bestModTime)) {
+			bestSessionID = rec.ID
+			bestModTime = modTime
+			bestMatched = matched
+		}
+		return nil
+	})
+
+	if bestSessionID == "" {
+		return nil, nil
+	}
+
+	transcriptData := gatherMessagesForSession(dataDir, bestSessionID)
+
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptData: transcriptData,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
+}
+
+// gatherMessagesForSession walks the data directory collecting any message
+// records that reference sessionID, either via an explicit session ID field
+// or by living in a directory named after the session. Matching by content
+// (rather than a fixed path) makes discovery resilient to layout changes.
+func gatherMessagesForSession(dataDir, sessionID string) []byte {
+	var messages []json.RawMessage
+
+	_ = filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		var rec scanRecord
+		if json.Unmarshal(data, &rec) != nil || !rec.isMessage() {
+			return nil
+		}
+
+		belongsToSession := rec.SessionID == sessionID || rec.Session == sessionID ||
+			filepath.Base(filepath.Dir(path)) == sessionID
+		if !belongsToSession {
+			return nil
+		}
+
+		messages = append(messages, json.RawMessage(append([]byte{}, data...)))
+		return nil
+	})
+
+	if len(messages) == 0 {
+		return nil
+	}
+
+	out, err := json.Marshal(messages)
+	if err != nil {
+		return nil
+	}
+	return out
 }
