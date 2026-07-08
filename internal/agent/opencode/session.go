@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -73,6 +74,48 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// storageLayout describes one generation of OpenCode's on-disk session
+// storage: a directory containing per-session JSON files, plus a way to
+// derive the message directory for a session found in that layout.
+type storageLayout struct {
+	sessionDir    string
+	messageDirFor func(sessionID string) string
+}
+
+// nestedLayouts returns the per-project ("project/<id>/storage/...") layout
+// candidates used by newer OpenCode releases, keyed off of the given
+// storage base directory (dataDir/project/<id>/storage).
+func nestedLayouts(storageBase string) []storageLayout {
+	messageDirFor := func(sessionID string) string {
+		return filepath.Join(storageBase, "session", "message", sessionID)
+	}
+	return []storageLayout{
+		// OpenCode versions that key session metadata under an "info" subdir.
+		{sessionDir: filepath.Join(storageBase, "session", "info"), messageDirFor: messageDirFor},
+		// OpenCode versions that store session JSON directly under "session".
+		{sessionDir: filepath.Join(storageBase, "session"), messageDirFor: messageDirFor},
+	}
+}
+
+// storageLayouts returns all known OpenCode storage layouts to probe for a
+// given project: the legacy flat layout (pre-v1.2, "storage/session/<projectID>")
+// first since it was the first verified layout, followed by the newer
+// per-project nested layouts introduced in later releases. OpenCode's
+// on-disk format has changed across releases (see .github/agent-versions.json
+// for the pinned last-known-good version), so DiscoverSession must tolerate
+// drift instead of assuming a single fixed path.
+func storageLayouts(dataDir, projectID string) []storageLayout {
+	layouts := []storageLayout{
+		{
+			sessionDir: filepath.Join(dataDir, "storage", "session", projectID),
+			messageDirFor: func(sessionID string) string {
+				return filepath.Join(dataDir, "storage", "message", sessionID)
+			},
+		},
+	}
+	return append(layouts, nestedLayouts(filepath.Join(dataDir, "project", projectID, "storage"))...)
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
@@ -127,3 +170,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
