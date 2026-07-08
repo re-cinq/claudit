@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -230,8 +231,20 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+//
+// OpenCode's own on-disk session storage is not public API and has changed
+// across versions (flat JSON files pre-v1.2, SQLite in some later releases,
+// and so on) — hard-coding any one layout is fragile and breaks silently on
+// upgrade. Instead we prefer the shiftlog plugin's own transcript cache
+// (written via OpenCode's live SDK client on every tool call, see plugin.go),
+// which is stable regardless of how OpenCode itself stores sessions. The
+// legacy on-disk scanners are kept as a best-effort fallback for setups where
+// the plugin hasn't run yet.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	if session, err := discoverFromShiftlogCache(projectPath); err == nil && session != nil {
+		return session, nil
+	}
+
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
@@ -249,6 +262,57 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 
 	projectID := GetProjectID(projectPath)
 	return discoverFromSQLite(dataDir, projectID, projectPath)
+}
+
+// shiftlogCacheFile is where the OpenCode plugin caches the most recent
+// session transcript (see cacheSessionTranscript in plugin.go).
+const shiftlogCacheFile = "opencode-session.json"
+
+// cachedOpenCodeSession is the JSON shape written by the plugin's
+// cacheSessionTranscript helper.
+type cachedOpenCodeSession struct {
+	SessionID   string          `json:"session_id"`
+	ProjectPath string          `json:"project_path"`
+	UpdatedAt   string          `json:"updated_at"`
+	Transcript  json.RawMessage `json:"transcript"`
+}
+
+// discoverFromShiftlogCache reads the transcript cache the shiftlog plugin
+// maintains at .shiftlog/opencode-session.json. This is refreshed on every
+// tool call during a live OpenCode session, so its own mtime (rather than
+// anything inside OpenCode's internal storage) tells us whether the session
+// is still recent.
+func discoverFromShiftlogCache(projectPath string) (*agent.SessionInfo, error) {
+	cachePath := filepath.Join(projectPath, ".shiftlog", shiftlogCacheFile)
+
+	info, err := os.Stat(cachePath)
+	if err != nil {
+		return nil, nil
+	}
+	if time.Since(info.ModTime()) > agent.RecentSessionTimeout {
+		return nil, nil
+	}
+
+	data, err := os.ReadFile(cachePath)
+	if err != nil {
+		return nil, nil
+	}
+
+	var cached cachedOpenCodeSession
+	if err := json.Unmarshal(data, &cached); err != nil {
+		return nil, nil
+	}
+	if cached.SessionID == "" || len(cached.Transcript) == 0 {
+		return nil, nil
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      cached.SessionID,
+		TranscriptPath: "",
+		StartedAt:      cached.UpdatedAt,
+		ProjectPath:    projectPath,
+		TranscriptData: cached.Transcript,
+	}, nil
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -454,7 +518,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +560,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```

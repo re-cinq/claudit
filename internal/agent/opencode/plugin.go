@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -22,6 +23,41 @@ const pluginTemplate = `// shiftlog plugin for OpenCode CLI
 export const ShiftlogPlugin = async ({ directory, client }) => {
   const pendingCommits = new Map();
 
+  // Caches the live session transcript to .shiftlog/opencode-session.json after
+  // every tool call, via OpenCode's SDK client. This lets a later *manual*
+  // git commit (one the agent didn't make itself) still be attributed to this
+  // session, without shiftlog needing to reverse-engineer OpenCode's internal
+  // on-disk session storage format, which isn't public API and has changed
+  // across versions.
+  const cacheSessionTranscript = async (sessionID) => {
+    if (!client || !sessionID) return;
+    try {
+      const msgs = await client.session.messages({ path: { id: sessionID } });
+      if (!msgs || !Array.isArray(msgs)) return;
+      const transcript = msgs.map(m => ({
+        role: m.role || "",
+        id: m.id || "",
+        content: m.content || "",
+        time: m.time || {},
+      }));
+      const fs = await import("fs");
+      const path = await import("path");
+      const shiftlogDir = path.join(directory, ".shiftlog");
+      fs.mkdirSync(shiftlogDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(shiftlogDir, "opencode-session.json"),
+        JSON.stringify({
+          session_id: sessionID,
+          project_path: directory,
+          updated_at: new Date().toISOString(),
+          transcript,
+        })
+      );
+    } catch (e) {
+      // Best-effort cache; never disrupt the session over this.
+    }
+  };
+
   return {
     "tool.execute.before": async (input, output) => {
       const command = output?.args?.command || output?.args?.cmd || "";
@@ -35,6 +71,8 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
     },
 
     "tool.execute.after": async (input, output) => {
+      await cacheSessionTranscript(input.sessionID);
+
       const pending = pendingCommits.get(input.callID);
       if (!pending) return;
       pendingCommits.delete(input.callID);
@@ -125,3 +163,4 @@ func HasPlugin(repoRoot string) bool {
 	_, err := os.Stat(pluginPath)
 	return err == nil
 }
+```
