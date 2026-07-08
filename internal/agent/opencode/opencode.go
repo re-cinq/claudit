@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -7,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -304,7 +306,17 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
-// discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
+// discoverFromSQLite queries the OpenCode SQLite database for the most recent
+// session belonging to this project.
+//
+// OpenCode's SQLite schema is not guaranteed to expose typed SQL columns for
+// fields like the project id or timestamps (recent versions keep most fields
+// inside a JSON blob column, similar to how the message table already stores
+// its payload in a "data" column). Querying a column that doesn't exist
+// causes sqlite3 to exit non-zero, which previously made discovery silently
+// return nothing. To stay resilient across schema changes, rows are pulled
+// generically via `sqlite3 -json` and inspected in Go instead of relying on
+// specific SQL column names.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
@@ -316,67 +328,226 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
-	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+	sessions, err := sqliteJSONRows(dbPath, "session", "sessions")
+	if err != nil || len(sessions) == 0 {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
-	// Check if this session was recent (within timeout)
-	timeQuery := fmt.Sprintf(
-		`SELECT time_updated FROM session WHERE id='%s';`,
-		sessionID,
+	var (
+		bestID   string
+		bestTime time.Time
+		found    bool
 	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
-	timeOutput, err := cmd.Output()
-	if err == nil {
-		timeStr := strings.TrimSpace(string(timeOutput))
-		if t, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02T15:04:05.000Z", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02 15:04:05", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
+
+	for _, row := range sessions {
+		if !rowMatchesProject(row, projectID, projectPath) {
+			continue
 		}
-		// If we can't parse the time, proceed anyway — better to try than skip
+		id, _ := row["id"].(string)
+		if id == "" {
+			continue
+		}
+		t := rowTimestamp(row, "time_updated", "timeUpdated", "updated", "time", "time_created", "timeCreated", "created")
+		if !found || t.After(bestTime) {
+			bestID, bestTime, found = id, t, true
+		}
 	}
 
-	// Get messages for this session as a JSON array
-	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
-	)
-	cmd = exec.Command("sqlite3", dbPath, msgQuery)
-	msgOutput, err := cmd.Output()
+	if !found {
+		return nil, nil
+	}
+
+	// Check if this session was recent (within timeout). If we couldn't
+	// determine a timestamp at all, proceed anyway — better to try than skip.
+	if !bestTime.IsZero() && time.Since(bestTime) > agent.RecentSessionTimeout {
+		return nil, nil
+	}
+
+	messages, err := sqliteJSONRows(dbPath, "message", "messages")
 	if err != nil {
 		return nil, nil
 	}
 
-	transcriptData := []byte(strings.TrimSpace(string(msgOutput)))
-	// sqlite3 returns "[null]" when no rows match
-	if string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
+	var sessionMessages []map[string]interface{}
+	for _, m := range messages {
+		if rowBelongsToSession(m, bestID) {
+			sessionMessages = append(sessionMessages, m)
+		}
+	}
+
+	if len(sessionMessages) == 0 {
+		return nil, nil
+	}
+
+	sort.Slice(sessionMessages, func(i, j int) bool {
+		ti := rowTimestamp(sessionMessages[i], "time_created", "timeCreated", "created", "time", "time_updated", "timeUpdated", "updated")
+		tj := rowTimestamp(sessionMessages[j], "time_created", "timeCreated", "created", "time", "time_updated", "timeUpdated", "updated")
+		return ti.Before(tj)
+	})
+
+	transcriptData, err := json.Marshal(sessionMessages)
+	if err != nil {
 		return nil, nil
 	}
 
 	return &agent.SessionInfo{
-		SessionID:      sessionID,
+		SessionID:      bestID,
 		TranscriptPath: "", // no file path for SQLite
 		StartedAt:      time.Now().Format(time.RFC3339),
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// sqliteJSONRows queries each candidate table name (in order) until one
+// succeeds, returning its rows as generic JSON objects. This avoids
+// hardcoding a single table name that may not match the running OpenCode
+// version's schema. Any nested "data" column (OpenCode's JSON-blob storage
+// convention) is flattened into the row so its fields are addressable like
+// any other column.
+func sqliteJSONRows(dbPath string, tableNames ...string) ([]map[string]interface{}, error) {
+	var lastErr error
+	for _, table := range tableNames {
+		cmd := exec.Command("sqlite3", "-json", dbPath, fmt.Sprintf("SELECT * FROM %s;", table))
+		output, err := cmd.Output()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		trimmed := strings.TrimSpace(string(output))
+		if trimmed == "" {
+			return nil, nil
+		}
+
+		var rows []map[string]interface{}
+		if err := json.Unmarshal([]byte(trimmed), &rows); err != nil {
+			lastErr = err
+			continue
+		}
+
+		for _, row := range rows {
+			mergeDataBlob(row)
+		}
+
+		return rows, nil
+	}
+
+	return nil, lastErr
+}
+
+// mergeDataBlob flattens a JSON-encoded "data" column (if present) into the
+// row so its fields are addressable alongside real SQL columns.
+func mergeDataBlob(row map[string]interface{}) {
+	blob, ok := row["data"].(string)
+	if !ok || blob == "" {
+		return
+	}
+
+	var inner map[string]interface{}
+	if err := json.Unmarshal([]byte(blob), &inner); err != nil {
+		return
+	}
+
+	for k, v := range inner {
+		if _, exists := row[k]; !exists {
+			row[k] = v
+		}
+	}
+}
+
+// rowMatchesProject reports whether a session row belongs to the given
+// project, checking common field name variants for the project identifier
+// or working directory. If none of those fields can be found on the row, it
+// is accepted so discovery can still fall back to "most recently updated
+// session" rather than finding nothing at all.
+func rowMatchesProject(row map[string]interface{}, projectID, projectPath string) bool {
+	for _, key := range []string{"projectID", "project_id", "projectId"} {
+		if v, ok := row[key].(string); ok && v != "" {
+			return v == projectID
+		}
+	}
+
+	for _, key := range []string{"directory", "cwd", "path", "worktree"} {
+		if v, ok := row[key].(string); ok && v != "" {
+			return v == projectPath
+		}
+	}
+
+	return true
+}
+
+// rowBelongsToSession reports whether a message row belongs to the given
+// session, checking common field name variants for the session reference.
+func rowBelongsToSession(row map[string]interface{}, sessionID string) bool {
+	for _, key := range []string{"session_id", "sessionID", "sessionId"} {
+		if v, ok := row[key].(string); ok {
+			return v == sessionID
+		}
+	}
+	return false
+}
+
+// rowTimestamp looks up the first matching timestamp field among keys
+// (checked both at the top level and nested under a "time" object) and
+// parses it as a Unix timestamp (seconds or milliseconds) or a common
+// string time format. Returns the zero Time if nothing could be parsed.
+func rowTimestamp(row map[string]interface{}, keys ...string) time.Time {
+	if t, ok := parseTimestampFrom(row, keys...); ok {
+		return t
+	}
+
+	if nested, ok := row["time"].(map[string]interface{}); ok {
+		if t, ok := parseTimestampFrom(nested, keys...); ok {
+			return t
+		}
+	}
+
+	return time.Time{}
+}
+
+// parseTimestampFrom checks the given keys on m in order and returns the
+// first value that parses as a timestamp.
+func parseTimestampFrom(m map[string]interface{}, keys ...string) (time.Time, bool) {
+	for _, key := range keys {
+		v, ok := m[key]
+		if !ok {
+			continue
+		}
+		if t, ok := parseTimestampValue(v); ok {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// parseTimestampValue parses a JSON-decoded value as either a Unix
+// timestamp (seconds or milliseconds, as a JSON number) or a common
+// string time format.
+func parseTimestampValue(v interface{}) (time.Time, bool) {
+	switch val := v.(type) {
+	case float64:
+		if val <= 0 {
+			return time.Time{}, false
+		}
+		if val > 1e12 {
+			return time.UnixMilli(int64(val)), true
+		}
+		return time.Unix(int64(val), 0), true
+	case string:
+		layouts := []string{
+			time.RFC3339Nano,
+			time.RFC3339,
+			"2006-01-02T15:04:05.000Z",
+			"2006-01-02 15:04:05",
+		}
+		for _, layout := range layouts {
+			if t, err := time.Parse(layout, val); err == nil {
+				return t, true
+			}
+		}
+	}
+	return time.Time{}, false
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -497,4 +668,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
