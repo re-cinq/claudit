@@ -230,10 +230,25 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It tries, in order: flat file storage scoped by our locally-computed
+// project ID (pre-v1.2 OpenCode), a tolerant recursive scan of the data
+// directory that matches sessions by their recorded "directory" field
+// instead of assuming a fixed nesting depth (newer OpenCode versions have
+// repeatedly changed how session storage is scoped per-project), and
+// finally SQLite (OpenCode v1.2+ migration).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
+	if err != nil {
+		return nil, err
+	}
+	if session != nil {
+		return session, nil
+	}
+
+	// Fall back to a tolerant recursive scan that doesn't assume a fixed
+	// storage layout, matching sessions by content instead of path shape.
+	session, err = a.discoverFromStorageScan(projectPath)
 	if err != nil {
 		return nil, err
 	}
@@ -249,6 +264,89 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 
 	projectID := GetProjectID(projectPath)
 	return discoverFromSQLite(dataDir, projectID, projectPath)
+}
+
+// discoverFromStorageScan recursively scans OpenCode's data directory for
+// session JSON files, tolerating storage layout changes across OpenCode
+// versions (e.g. session files scoped under an extra "project/<id>/"
+// directory, or stored flatly with no per-project subdirectory at all).
+// Rather than recomputing OpenCode's internal project-scoping scheme
+// (which has changed between versions), sessions are matched to the
+// current project via the "directory" field recorded inside each session
+// file. The sibling message directory is derived by swapping the
+// "session" path segment for "message", which holds regardless of how
+// deeply the session storage is nested.
+func (a *Agent) discoverFromStorageScan(projectPath string) (*agent.SessionInfo, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return nil, nil
+	}
+
+	now := time.Now()
+	var bestSessionID, bestMsgDir string
+	var bestModTime time.Time
+
+	_ = filepath.WalkDir(dataDir, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		rel, err := filepath.Rel(dataDir, path)
+		if err != nil {
+			return nil
+		}
+		parts := strings.Split(rel, string(filepath.Separator))
+		sessionIdx := -1
+		for i, p := range parts {
+			if p == "session" {
+				sessionIdx = i
+			}
+		}
+		if sessionIdx == -1 {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return nil
+		}
+		if bestSessionID != "" && !modTime.After(bestModTime) {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		var s sessionInfo
+		if err := json.Unmarshal(data, &s); err != nil || s.ID == "" {
+			return nil
+		}
+		if s.Directory != "" && !agent.PathsEqual(s.Directory, projectPath) {
+			return nil
+		}
+
+		msgParts := append(append([]string{}, parts[:sessionIdx]...), "message", s.ID)
+		bestSessionID = s.ID
+		bestModTime = modTime
+		bestMsgDir = filepath.Join(dataDir, filepath.Join(msgParts...))
+		return nil
+	})
+
+	if bestSessionID == "" {
+		return nil, nil
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: bestMsgDir,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -497,4 +595,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
