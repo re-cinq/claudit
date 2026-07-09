@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -240,10 +241,11 @@ func storeConversation(ag agent.Agent, sessionID, transcriptPath string, transcr
 }
 
 // readTranscriptData reads transcript data from a file or directory.
-// Some agents (e.g., OpenCode) store messages as individual JSON files
-// in a directory rather than a single file. In that case, we read all
-// JSON files and combine them into a JSON array.
-// JSONL files are split by line so each line becomes a separate message.
+// Some agents (e.g., OpenCode) store messages as individual JSON files,
+// possibly nested in subdirectories, rather than in a single file. In that
+// case, we walk the whole directory tree and combine all JSON/JSONL files
+// into a JSON array. JSONL files are split by line so each line becomes a
+// separate message.
 func readTranscriptData(path string) ([]byte, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -254,25 +256,22 @@ func readTranscriptData(path string) ([]byte, error) {
 		return os.ReadFile(path)
 	}
 
-	entries, err := os.ReadDir(path)
-	if err != nil {
-		return nil, err
-	}
-
 	var messages []json.RawMessage
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
+	err = filepath.WalkDir(path, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() {
+			return nil
 		}
-		name := entry.Name()
+
+		name := d.Name()
 		isJSON := strings.HasSuffix(name, ".json")
 		isJSONL := strings.HasSuffix(name, ".jsonl")
 		if !isJSON && !isJSONL {
-			continue
+			return nil
 		}
-		data, err := os.ReadFile(filepath.Join(path, name))
+
+		data, err := os.ReadFile(p)
 		if err != nil {
-			continue
+			return nil
 		}
 		if isJSONL {
 			// JSONL: each line is a separate JSON object
@@ -286,6 +285,10 @@ func readTranscriptData(path string) ([]byte, error) {
 		} else {
 			messages = append(messages, json.RawMessage(data))
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	return json.Marshal(messages)
