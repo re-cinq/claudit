@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -8,6 +9,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -127,3 +131,53 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+
+// sessionCacheEntry is the on-disk shape written by the shiftlog OpenCode
+// plugin (see plugin.go) after every tool call.
+type sessionCacheEntry struct {
+	SessionID      string `json:"session_id"`
+	TranscriptData string `json:"transcript_data"`
+	UpdatedAt      string `json:"updated_at"`
+}
+
+// sessionCachePath returns the path to the plugin-written session cache for
+// a project. The cache lives inside .git/ so it never gets committed.
+func sessionCachePath(projectPath string) string {
+	return filepath.Join(projectPath, ".git", "shiftlog-opencode-session.json")
+}
+
+// readSessionCache reads the session cache written by the shiftlog plugin's
+// tool.execute.after hook, if present and recent.
+//
+// OpenCode's own on-disk session storage (flat files vs SQLite, exact schema)
+// has changed across releases, so instead of reverse-engineering the current
+// format we have the plugin persist the session through OpenCode's stable,
+// documented plugin SDK (client.session.messages()) on every tool call. That
+// lets DiscoverSession work for commits made outside of an agent tool call
+// (e.g. a manual "git commit" the user runs after an agent session), without
+// needing to know where or how OpenCode stores sessions internally.
+func readSessionCache(projectPath string) *agent.SessionInfo {
+	data, err := os.ReadFile(sessionCachePath(projectPath))
+	if err != nil {
+		return nil
+	}
+
+	var entry sessionCacheEntry
+	if err := json.Unmarshal(data, &entry); err != nil || entry.SessionID == "" {
+		return nil
+	}
+
+	if updated, err := time.Parse(time.RFC3339, entry.UpdatedAt); err == nil {
+		if time.Since(updated) > agent.RecentSessionTimeout {
+			return nil
+		}
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      entry.SessionID,
+		StartedAt:      entry.UpdatedAt,
+		ProjectPath:    projectPath,
+		TranscriptData: []byte(entry.TranscriptData),
+	}
+}
+```

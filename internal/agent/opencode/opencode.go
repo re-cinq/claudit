@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -230,8 +231,18 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first checks the session cache written by the shiftlog plugin on every
+// tool call (see session.go's readSessionCache), which relies only on
+// OpenCode's stable public plugin SDK and so survives changes to OpenCode's
+// internal storage format. If no cache entry is found (e.g. an older
+// shiftlog-generated plugin, or the plugin never ran), it falls back to
+// scanning OpenCode's on-disk storage directly: flat file storage first
+// (pre-v1.2 OpenCode), then SQLite (v1.2+).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	if session := readSessionCache(projectPath); session != nil {
+		return session, nil
+	}
+
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
@@ -497,4 +508,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
