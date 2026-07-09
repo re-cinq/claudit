@@ -230,8 +230,21 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first checks the active-session pointer written by the shiftlog plugin
+// (see plugin.go), then falls back to flat file storage (pre-v1.2), then
+// SQLite (v1.2+).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	// Try the active-session pointer written synchronously by the shiftlog
+	// plugin on every tool call. Unlike scanning OpenCode's own storage,
+	// this pointer carries no race with the brief window during which
+	// OpenCode may still be flushing session state to disk right after its
+	// CLI process exits - which matters for a *manual* commit (one made
+	// outside the agent, so no "git commit" tool call ever fires the
+	// plugin's own store hook).
+	if session, err := discoverFromActiveSession(projectPath); err == nil && session != nil {
+		return session, nil
+	}
+
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
@@ -249,6 +262,86 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 
 	projectID := GetProjectID(projectPath)
 	return discoverFromSQLite(dataDir, projectID, projectPath)
+}
+
+// activeSessionPointer is the .shiftlog/active-session.json payload written
+// synchronously by the OpenCode plugin (see plugin.go) on every tool call.
+type activeSessionPointer struct {
+	SessionID      string `json:"session_id"`
+	TranscriptPath string `json:"transcript_path"`
+	StartedAt      string `json:"started_at"`
+	ProjectPath    string `json:"project_path"`
+}
+
+// discoverFromActiveSession reads the active-session pointer written by the
+// shiftlog plugin and briefly waits for OpenCode to finish flushing the
+// corresponding message directory to disk before returning.
+func discoverFromActiveSession(projectPath string) (*agent.SessionInfo, error) {
+	pointerPath := filepath.Join(projectPath, ".shiftlog", "active-session.json")
+
+	pointerInfo, err := os.Stat(pointerPath)
+	if err != nil {
+		return nil, nil
+	}
+
+	data, err := os.ReadFile(pointerPath)
+	if err != nil {
+		return nil, nil
+	}
+
+	var active activeSessionPointer
+	if err := json.Unmarshal(data, &active); err != nil {
+		return nil, nil
+	}
+
+	if active.SessionID == "" || !agent.PathsEqual(active.ProjectPath, projectPath) {
+		return nil, nil
+	}
+
+	if time.Since(pointerInfo.ModTime()) > agent.RecentSessionTimeout {
+		return nil, nil
+	}
+
+	// OpenCode may still be flushing this session's messages to disk in the
+	// brief window right after its CLI process exits (e.g. a one-shot
+	// `opencode run` returning before a background writer finishes). Wait
+	// briefly for content to appear rather than reporting an empty transcript.
+	waitForTranscriptContent(active.TranscriptPath, 2*time.Second)
+
+	return &agent.SessionInfo{
+		SessionID:      active.SessionID,
+		TranscriptPath: active.TranscriptPath,
+		StartedAt:      active.StartedAt,
+		ProjectPath:    active.ProjectPath,
+	}, nil
+}
+
+// waitForTranscriptContent polls for path to exist and, if it is a
+// directory, to contain at least one entry - up to timeout. It never
+// returns an error; discovery proceeds best-effort regardless of outcome.
+func waitForTranscriptContent(path string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for {
+		if transcriptHasContent(path) {
+			return
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func transcriptHasContent(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	if !info.IsDir() {
+		return true
+	}
+	entries, err := os.ReadDir(path)
+	return err == nil && len(entries) > 0
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -497,4 +590,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
