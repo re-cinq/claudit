@@ -293,7 +293,13 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		return nil, nil
 	}
 
-	// The transcript path for OpenCode is the message directory
+	// The transcript path for OpenCode is the message directory. OpenCode may
+	// not have flushed message files to disk yet at the exact moment a
+	// session is discovered (e.g. immediately after the CLI process exits
+	// and a manual `git commit` triggers the post-commit hook a moment
+	// later), so read whatever is on disk right now and hand it back inline
+	// instead of leaving a later, separate path-based read to hard-fail (and
+	// silently drop the note) if the directory doesn't exist yet.
 	msgDir, _ := GetMessageDir(bestSessionID)
 
 	return &agent.SessionInfo{
@@ -301,7 +307,48 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		TranscriptPath: msgDir,
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
+		TranscriptData: readMessagesFromDir(msgDir),
 	}, nil
+}
+
+// readMessagesFromDir reads all message files from an OpenCode message
+// directory and returns them combined as a JSON array. A missing or empty
+// directory is treated as zero messages rather than an error, since message
+// files may not be flushed to disk yet when a session is first discovered.
+func readMessagesFromDir(dir string) []byte {
+	messages := []json.RawMessage{}
+
+	entries, err := os.ReadDir(dir)
+	if err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			data, err := os.ReadFile(filepath.Join(dir, name))
+			if err != nil {
+				continue
+			}
+			switch {
+			case strings.HasSuffix(name, ".jsonl"):
+				for _, line := range strings.Split(string(data), "\n") {
+					line = strings.TrimSpace(line)
+					if line == "" {
+						continue
+					}
+					messages = append(messages, json.RawMessage(line))
+				}
+			case strings.HasSuffix(name, ".json"):
+				messages = append(messages, json.RawMessage(data))
+			}
+		}
+	}
+
+	out, err := json.Marshal(messages)
+	if err != nil {
+		return []byte("[]")
+	}
+	return out
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -353,21 +400,24 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
 
-	// Get messages for this session as a JSON array
+	// Get messages for this session as a JSON array. A session that exists
+	// but has no messages yet (e.g. OpenCode hasn't finished flushing them to
+	// the database at the moment the post-commit hook runs) is still a real,
+	// recently-active session — treat it as zero messages rather than
+	// discarding the session entirely, so a note still gets written.
 	msgQuery := fmt.Sprintf(
 		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
 		sessionID,
 	)
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
-	if err != nil {
-		return nil, nil
-	}
 
-	transcriptData := []byte(strings.TrimSpace(string(msgOutput)))
-	// sqlite3 returns "[null]" when no rows match
-	if string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
-		return nil, nil
+	transcriptData := []byte("[]")
+	if err == nil {
+		trimmed := strings.TrimSpace(string(msgOutput))
+		if trimmed != "" && trimmed != "[null]" && trimmed != "[]" {
+			transcriptData = []byte(trimmed)
+		}
 	}
 
 	return &agent.SessionInfo{
@@ -497,4 +547,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
