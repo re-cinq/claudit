@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -283,10 +284,24 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 			continue
 		}
 
-		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
-			bestModTime = modTime
+		if bestSessionID != "" && !modTime.After(bestModTime) {
+			continue
 		}
+
+		// The session ID is authoritative from the "id" field inside the
+		// session file — OpenCode's session filenames don't always match
+		// the session ID, so fall back to the filename only if the file
+		// can't be read or parsed.
+		sessionID := strings.TrimSuffix(entry.Name(), ".json")
+		if data, readErr := os.ReadFile(filepath.Join(sessionDir, entry.Name())); readErr == nil {
+			var parsed sessionInfo
+			if json.Unmarshal(data, &parsed) == nil && parsed.ID != "" {
+				sessionID = parsed.ID
+			}
+		}
+
+		bestSessionID = sessionID
+		bestModTime = modTime
 	}
 
 	if bestSessionID == "" {
@@ -497,4 +512,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
