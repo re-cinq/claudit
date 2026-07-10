@@ -252,19 +252,50 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
+//
+// Older OpenCode versions nested session files under a per-project directory
+// named after the project ID (the git root commit hash). Newer versions
+// (observed starting around 1.15+) store session files flat directly under
+// storage/session/, with each session file carrying its own "directory" (and
+// sometimes "projectID") field identifying the project it belongs to instead
+// of relying on directory nesting. We try the nested layout first, then fall
+// back to scanning the flat layout and matching by that field.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
+	nestedDir := filepath.Join(dataDir, "storage", "session", GetProjectID(projectPath))
+	if sessionID, modTime, ok := mostRecentSessionFile(nestedDir, projectPath, false); ok {
+		return buildDiscoveredSession(sessionID, modTime, projectPath), nil
+	}
+
+	flatDir := filepath.Join(dataDir, "storage", "session")
+	if sessionID, modTime, ok := mostRecentSessionFile(flatDir, projectPath, true); ok {
+		return buildDiscoveredSession(sessionID, modTime, projectPath), nil
+	}
+
+	return nil, nil
+}
+
+// mostRecentSessionFile scans dir for the most recently modified session
+// JSON file within the recent-session timeout. When matchProject is true,
+// only files whose "directory" or "projectID" field matches projectPath (or
+// its derived project ID) are considered; this is required for the flat
+// layout, where files from unrelated projects live side by side.
+func mostRecentSessionFile(dir, projectPath string, matchProject bool) (sessionID string, modTime time.Time, ok bool) {
+	dirEntries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, nil
+		return "", time.Time{}, false
 	}
 
 	now := time.Now()
-	recentTimeout := agent.RecentSessionTimeout
+	var projectID string
+	if matchProject {
+		projectID = GetProjectID(projectPath)
+	}
+
 	var bestSessionID string
 	var bestModTime time.Time
 
@@ -278,30 +309,52 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 			continue
 		}
 
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
+		fileModTime := info.ModTime()
+		if now.Sub(fileModTime) > agent.RecentSessionTimeout {
 			continue
 		}
 
-		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
-			bestModTime = modTime
+		id := strings.TrimSuffix(entry.Name(), ".json")
+
+		if matchProject {
+			data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+			if err != nil {
+				continue
+			}
+			var sess sessionInfo
+			if err := json.Unmarshal(data, &sess); err != nil {
+				continue
+			}
+			directoryMatches := sess.Directory != "" && filepath.Clean(sess.Directory) == filepath.Clean(projectPath)
+			projectIDMatches := sess.ProjectID != "" && sess.ProjectID == projectID
+			if !directoryMatches && !projectIDMatches {
+				continue
+			}
+		}
+
+		if bestSessionID == "" || fileModTime.After(bestModTime) {
+			bestSessionID = id
+			bestModTime = fileModTime
 		}
 	}
 
 	if bestSessionID == "" {
-		return nil, nil
+		return "", time.Time{}, false
 	}
+	return bestSessionID, bestModTime, true
+}
 
+// buildDiscoveredSession assembles the SessionInfo for a discovered session file.
+func buildDiscoveredSession(sessionID string, modTime time.Time, projectPath string) *agent.SessionInfo {
 	// The transcript path for OpenCode is the message directory
-	msgDir, _ := GetMessageDir(bestSessionID)
+	msgDir, _ := GetMessageDir(sessionID)
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
+		SessionID:      sessionID,
 		TranscriptPath: msgDir,
-		StartedAt:      bestModTime.Format(time.RFC3339),
+		StartedAt:      modTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
-	}, nil
+	}
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +550,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
