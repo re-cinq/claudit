@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -73,6 +74,29 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// resolveMessageDir returns the most likely message directory for a session.
+// OpenCode has stored per-session messages at different paths across
+// versions (a top-level "message" namespace, or one nested under "session").
+// This tries each known layout and prefers whichever one actually has files,
+// falling back to the conventional default so callers get a stable path even
+// when no messages are found yet.
+func resolveMessageDir(dataDir, sessionID string) string {
+	candidates := []string{
+		filepath.Join(dataDir, "storage", "message", sessionID),
+		filepath.Join(dataDir, "storage", "session", "message", sessionID),
+		filepath.Join(dataDir, "storage", "session", sessionID, "message"),
+	}
+
+	for _, dir := range candidates {
+		entries, err := os.ReadDir(dir)
+		if err == nil && len(entries) > 0 {
+			return dir
+		}
+	}
+
+	return candidates[0]
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
@@ -127,3 +151,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
