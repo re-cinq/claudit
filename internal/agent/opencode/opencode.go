@@ -323,10 +323,23 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
-		return nil, nil
-	}
 	sessionID := strings.TrimSpace(string(sessionOutput))
+
+	// Some OpenCode versions key sessions by a project identifier other than
+	// the git root commit hash (e.g. a hash of the worktree path), so an
+	// exact project_id match can legitimately find nothing even though a
+	// recent session exists. Fall back to the most recently updated session
+	// in the whole database — the recency check below still guards against
+	// picking up an unrelated stale session.
+	if err != nil || sessionID == "" {
+		cmd = exec.Command("sqlite3", "-separator", "\t", dbPath,
+			"SELECT id FROM session ORDER BY time_updated DESC LIMIT 1;")
+		sessionOutput, err = cmd.Output()
+		if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+			return nil, nil
+		}
+		sessionID = strings.TrimSpace(string(sessionOutput))
+	}
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
@@ -497,4 +510,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
