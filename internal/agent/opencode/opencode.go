@@ -230,9 +230,9 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first tries flat file storage, then falls back to SQLite.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
+	// Try flat file storage first
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
 		return nil, err
@@ -241,7 +241,7 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
+	// Fall back to SQLite
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
@@ -251,21 +251,83 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 	return discoverFromSQLite(dataDir, projectID, projectPath)
 }
 
-// discoverFromFlatFiles tries the legacy flat file session discovery.
+// discoverFromFlatFiles tries the flat file session discovery.
+//
+// OpenCode's on-disk layout has shifted across releases, so several
+// candidate layouts are tried in order:
+//  1. Legacy: sessions partitioned into a per-project directory under the
+//     global XDG data dir (storage/session/<projectID>/<id>.json).
+//  2. Project-first: each project gets its own storage root
+//     (project/<projectID>/storage/session/<id>.json).
+//  3. Flat: all sessions live together with the owning project recorded
+//     inside each session's JSON (storage/session/<id>.json, filtered by
+//     the session's projectID/directory field) instead of via directory
+//     nesting.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
+	projectID := GetProjectID(projectPath)
 
-	dirEntries, err := os.ReadDir(sessionDir)
+	matchesProject := func(data []byte) bool {
+		var info sessionInfo
+		if err := json.Unmarshal(data, &info); err != nil {
+			return false
+		}
+		return info.ProjectID == projectID || info.Directory == projectPath
+	}
+
+	candidates := []struct {
+		sessionDir string
+		messageDir func(id string) string
+		filter     func([]byte) bool
+	}{
+		{
+			sessionDir: filepath.Join(dataDir, "storage", "session", projectID),
+			messageDir: func(id string) string { return filepath.Join(dataDir, "storage", "message", id) },
+		},
+		{
+			sessionDir: filepath.Join(dataDir, "project", projectID, "storage", "session"),
+			messageDir: func(id string) string {
+				return filepath.Join(dataDir, "project", projectID, "storage", "message", id)
+			},
+		},
+		{
+			sessionDir: filepath.Join(dataDir, "storage", "session"),
+			messageDir: func(id string) string { return filepath.Join(dataDir, "storage", "message", id) },
+			filter:     matchesProject,
+		},
+	}
+
+	for _, c := range candidates {
+		id, modTime, ok := scanSessionDir(c.sessionDir, c.filter)
+		if !ok {
+			continue
+		}
+		return &agent.SessionInfo{
+			SessionID:      id,
+			TranscriptPath: c.messageDir(id),
+			StartedAt:      modTime.Format(time.RFC3339),
+			ProjectPath:    projectPath,
+		}, nil
+	}
+
+	return nil, nil
+}
+
+// scanSessionDir finds the most recently modified session file (by mtime,
+// within agent.RecentSessionTimeout) in dir. If filter is non-nil, a file's
+// contents are read and passed to filter; files it rejects are skipped. The
+// returned id is the filename without its .json extension.
+func scanSessionDir(dir string, filter func([]byte) bool) (id string, modTime time.Time, found bool) {
+	dirEntries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, nil
+		return "", time.Time{}, false
 	}
 
 	now := time.Now()
-	recentTimeout := agent.RecentSessionTimeout
-	var bestSessionID string
+	var bestID string
 	var bestModTime time.Time
 
 	for _, entry := range dirEntries {
@@ -278,30 +340,28 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 			continue
 		}
 
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
+		mt := info.ModTime()
+		if now.Sub(mt) > agent.RecentSessionTimeout {
 			continue
 		}
 
-		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
-			bestModTime = modTime
+		if filter != nil {
+			data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+			if err != nil || !filter(data) {
+				continue
+			}
+		}
+
+		if bestID == "" || mt.After(bestModTime) {
+			bestID = strings.TrimSuffix(entry.Name(), ".json")
+			bestModTime = mt
 		}
 	}
 
-	if bestSessionID == "" {
-		return nil, nil
+	if bestID == "" {
+		return "", time.Time{}, false
 	}
-
-	// The transcript path for OpenCode is the message directory
-	msgDir, _ := GetMessageDir(bestSessionID)
-
-	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: msgDir,
-		StartedAt:      bestModTime.Format(time.RFC3339),
-		ProjectPath:    projectPath,
-	}, nil
+	return bestID, bestModTime, true
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -454,7 +514,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -495,6 +554,37 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 		}
 	}
 
+	// Try "parts" array — newer OpenCode versions represent message content
+	// as a list of typed parts (text, tool-call, tool-result, ...) instead of
+	// a flat "content" field. Only text parts contribute to the message body.
+	if partsRaw, ok := raw["parts"]; ok {
+		var parts []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+			Data struct {
+				Text string `json:"text"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(partsRaw, &parts); err == nil && len(parts) > 0 {
+			var blocks []agent.ContentBlock
+			for _, p := range parts {
+				if p.Type != "text" {
+					continue
+				}
+				text := p.Text
+				if text == "" {
+					text = p.Data.Text
+				}
+				if text != "" {
+					blocks = append(blocks, agent.ContentBlock{Type: "text", Text: text})
+				}
+			}
+			if len(blocks) > 0 {
+				msg.Content = blocks
+				return msg
+			}
+		}
+	}
+
 	return msg
 }
-
