@@ -73,6 +73,54 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// sqliteQuery runs a single sqlite3 query against dbPath and returns trimmed stdout.
+func sqliteQuery(dbPath, query string) (string, error) {
+	cmd := exec.Command("sqlite3", dbPath, query)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// sqliteEscape escapes a value for safe inclusion in a single-quoted SQLite string literal.
+func sqliteEscape(value string) string {
+	return strings.ReplaceAll(value, "'", "''")
+}
+
+// sqliteTableColumns returns the set of column names for a table, or nil if the
+// table doesn't exist or sqlite3 fails. OpenCode's storage schema has changed
+// across versions, so callers should not assume fixed column names.
+func sqliteTableColumns(dbPath, table string) map[string]bool {
+	out, err := sqliteQuery(dbPath, fmt.Sprintf("PRAGMA table_info(%s);", table))
+	if err != nil || out == "" {
+		return nil
+	}
+
+	columns := make(map[string]bool)
+	for _, line := range strings.Split(out, "\n") {
+		// table_info output columns: cid|name|type|notnull|dflt_value|pk
+		fields := strings.Split(line, "|")
+		if len(fields) >= 2 {
+			columns[fields[1]] = true
+		}
+	}
+	if len(columns) == 0 {
+		return nil
+	}
+	return columns
+}
+
+// firstAvailableColumn returns the first candidate present in columns, or "" if none match.
+func firstAvailableColumn(columns map[string]bool, candidates ...string) string {
+	for _, c := range candidates {
+		if columns[c] {
+			return c
+		}
+	}
+	return ""
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
