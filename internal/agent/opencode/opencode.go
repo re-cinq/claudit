@@ -304,10 +304,30 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
+// findOpenCodeDB locates the OpenCode SQLite database file within the data
+// directory. OpenCode stores this at "<dataDir>/storage" — the same "storage"
+// path that was a flat-file JSON directory tree in older (pre-v1.2) releases
+// is, in current OpenCode versions, the SQLite database file itself. A couple
+// of alternate/legacy filenames are checked as a fallback for compatibility
+// with older or differently-configured installs.
+func findOpenCodeDB(dataDir string) (string, bool) {
+	candidates := []string{
+		filepath.Join(dataDir, "storage"),
+		filepath.Join(dataDir, "storage", "opencode.db"),
+		filepath.Join(dataDir, "opencode.db"),
+	}
+	for _, candidate := range candidates {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
-	dbPath := filepath.Join(dataDir, "opencode.db")
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+	dbPath, ok := findOpenCodeDB(dataDir)
+	if !ok {
 		return nil, nil
 	}
 
@@ -497,4 +517,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
