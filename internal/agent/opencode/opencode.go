@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -230,7 +231,11 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+),
+// then falls back to a layout-agnostic recency scan. OpenCode has reorganized its
+// on-disk storage layout across releases (project-scoped subdirectories, an
+// "info" split, dropping SQLite, etc.), so the recency scan exists to keep
+// discovery working even when the exact directory nesting drifts again.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
@@ -241,14 +246,20 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
+	// Fall back to SQLite (OpenCode v1.2+)
 	projectID := GetProjectID(projectPath)
-	return discoverFromSQLite(dataDir, projectID, projectPath)
+	if session, err := discoverFromSQLite(dataDir, projectID, projectPath); err == nil && session != nil {
+		return session, nil
+	}
+
+	// Last resort: scan the whole data directory for the most recently
+	// touched session file, without assuming a fixed layout.
+	return discoverByRecency(dataDir, projectPath)
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -316,17 +327,25 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
+	// Find most recent session for this project; if none is found for the
+	// exact project ID (OpenCode's project identification scheme has changed
+	// across versions), fall back to the most recent session overall.
 	sessionQuery := fmt.Sprintf(
 		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
 		projectID,
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
-		return nil, nil
-	}
 	sessionID := strings.TrimSpace(string(sessionOutput))
+	if err != nil || sessionID == "" {
+		fallbackQuery := `SELECT id FROM session ORDER BY time_updated DESC LIMIT 1;`
+		cmd = exec.Command("sqlite3", "-separator", "\t", dbPath, fallbackQuery)
+		sessionOutput, err = cmd.Output()
+		if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+			return nil, nil
+		}
+		sessionID = strings.TrimSpace(string(sessionOutput))
+	}
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
@@ -377,6 +396,100 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// discoverByRecency is a last-resort discovery pass that doesn't assume any
+// particular on-disk layout. OpenCode has restructured its storage directory
+// more than once (e.g. moving session metadata in and out of per-project
+// subdirectories, splitting "info"/"message"/"part" data), so this walks the
+// whole data directory looking for the most recently modified session file
+// instead of a fixed path.
+func discoverByRecency(dataDir, projectPath string) (*agent.SessionInfo, error) {
+	if dataDir == "" {
+		return nil, nil
+	}
+	if _, err := os.Stat(dataDir); err != nil {
+		return nil, nil
+	}
+
+	now := time.Now()
+	var bestSessionID string
+	var bestModTime time.Time
+
+	_ = filepath.WalkDir(dataDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		// Skip anything that lives under a "message" or "part" area — we're
+		// looking for the session's own metadata file, not its contents.
+		slashPath := filepath.ToSlash(path)
+		if strings.Contains(slashPath, "/message/") || strings.Contains(slashPath, "/part/") {
+			return nil
+		}
+		if !strings.Contains(slashPath, "/session") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return nil
+		}
+
+		if bestSessionID == "" || modTime.After(bestModTime) {
+			bestSessionID = strings.TrimSuffix(d.Name(), ".json")
+			bestModTime = modTime
+		}
+		return nil
+	})
+
+	if bestSessionID == "" {
+		return nil, nil
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: findMessageDir(dataDir, bestSessionID),
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
+}
+
+// findMessageDir looks for the directory (or file) holding a session's
+// messages anywhere under dataDir, matching by session ID rather than a
+// fixed path, since OpenCode has nested "message" storage differently
+// across versions (e.g. storage/message/<id> vs storage/session/message/<id>).
+// Falls back to the legacy computed path if nothing is found.
+func findMessageDir(dataDir, sessionID string) string {
+	var found string
+	_ = filepath.WalkDir(dataDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || found != "" {
+			return nil
+		}
+		if !strings.Contains(filepath.ToSlash(path), "/message/") {
+			return nil
+		}
+		name := d.Name()
+		if d.IsDir() && name == sessionID {
+			found = path
+			return filepath.SkipAll
+		}
+		if !d.IsDir() && strings.TrimSuffix(name, ".json") == sessionID {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if found != "" {
+		return found
+	}
+	msgDir, _ := GetMessageDir(sessionID)
+	return msgDir
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -497,4 +610,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
