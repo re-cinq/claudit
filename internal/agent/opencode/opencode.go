@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -230,9 +231,21 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// OpenCode's on-disk session layout has changed across releases (flat files
+// keyed by a project id, nested per-project directories, SQLite, embedded
+// vs. separate message storage, ...). Rather than assume one fixed layout,
+// it first scans the data directory for a recent session file that matches
+// this project by its recorded content, then falls back to the legacy flat
+// file and SQLite layouts for older OpenCode versions.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
+	dataDir, err := GetDataDir()
+	if err == nil {
+		if session := discoverByContentScan(dataDir, projectPath); session != nil {
+			return session, nil
+		}
+	}
+
+	// Try flat file storage next (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
 		return nil, err
@@ -242,8 +255,7 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 	}
 
 	// Fall back to SQLite (OpenCode v1.2+)
-	dataDir, err := GetDataDir()
-	if err != nil {
+	if dataDir == "" {
 		return nil, nil
 	}
 
@@ -497,4 +509,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
