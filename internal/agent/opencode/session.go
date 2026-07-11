@@ -81,6 +81,64 @@ type sessionInfo struct {
 	Title     string `json:"title,omitempty"`
 }
 
+// escapeSQLiteString escapes a string for safe inclusion in a single-quoted
+// SQLite literal by doubling embedded single quotes.
+func escapeSQLiteString(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
+// sqliteColumns returns the column names for a table in a SQLite database,
+// via PRAGMA table_info. Returns nil if the table doesn't exist, the query
+// fails, or sqlite3 is unavailable.
+func sqliteColumns(dbPath, table string) []string {
+	cmd := exec.Command("sqlite3", dbPath, fmt.Sprintf("PRAGMA table_info(%s);", table))
+	output, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	var cols []string
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// PRAGMA table_info rows: cid|name|type|notnull|dflt_value|pk
+		parts := strings.Split(line, "|")
+		if len(parts) >= 2 && parts[1] != "" {
+			cols = append(cols, parts[1])
+		}
+	}
+	return cols
+}
+
+// sqliteFirstExistingTable returns the first candidate table name that
+// actually exists in the database (has at least one column), or "" if none do.
+// This tolerates OpenCode renaming tables (e.g. session -> sessions) across versions.
+func sqliteFirstExistingTable(dbPath string, candidates ...string) string {
+	for _, name := range candidates {
+		if len(sqliteColumns(dbPath, name)) > 0 {
+			return name
+		}
+	}
+	return ""
+}
+
+// firstMatchingColumn returns the actual column name (preserving its case)
+// for the first candidate (case-insensitive) found in cols, or "" if none match.
+func firstMatchingColumn(cols []string, candidates ...string) string {
+	byLower := make(map[string]string, len(cols))
+	for _, c := range cols {
+		byLower[strings.ToLower(c)] = c
+	}
+	for _, cand := range candidates {
+		if actual, ok := byLower[strings.ToLower(cand)]; ok {
+			return actual
+		}
+	}
+	return ""
+}
+
 // WriteSessionFile writes a session and its messages to OpenCode's storage.
 func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (string, error) {
 	sessionDir, err := GetSessionDir(projectPath)
