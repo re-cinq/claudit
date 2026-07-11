@@ -127,3 +127,133 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+
+// FindSQLiteDB locates OpenCode's SQLite database within the data directory.
+// The filename/location has changed across OpenCode releases, so common
+// candidates are tried first before falling back to a directory scan.
+func FindSQLiteDB(dataDir string) string {
+	candidates := []string{
+		"opencode.db",
+		"db.sqlite",
+		"opencode.sqlite",
+		"opencode.sqlite3",
+		filepath.Join("db", "opencode.db"),
+		filepath.Join("storage", "opencode.db"),
+	}
+	for _, c := range candidates {
+		p := filepath.Join(dataDir, c)
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p
+		}
+	}
+
+	var found string
+	_ = filepath.WalkDir(dataDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || found != "" || d.IsDir() {
+			return nil
+		}
+		switch strings.ToLower(filepath.Ext(d.Name())) {
+		case ".db", ".sqlite", ".sqlite3":
+			found = path
+		}
+		return nil
+	})
+	return found
+}
+
+// sqliteTable describes a discovered SQLite table and its columns.
+type sqliteTable struct {
+	Name    string
+	Columns []string
+}
+
+// findSQLiteTable finds the table whose name best matches nameHint
+// (case-insensitive exact match preferred, substring match as fallback)
+// and returns its columns. Table/column names have changed across OpenCode
+// releases, so callers should not assume fixed names.
+func findSQLiteTable(dbPath, nameHint string) (*sqliteTable, error) {
+	cmd := exec.Command("sqlite3", dbPath, "SELECT name FROM sqlite_master WHERE type='table';")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	var names []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			names = append(names, line)
+		}
+	}
+
+	var tableName string
+	for _, n := range names {
+		if strings.EqualFold(n, nameHint) {
+			tableName = n
+			break
+		}
+	}
+	if tableName == "" {
+		for _, n := range names {
+			if strings.Contains(strings.ToLower(n), strings.ToLower(nameHint)) {
+				if tableName == "" || len(n) < len(tableName) {
+					tableName = n
+				}
+			}
+		}
+	}
+	if tableName == "" {
+		return nil, nil
+	}
+
+	colsCmd := exec.Command("sqlite3", dbPath, fmt.Sprintf("PRAGMA table_info(%s);", quoteIdent(tableName)))
+	colsOut, err := colsCmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	var cols []string
+	for _, line := range strings.Split(strings.TrimSpace(string(colsOut)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "|")
+		if len(parts) > 1 {
+			cols = append(cols, parts[1])
+		}
+	}
+
+	return &sqliteTable{Name: tableName, Columns: cols}, nil
+}
+
+// pickColumn returns the first column matching a candidate name
+// (case-insensitive exact match first, then substring match), or ""
+// if none of the candidates are present.
+func pickColumn(cols []string, candidates ...string) string {
+	for _, cand := range candidates {
+		for _, c := range cols {
+			if strings.EqualFold(c, cand) {
+				return c
+			}
+		}
+	}
+	for _, cand := range candidates {
+		for _, c := range cols {
+			if strings.Contains(strings.ToLower(c), cand) {
+				return c
+			}
+		}
+	}
+	return ""
+}
+
+// quoteIdent quotes a SQLite identifier (table/column name).
+func quoteIdent(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+// sqlQuote quotes a SQLite string literal.
+func sqlQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
