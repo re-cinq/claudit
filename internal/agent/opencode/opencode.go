@@ -266,10 +266,21 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
 	var bestSessionID string
+	var bestIsDir bool
 	var bestModTime time.Time
 
 	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		// Older OpenCode versions store each session as a single
+		// "<sessionID>.json" file. Newer versions store each session as a
+		// directory (e.g. "<sessionID>/info.json" plus other session-scoped
+		// data), so both shapes need to be recognized here.
+		var sessionID string
+		switch {
+		case entry.IsDir():
+			sessionID = entry.Name()
+		case strings.HasSuffix(entry.Name(), ".json"):
+			sessionID = strings.TrimSuffix(entry.Name(), ".json")
+		default:
 			continue
 		}
 
@@ -284,7 +295,8 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		}
 
 		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			bestSessionID = sessionID
+			bestIsDir = entry.IsDir()
 			bestModTime = modTime
 		}
 	}
@@ -293,8 +305,16 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		return nil, nil
 	}
 
-	// The transcript path for OpenCode is the message directory
+	// The transcript path for OpenCode is normally the separate message
+	// directory (storage/message/<sessionID>). If that doesn't exist but the
+	// session itself was stored as a directory, fall back to reading
+	// messages from within the session's own directory.
 	msgDir, _ := GetMessageDir(bestSessionID)
+	if bestIsDir {
+		if _, statErr := os.Stat(msgDir); statErr != nil {
+			msgDir = filepath.Join(sessionDir, bestSessionID)
+		}
+	}
 
 	return &agent.SessionInfo{
 		SessionID:      bestSessionID,
@@ -497,4 +517,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
