@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -265,7 +266,7 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestSessionID string
+	var bestFileName string
 	var bestModTime time.Time
 
 	for _, entry := range dirEntries {
@@ -283,14 +284,26 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 			continue
 		}
 
-		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+		if bestFileName == "" || modTime.After(bestModTime) {
+			bestFileName = entry.Name()
 			bestModTime = modTime
 		}
 	}
 
-	if bestSessionID == "" {
+	if bestFileName == "" {
 		return nil, nil
+	}
+
+	// The session filename does not necessarily match the session ID (newer
+	// OpenCode versions prefix/format filenames differently), so read the
+	// "id" field from the session file itself rather than deriving it from
+	// the filename. Falling back to the filename keeps older layouts working.
+	bestSessionID := strings.TrimSuffix(bestFileName, ".json")
+	if data, err := os.ReadFile(filepath.Join(sessionDir, bestFileName)); err == nil {
+		var sess sessionInfo
+		if err := json.Unmarshal(data, &sess); err == nil && sess.ID != "" {
+			bestSessionID = sess.ID
+		}
 	}
 
 	// The transcript path for OpenCode is the message directory
@@ -497,4 +510,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
