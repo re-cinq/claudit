@@ -1,1 +1,3 @@
 - [x] Add todo list
+- [ ] Verify the file is in the index.
+- [ ] Commit the file.
