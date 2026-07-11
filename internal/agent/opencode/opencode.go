@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -258,34 +259,28 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		return nil, nil
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
-	if err != nil {
-		return nil, nil
-	}
+	bestSessionID, bestModTime := findMostRecentSession(sessionDir)
 
-	now := time.Now()
-	recentTimeout := agent.RecentSessionTimeout
-	var bestSessionID string
-	var bestModTime time.Time
-
-	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
-
-		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
-			bestModTime = modTime
+	if bestSessionID == "" {
+		// The project ID scheme may not match this OpenCode version's
+		// layout (e.g. projects keyed by directory instead of git root
+		// commit hash). Fall back to scanning all known projects for the
+		// most recently modified session, still bounded by the recency
+		// window applied in findMostRecentSession.
+		if dataDir, err := GetDataDir(); err == nil {
+			sessionsRoot := filepath.Join(dataDir, "storage", "session")
+			if projectDirs, err := os.ReadDir(sessionsRoot); err == nil {
+				for _, pd := range projectDirs {
+					if !pd.IsDir() {
+						continue
+					}
+					id, modTime := findMostRecentSession(filepath.Join(sessionsRoot, pd.Name()))
+					if id != "" && (bestSessionID == "" || modTime.After(bestModTime)) {
+						bestSessionID = id
+						bestModTime = modTime
+					}
+				}
+			}
 		}
 	}
 
@@ -302,6 +297,49 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// findMostRecentSession scans a session storage directory for the most
+// recently modified session within the recency window. OpenCode has stored
+// sessions both as flat "<id>.json" files and, in newer versions, as
+// "<id>/" directories, so both layouts are accepted.
+func findMostRecentSession(sessionDir string) (string, time.Time) {
+	dirEntries, err := os.ReadDir(sessionDir)
+	if err != nil {
+		return "", time.Time{}
+	}
+
+	now := time.Now()
+	var bestSessionID string
+	var bestModTime time.Time
+
+	for _, entry := range dirEntries {
+		var sessionID string
+		if entry.IsDir() {
+			sessionID = entry.Name()
+		} else if strings.HasSuffix(entry.Name(), ".json") {
+			sessionID = strings.TrimSuffix(entry.Name(), ".json")
+		} else {
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			continue
+		}
+
+		if bestSessionID == "" || modTime.After(bestModTime) {
+			bestSessionID = sessionID
+			bestModTime = modTime
+		}
+	}
+
+	return bestSessionID, bestModTime
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -324,7 +362,16 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
 	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
-		return nil, nil
+		// The project_id scheme may not match this OpenCode version's schema
+		// (e.g. projects keyed by directory instead of git root commit hash).
+		// Fall back to the single most recently updated session across all
+		// projects; the recency check below still bounds staleness.
+		fallbackQuery := `SELECT id FROM session ORDER BY time_updated DESC LIMIT 1;`
+		cmd = exec.Command("sqlite3", "-separator", "\t", dbPath, fallbackQuery)
+		sessionOutput, err = cmd.Output()
+		if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+			return nil, nil
+		}
 	}
 	sessionID := strings.TrimSpace(string(sessionOutput))
 
@@ -454,7 +501,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +543,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
