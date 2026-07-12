@@ -73,6 +73,41 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// GetProjectDir returns the project-scoped data directory used by newer
+// OpenCode releases, which nest per-project storage under
+// "project/<projectID>" instead of writing directly under
+// "storage/<kind>/<projectID>" (the layout used by GetSessionDir/GetMessageDir).
+func GetProjectDir(projectPath string) (string, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(dataDir, "project", GetProjectID(projectPath)), nil
+}
+
+// GetProjectSessionDir returns the session storage directory for a project
+// under OpenCode's current "project/<id>/storage/session" layout.
+func GetProjectSessionDir(projectPath string) (string, error) {
+	projectDir, err := GetProjectDir(projectPath)
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(projectDir, "storage", "session"), nil
+}
+
+// GetProjectMessageDir returns the message storage directory for a session
+// under OpenCode's current "project/<id>/storage/message" layout.
+func GetProjectMessageDir(projectPath, sessionID string) (string, error) {
+	projectDir, err := GetProjectDir(projectPath)
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(projectDir, "storage", "message", sessionID), nil
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
@@ -124,6 +159,22 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	// Write the raw transcript data as a single message file for restore
 	msgPath := filepath.Join(msgDir, "transcript.jsonl")
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
+
+	// Also mirror the session and messages into the "project/<id>/storage"
+	// layout used by newer OpenCode releases, so resume works regardless of
+	// which storage layout the installed OpenCode version reads from.
+	if projectSessionDir, err := GetProjectSessionDir(projectPath); err == nil {
+		if err := os.MkdirAll(projectSessionDir, 0700); err == nil {
+			projectSessionPath := filepath.Join(projectSessionDir, sessionID+".json")
+			_ = os.WriteFile(projectSessionPath, data, 0600)
+		}
+	}
+	if projectMsgDir, err := GetProjectMessageDir(projectPath, sessionID); err == nil {
+		if err := os.MkdirAll(projectMsgDir, 0700); err == nil {
+			projectMsgPath := filepath.Join(projectMsgDir, "transcript.jsonl")
+			_ = os.WriteFile(projectMsgPath, transcriptData, 0600)
+		}
+	}
 
 	return sessionPath, nil
 }
