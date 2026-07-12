@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -36,8 +37,13 @@ func GetDataDir() (string, error) {
 
 // GetProjectID returns the project identifier for OpenCode.
 // For git repos, this is the root commit hash. For non-git dirs, it's "global".
+//
+// This intentionally scopes to HEAD rather than --all: shiftlog itself writes
+// to refs/notes/shiftlog, which has its own independent root commit once a
+// note has been created. Including --all would let that ref's root leak in
+// and silently change the computed project ID for the same repo.
 func GetProjectID(projectPath string) string {
-	cmd := exec.Command("git", "rev-list", "--max-parents=0", "--all")
+	cmd := exec.Command("git", "rev-list", "--max-parents=0", "HEAD")
 	cmd.Dir = projectPath
 	output, err := cmd.Output()
 	if err != nil {
@@ -127,3 +133,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
