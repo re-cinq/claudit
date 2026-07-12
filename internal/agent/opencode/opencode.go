@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -230,8 +231,16 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// OpenCode's on-disk storage layout (flat JSON files vs SQLite, schema, paths)
+// has changed across releases and is not a stable contract, so we first try
+// the `opencode session list` CLI, which is documented and version-stable.
+// If that yields nothing usable, we fall back to reading OpenCode's storage
+// directly: flat file storage (pre-v1.2), then SQLite (v1.2+).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	if session, err := discoverFromCLI(projectPath); err == nil && session != nil {
+		return session, nil
+	}
+
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
@@ -249,6 +258,122 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 
 	projectID := GetProjectID(projectPath)
 	return discoverFromSQLite(dataDir, projectID, projectPath)
+}
+
+// sessionListIDPattern matches a plausible OpenCode session ID: the first
+// whitespace-delimited token on a line, provided it looks like an
+// identifier rather than a table header (e.g. "ID", "SESSION").
+var sessionListIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{8,}$`)
+
+// discoverFromCLI shells out to `opencode session list` to find the most
+// recently active session for projectPath, then reads its transcript via
+// whatever storage backend is actually present. `opencode session list` is
+// validated to exist across OpenCode releases (see opencode_validation_test.go),
+// unlike the underlying storage format, so this is preferred over parsing
+// OpenCode's storage directly.
+func discoverFromCLI(projectPath string) (*agent.SessionInfo, error) {
+	if _, err := exec.LookPath("opencode"); err != nil {
+		return nil, nil
+	}
+
+	cmd := exec.Command("opencode", "session", "list")
+	cmd.Dir = projectPath
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, nil
+	}
+
+	sessionID := mostRecentSessionIDFromList(string(output))
+	if sessionID == "" {
+		return nil, nil
+	}
+
+	info := &agent.SessionInfo{
+		SessionID:   sessionID,
+		StartedAt:   time.Now().Format(time.RFC3339),
+		ProjectPath: projectPath,
+	}
+
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return info, nil
+	}
+
+	if data := fetchMessagesFromSQLite(dataDir, sessionID); data != nil {
+		info.TranscriptData = data
+		return info, nil
+	}
+
+	if msgDir, err := GetMessageDir(sessionID); err == nil {
+		if entries, err := os.ReadDir(msgDir); err == nil && len(entries) > 0 {
+			info.TranscriptPath = msgDir
+			return info, nil
+		}
+	}
+
+	return info, nil
+}
+
+// mostRecentSessionIDFromList extracts the most recent session ID from
+// `opencode session list` output. OpenCode does not document a stable
+// machine-readable format for this command, so we heuristically take the
+// first identifier-like token of the first non-header line: this matches
+// a bare ID list as well as a table with the most recent session listed
+// first (e.g. "ID  TITLE  UPDATED").
+func mostRecentSessionIDFromList(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+
+		candidate := fields[0]
+		switch strings.ToLower(candidate) {
+		case "id", "session", "session_id", "sessionid":
+			continue
+		}
+
+		if sessionListIDPattern.MatchString(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// fetchMessagesFromSQLite reads all messages for sessionID from OpenCode's
+// SQLite database, if present. Returns nil if the database, sqlite3 CLI, or
+// any messages for the session are unavailable.
+func fetchMessagesFromSQLite(dataDir, sessionID string) []byte {
+	dbPath := filepath.Join(dataDir, "opencode.db")
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		return nil
+	}
+
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		return nil
+	}
+
+	msgQuery := fmt.Sprintf(
+		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
+		sessionID,
+	)
+	cmd := exec.Command("sqlite3", dbPath, msgQuery)
+	msgOutput, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	transcriptData := []byte(strings.TrimSpace(string(msgOutput)))
+	if len(transcriptData) == 0 || string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
+		return nil
+	}
+
+	return transcriptData
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -497,4 +622,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
