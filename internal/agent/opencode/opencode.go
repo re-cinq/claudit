@@ -1,12 +1,15 @@
+```go
 package opencode
 
 import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -186,41 +189,61 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 }
 
 // parseMessageDir reads all message files from an OpenCode message directory.
+// OpenCode has changed how deeply it nests message (and message "part")
+// files across releases, so rather than assuming a single flat directory of
+// files this walks the whole subtree and collects every JSON/JSONL file it
+// finds, in path order.
 func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
-	dirEntries, err := os.ReadDir(dir)
+	type rawFile struct {
+		path string
+		data []byte
+	}
+	var files []rawFile
+
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+
+		name := d.Name()
+		switch {
+		case strings.HasSuffix(name, ".jsonl"):
+			data, rerr := os.ReadFile(path)
+			if rerr != nil {
+				return nil
+			}
+			// JSONL: each line is a separate JSON object
+			for _, line := range strings.Split(string(data), "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				files = append(files, rawFile{path: path, data: []byte(line)})
+			}
+		case strings.HasSuffix(name, ".json"):
+			data, rerr := os.ReadFile(path)
+			if rerr != nil {
+				return nil
+			}
+			files = append(files, rawFile{path: path, data: data})
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
 
+	// Sort for a stable, deterministic ordering across the walk.
+	sort.Slice(files, func(i, j int) bool { return files[i].path < files[j].path })
+
 	var entries []agent.TranscriptEntry
-	for _, de := range dirEntries {
-		if de.IsDir() || !strings.HasSuffix(de.Name(), ".json") {
-			// Handle .jsonl files too
-			if strings.HasSuffix(de.Name(), ".jsonl") {
-				f, err := os.Open(filepath.Join(dir, de.Name()))
-				if err != nil {
-					continue
-				}
-				transcript, err := a.ParseTranscript(f)
-				_ = f.Close()
-				if err == nil {
-					entries = append(entries, transcript.Entries...)
-				}
-			}
-			continue
-		}
-
-		data, err := os.ReadFile(filepath.Join(dir, de.Name()))
-		if err != nil {
-			continue
-		}
-
+	for _, f := range files {
 		var raw map[string]json.RawMessage
-		if err := json.Unmarshal(data, &raw); err != nil {
+		if err := json.Unmarshal(f.data, &raw); err != nil {
 			continue
 		}
 
-		entry := parseOpenCodeEntry(raw, data)
+		entry := parseOpenCodeEntry(raw, f.data)
 		if entry.Type != "" {
 			entries = append(entries, entry)
 		}
@@ -230,9 +253,9 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first tries flat file storage, then falls back to SQLite.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
+	// Try flat file storage first
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
 		return nil, err
@@ -241,7 +264,7 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
+	// Fall back to SQLite
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
@@ -251,55 +274,38 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 	return discoverFromSQLite(dataDir, projectID, projectPath)
 }
 
-// discoverFromFlatFiles tries the legacy flat file session discovery.
+// discoverFromFlatFiles searches the OpenCode data directory for the most
+// recently modified session belonging to this project, and locates its
+// message directory.
+//
+// OpenCode has moved where session/message files live across releases (a
+// flat storage/session/<projectID>/<id>.json layout in older versions vs. a
+// more deeply nested layout in newer ones). Rather than assuming one fixed
+// path depth, this walks the whole data directory and matches files by
+// content and directory name, so it keeps working across those reshuffles.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
-	if err != nil {
-		return nil, nil
-	}
+	projectID := GetProjectID(projectPath)
 
-	now := time.Now()
-	recentTimeout := agent.RecentSessionTimeout
-	var bestSessionID string
-	var bestModTime time.Time
-
-	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
-
-		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
-			bestModTime = modTime
-		}
-	}
-
-	if bestSessionID == "" {
+	sessionID, modTime, found := findRecentProjectSession(dataDir, projectID)
+	if !found {
 		return nil, nil
 	}
 
 	// The transcript path for OpenCode is the message directory
-	msgDir, _ := GetMessageDir(bestSessionID)
+	msgDir := findSessionMessageDir(dataDir, sessionID)
+	if msgDir == "" {
+		msgDir, _ = GetMessageDir(sessionID)
+	}
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
+		SessionID:      sessionID,
 		TranscriptPath: msgDir,
-		StartedAt:      bestModTime.Format(time.RFC3339),
+		StartedAt:      modTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
@@ -497,4 +503,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
