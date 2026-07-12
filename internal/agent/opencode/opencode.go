@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -229,26 +230,59 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 	return &agent.Transcript{Entries: entries}, nil
 }
 
+// discoverSessionRetryWindow bounds how long DiscoverSession will wait for a
+// session that OpenCode has not finished persisting yet. OpenCode's storage
+// writes happen in a background process that can outlive the `opencode run`
+// CLI invocation, so a session from moments ago (e.g. right before a manual
+// `git commit`) may not be visible on disk the instant the post-commit hook
+// runs. We only wait when OpenCode's data directory already exists (i.e. it
+// has been used at all) so that repos which never ran OpenCode still return
+// immediately.
+const (
+	discoverSessionRetryWindow   = 3 * time.Second
+	discoverSessionRetryInterval = 300 * time.Millisecond
+)
+
 // DiscoverSession finds an active or recent OpenCode session.
 // It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
-	session, err := a.discoverFromFlatFiles(projectPath)
-	if err != nil {
-		return nil, err
-	}
-	if session != nil {
-		return session, nil
-	}
+	dataDir, dataDirErr := GetDataDir()
 
-	// Fall back to SQLite (OpenCode v1.2+)
-	dataDir, err := GetDataDir()
-	if err != nil {
-		return nil, nil
-	}
+	deadline := time.Now().Add(discoverSessionRetryWindow)
+	for {
+		// Try flat file storage first (pre-v1.2 OpenCode)
+		session, err := a.discoverFromFlatFiles(projectPath)
+		if err != nil {
+			return nil, err
+		}
+		if session != nil {
+			return session, nil
+		}
 
-	projectID := GetProjectID(projectPath)
-	return discoverFromSQLite(dataDir, projectID, projectPath)
+		// Fall back to SQLite (OpenCode v1.2+)
+		if dataDirErr == nil {
+			projectID := GetProjectID(projectPath)
+			sqliteSession, err := discoverFromSQLite(dataDir, projectID, projectPath)
+			if err != nil {
+				return nil, err
+			}
+			if sqliteSession != nil {
+				return sqliteSession, nil
+			}
+		}
+
+		// Nothing found yet. Only retry if OpenCode's data directory exists
+		// (meaning a session may simply still be flushing to disk) and we
+		// haven't exceeded the retry window.
+		if dataDirErr != nil || time.Now().After(deadline) {
+			return nil, nil
+		}
+		if _, err := os.Stat(dataDir); err != nil {
+			return nil, nil
+		}
+
+		time.Sleep(discoverSessionRetryInterval)
+	}
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -497,4 +531,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
