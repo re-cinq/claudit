@@ -35,8 +35,21 @@ func GetDataDir() (string, error) {
 }
 
 // GetProjectID returns the project identifier for OpenCode.
-// For git repos, this is the root commit hash. For non-git dirs, it's "global".
+//
+// OpenCode caches a generated project ID in a file named "opencode" inside
+// the repository's git directory (e.g. .git/opencode) the first time it runs
+// against a project, and reuses that cached ID afterward regardless of the
+// commit history. When present, that cached ID is authoritative and must be
+// used so shiftlog looks in the same storage location OpenCode itself uses.
+//
+// If no cached ID file exists (OpenCode hasn't run here yet, or an older
+// version is in use), fall back to the root commit hash. For non-git dirs,
+// it's "global".
 func GetProjectID(projectPath string) string {
+	if id := readCachedProjectID(projectPath); id != "" {
+		return id
+	}
+
 	cmd := exec.Command("git", "rev-list", "--max-parents=0", "--all")
 	cmd.Dir = projectPath
 	output, err := cmd.Output()
@@ -50,6 +63,39 @@ func GetProjectID(projectPath string) string {
 		return strings.TrimSpace(lines[0])
 	}
 	return "global"
+}
+
+// readCachedProjectID reads OpenCode's cached project ID from
+// <gitDir>/opencode, if present. Returns "" if the file doesn't exist, is
+// empty, or can't be read.
+func readCachedProjectID(projectPath string) string {
+	gitDir := filepath.Join(projectPath, ".git")
+	info, err := os.Stat(gitDir)
+	if err != nil {
+		return ""
+	}
+
+	// If .git is a file, this is a linked worktree - resolve the real git dir.
+	if !info.IsDir() {
+		content, err := os.ReadFile(gitDir)
+		if err != nil {
+			return ""
+		}
+		parts := strings.SplitN(strings.TrimSpace(string(content)), ": ", 2)
+		if len(parts) != 2 {
+			return ""
+		}
+		gitDir = parts[1]
+		if !filepath.IsAbs(gitDir) {
+			gitDir = filepath.Join(projectPath, gitDir)
+		}
+	}
+
+	data, err := os.ReadFile(filepath.Join(gitDir, "opencode"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 // GetSessionDir returns the session storage directory for a project.
