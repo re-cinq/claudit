@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -186,6 +187,9 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 }
 
 // parseMessageDir reads all message files from an OpenCode message directory.
+// Newer OpenCode versions may group message files under nested
+// subdirectories (e.g. by part type) instead of a single flat directory, so
+// this recurses into subdirectories rather than skipping them.
 func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 	dirEntries, err := os.ReadDir(dir)
 	if err != nil {
@@ -194,19 +198,28 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 
 	var entries []agent.TranscriptEntry
 	for _, de := range dirEntries {
-		if de.IsDir() || !strings.HasSuffix(de.Name(), ".json") {
-			// Handle .jsonl files too
-			if strings.HasSuffix(de.Name(), ".jsonl") {
-				f, err := os.Open(filepath.Join(dir, de.Name()))
-				if err != nil {
-					continue
-				}
-				transcript, err := a.ParseTranscript(f)
-				_ = f.Close()
-				if err == nil {
-					entries = append(entries, transcript.Entries...)
-				}
+		if de.IsDir() {
+			nested, err := a.parseMessageDir(filepath.Join(dir, de.Name()))
+			if err == nil {
+				entries = append(entries, nested.Entries...)
 			}
+			continue
+		}
+
+		if strings.HasSuffix(de.Name(), ".jsonl") {
+			f, err := os.Open(filepath.Join(dir, de.Name()))
+			if err != nil {
+				continue
+			}
+			transcript, err := a.ParseTranscript(f)
+			_ = f.Close()
+			if err == nil {
+				entries = append(entries, transcript.Entries...)
+			}
+			continue
+		}
+
+		if !strings.HasSuffix(de.Name(), ".json") {
 			continue
 		}
 
@@ -252,56 +265,117 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
+// Newer OpenCode versions may store each session as its own directory
+// (e.g. "storage/session/<projectID>/<sessionID>/...") rather than a single
+// "<sessionID>.json" file, so both layouts are supported here.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionDir(projectPath)
 	if err != nil {
 		return nil, nil
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
-	if err != nil {
+	bestSessionID, bestModTime, found := mostRecentSessionEntry(sessionDir)
+	if !found {
 		return nil, nil
 	}
-
-	now := time.Now()
-	recentTimeout := agent.RecentSessionTimeout
-	var bestSessionID string
-	var bestModTime time.Time
-
-	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
-
-		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
-			bestModTime = modTime
-		}
-	}
-
-	if bestSessionID == "" {
-		return nil, nil
-	}
-
-	// The transcript path for OpenCode is the message directory
-	msgDir, _ := GetMessageDir(bestSessionID)
 
 	return &agent.SessionInfo{
 		SessionID:      bestSessionID,
-		TranscriptPath: msgDir,
+		TranscriptPath: resolveMessageDir(sessionDir, bestSessionID),
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// mostRecentSessionEntry scans sessionDir for the most recently modified
+// session within the recent-session window. A session may be represented
+// either as a "<id>.json" file (older OpenCode) or as an "<id>/" directory
+// (newer OpenCode).
+func mostRecentSessionEntry(sessionDir string) (id string, modTime time.Time, found bool) {
+	dirEntries, err := os.ReadDir(sessionDir)
+	if err != nil {
+		return "", time.Time{}, false
+	}
+
+	now := time.Now()
+
+	for _, entry := range dirEntries {
+		var candidateID string
+		var mt time.Time
+
+		switch {
+		case entry.IsDir():
+			candidateID = entry.Name()
+			mt = latestModTime(filepath.Join(sessionDir, entry.Name()))
+		case strings.HasSuffix(entry.Name(), ".json"):
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			candidateID = strings.TrimSuffix(entry.Name(), ".json")
+			mt = info.ModTime()
+		default:
+			continue
+		}
+
+		if mt.IsZero() || now.Sub(mt) > agent.RecentSessionTimeout {
+			continue
+		}
+
+		if !found || mt.After(modTime) {
+			id, modTime, found = candidateID, mt, true
+		}
+	}
+
+	return id, modTime, found
+}
+
+// latestModTime returns the most recent modification time found among the
+// entries directly inside dir (non-recursive), or the zero Time if dir is
+// empty or unreadable.
+func latestModTime(dir string) time.Time {
+	var latest time.Time
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return latest
+	}
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(latest) {
+			latest = info.ModTime()
+		}
+	}
+	return latest
+}
+
+// resolveMessageDir locates the transcript directory for a session. Older
+// OpenCode versions store messages under a top-level
+// "storage/message/<sessionID>" tree; newer versions may instead nest
+// messages inside the session's own directory.
+func resolveMessageDir(sessionDir, sessionID string) string {
+	if msgDir, err := GetMessageDir(sessionID); err == nil && dirHasEntries(msgDir) {
+		return msgDir
+	}
+
+	sessionOwnDir := filepath.Join(sessionDir, sessionID)
+	if nested := filepath.Join(sessionOwnDir, "message"); dirHasEntries(nested) {
+		return nested
+	}
+	if dirHasEntries(sessionOwnDir) {
+		return sessionOwnDir
+	}
+
+	msgDir, _ := GetMessageDir(sessionID)
+	return msgDir
+}
+
+// dirHasEntries reports whether dir exists and contains at least one entry.
+func dirHasEntries(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	return err == nil && len(entries) > 0
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +571,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
