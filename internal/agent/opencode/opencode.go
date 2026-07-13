@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -230,10 +231,26 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It tries, in order: flat file storage (pre-v1.2), a layout-agnostic scan
+// of the storage tree (for versions that restructured session storage, e.g.
+// nesting under "project/<id>/"), and finally SQLite (v1.2+ with SQLite
+// backing).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
+	if err != nil {
+		return nil, err
+	}
+	if session != nil {
+		return session, nil
+	}
+
+	// OpenCode has restructured its on-disk storage layout across releases
+	// (e.g. nesting sessions under a "project/<id>/" directory instead of
+	// "storage/session/<id>/", or splitting session info from messages).
+	// Rather than hard-coding the new shape, scan the storage tree directly
+	// and match sessions by their recorded working directory or project ID.
+	session, err = a.discoverByScanningStorage(projectPath)
 	if err != nil {
 		return nil, err
 	}
@@ -302,6 +319,139 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// discoverByScanningStorage walks OpenCode's storage tree directly and
+// matches sessions by their recorded working directory or project ID,
+// rather than assuming a single fixed directory layout. OpenCode has
+// restructured its on-disk storage across releases (e.g. nesting under a
+// "project/<id>/" directory, or splitting session info from messages), so a
+// layout-agnostic scan is more resilient to those changes than hard-coding
+// a specific path shape.
+func (a *Agent) discoverByScanningStorage(projectPath string) (*agent.SessionInfo, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return nil, nil
+	}
+
+	projectID := GetProjectID(projectPath)
+	now := time.Now()
+
+	var bestSessionID string
+	var bestData []byte
+	var bestModTime time.Time
+
+	roots := []string{filepath.Join(dataDir, "storage"), filepath.Join(dataDir, "project")}
+	for _, root := range roots {
+		if info, statErr := os.Stat(root); statErr != nil || !info.IsDir() {
+			continue
+		}
+
+		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+				return nil
+			}
+
+			fi, infoErr := d.Info()
+			if infoErr != nil || now.Sub(fi.ModTime()) > agent.RecentSessionTimeout {
+				return nil
+			}
+			// Skip files that can't possibly beat the current best match.
+			if bestSessionID != "" && !fi.ModTime().After(bestModTime) {
+				return nil
+			}
+
+			data, readErr := os.ReadFile(path)
+			if readErr != nil {
+				return nil
+			}
+
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal(data, &raw); err != nil {
+				return nil
+			}
+
+			id := firstStringField(raw, "id", "sessionID", "sessionId", "session_id")
+			if id == "" {
+				return nil
+			}
+
+			directory := firstStringField(raw, "directory", "cwd", "path", "workingDirectory")
+			sessionProjectID := firstStringField(raw, "projectID", "project_id", "projectId", "project")
+
+			matches := (directory != "" && directory == projectPath) ||
+				(sessionProjectID != "" && sessionProjectID == projectID) ||
+				strings.Contains(filepath.ToSlash(path), "/"+projectID+"/")
+			if !matches {
+				return nil
+			}
+
+			bestSessionID = id
+			bestData = data
+			bestModTime = fi.ModTime()
+			return nil
+		})
+	}
+
+	if bestSessionID == "" {
+		return nil, nil
+	}
+
+	// Look for a directory literally named after the session ID anywhere in
+	// the data directory (e.g. a "message" or "part" store keyed by session),
+	// without assuming a fixed nesting depth.
+	transcriptPath := findSessionMessageDir(dataDir, bestSessionID)
+
+	sessionResult := &agent.SessionInfo{
+		SessionID:   bestSessionID,
+		StartedAt:   bestModTime.Format(time.RFC3339),
+		ProjectPath: projectPath,
+	}
+	if transcriptPath != "" {
+		sessionResult.TranscriptPath = transcriptPath
+	} else {
+		// No dedicated message directory found; fall back to the matched
+		// session file's own content so we still store something rather
+		// than silently discovering nothing.
+		sessionResult.TranscriptData = bestData
+	}
+	return sessionResult, nil
+}
+
+// findSessionMessageDir searches root for a directory literally named
+// sessionID, returning its path if found.
+func findSessionMessageDir(root, sessionID string) string {
+	if root == "" {
+		return ""
+	}
+	var found string
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || path == root || !d.IsDir() {
+			return nil
+		}
+		if d.Name() == sessionID {
+			found = path
+			return fs.SkipAll
+		}
+		return nil
+	})
+	return found
+}
+
+// firstStringField returns the first non-empty string value found under any
+// of the given keys in raw.
+func firstStringField(raw map[string]json.RawMessage, keys ...string) string {
+	for _, k := range keys {
+		v, ok := raw[k]
+		if !ok {
+			continue
+		}
+		var s string
+		if err := json.Unmarshal(v, &s); err == nil && s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +647,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
