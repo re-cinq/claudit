@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -230,8 +231,22 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+//
+// It first scans the data directory for a session belonging to this project,
+// matched via the "directory" field recorded in the session's own JSON file
+// (see findSessionByDirectory). This is resilient to OpenCode's on-disk
+// layout and project ID scheme changing across versions. If nothing is
+// found this way, it falls back to shift-log's legacy flat-file layout
+// assumption (pre-v1.2 OpenCode), and finally to SQLite-backed storage
+// (OpenCode v1.2+).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	dataDir, err := GetDataDir()
+	if err == nil {
+		if session := findSessionByDirectory(dataDir, projectPath); session != nil {
+			return session, nil
+		}
+	}
+
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
@@ -242,8 +257,7 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 	}
 
 	// Fall back to SQLite (OpenCode v1.2+)
-	dataDir, err := GetDataDir()
-	if err != nil {
+	if dataDir == "" {
 		return nil, nil
 	}
 
@@ -454,7 +468,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +510,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
