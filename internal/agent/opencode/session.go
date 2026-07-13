@@ -1,13 +1,18 @@
+```go
 package opencode
 
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -127,3 +132,116 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+
+// sessionFileHeader captures the fields we need to identify a session file
+// regardless of exactly where OpenCode places it on disk.
+type sessionFileHeader struct {
+	ID        string `json:"id"`
+	ProjectID string `json:"projectID"`
+	Directory string `json:"directory"`
+}
+
+// scanForSessionFile performs a layout-agnostic recursive scan of the OpenCode
+// data directory for a session file belonging to the given project.
+//
+// OpenCode's on-disk session layout has changed across releases (this package
+// already tracks the move from flat storage/session/<projectID>/ files to a
+// SQLite-backed store in discoverFromSQLite). Rather than hardcoding another
+// specific directory shape that may again drift out from under us on the next
+// release, this walks the whole data directory looking for any recently
+// modified *.json file whose content identifies it as belonging to this
+// project (via a "projectID" or "directory" field), independent of nesting.
+func scanForSessionFile(dataDir, projectPath string) (*agent.SessionInfo, error) {
+	if _, err := os.Stat(dataDir); err != nil {
+		return nil, nil
+	}
+
+	expectedProjectID := GetProjectID(projectPath)
+	now := time.Now()
+
+	var bestPath string
+	var bestSessionID string
+	var bestModTime time.Time
+
+	_ = filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		var header sessionFileHeader
+		if err := json.Unmarshal(data, &header); err != nil || header.ID == "" {
+			return nil
+		}
+
+		matches := (header.ProjectID != "" && header.ProjectID == expectedProjectID) ||
+			(header.Directory != "" && agent.PathsEqual(header.Directory, projectPath))
+		if !matches {
+			return nil
+		}
+
+		if bestPath == "" || modTime.After(bestModTime) {
+			bestPath = path
+			bestSessionID = header.ID
+			bestModTime = modTime
+		}
+		return nil
+	})
+
+	if bestSessionID == "" {
+		return nil, nil
+	}
+
+	// Prefer a dedicated message directory for this session if one exists
+	// anywhere under the data directory; otherwise fall back to the session
+	// file itself so a note can still be recorded with at least the session
+	// identity.
+	transcriptPath := bestPath
+	if msgDir := findMessageDir(dataDir, bestSessionID); msgDir != "" {
+		transcriptPath = msgDir
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: transcriptPath,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
+}
+
+// findMessageDir searches for a directory named after the session ID anywhere
+// under dataDir. OpenCode stores per-session message files in a directory
+// keyed by session ID, but the parent path has varied across releases (e.g.
+// storage/message/<id> vs. storage/session/message/<id>).
+func findMessageDir(dataDir, sessionID string) string {
+	var found string
+	_ = filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, err error) error {
+		if found != "" {
+			return filepath.SkipAll
+		}
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		if d.Name() == sessionID {
+			found = path
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	return found
+}
+```
