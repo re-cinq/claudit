@@ -253,14 +253,35 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	if info := discoverFromProjectSessionDir(projectPath); info != nil {
+		return info, nil
+	}
+
+	// Fallback for OpenCode versions that don't group session files under a
+	// directory named after the git-root-commit-hash project ID (or that
+	// compute the project ID differently altogether). Every session file
+	// still records its working directory, so scan all session files —
+	// whether nested per-project or stored flat — and match on that field
+	// instead of relying on the directory name.
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
+	}
+	return scanAllSessionsForProject(dataDir, projectPath)
+}
+
+// discoverFromProjectSessionDir looks for session files under the
+// project-ID-named session directory (dataDir/storage/session/<projectID>).
+// Returns nil if the directory doesn't exist or has no recent session files.
+func discoverFromProjectSessionDir(projectPath string) *agent.SessionInfo {
+	sessionDir, err := GetSessionDir(projectPath)
+	if err != nil {
+		return nil
 	}
 
 	dirEntries, err := os.ReadDir(sessionDir)
 	if err != nil {
-		return nil, nil
+		return nil
 	}
 
 	now := time.Now()
@@ -290,7 +311,7 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}
 
 	if bestSessionID == "" {
-		return nil, nil
+		return nil
 	}
 
 	// The transcript path for OpenCode is the message directory
@@ -301,7 +322,7 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		TranscriptPath: msgDir,
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
-	}, nil
+	}
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +518,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-

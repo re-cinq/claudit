@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +129,109 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// scanAllSessionsForProject scans every session file under
+// dataDir/storage/session — whether grouped in per-project subdirectories
+// (dataDir/storage/session/<projectID>/<sessionID>.json) or stored flat
+// (dataDir/storage/session/<sessionID>.json) — and returns the most recently
+// modified one whose recorded "directory" field matches projectPath.
+//
+// This is a fallback used when the project-ID-named directory lookup fails,
+// e.g. because a newer OpenCode version computes the project ID differently
+// than the git-root-commit-hash scheme GetProjectID assumes.
+func scanAllSessionsForProject(dataDir, projectPath string) (*agent.SessionInfo, error) {
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	topEntries, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		return nil, nil
+	}
+
+	now := time.Now()
+	var bestSessionID string
+	var bestModTime time.Time
+
+	checkFile := func(path string, entry os.DirEntry) {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			return
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			return
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return
+		}
+		if bestSessionID != "" && !modTime.After(bestModTime) {
+			return
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return
+		}
+
+		var sess sessionInfo
+		if err := json.Unmarshal(data, &sess); err != nil {
+			return
+		}
+		if !sameProjectDir(sess.Directory, projectPath) {
+			return
+		}
+
+		sessionID := sess.ID
+		if sessionID == "" {
+			sessionID = strings.TrimSuffix(entry.Name(), ".json")
+		}
+		bestSessionID = sessionID
+		bestModTime = modTime
+	}
+
+	for _, top := range topEntries {
+		if top.IsDir() {
+			// Nested-by-project layout: <projectID>/<sessionID>.json
+			subDir := filepath.Join(sessionRoot, top.Name())
+			subEntries, err := os.ReadDir(subDir)
+			if err != nil {
+				continue
+			}
+			for _, sub := range subEntries {
+				checkFile(filepath.Join(subDir, sub.Name()), sub)
+			}
+			continue
+		}
+		// Flat layout: <sessionID>.json directly under storage/session/
+		checkFile(filepath.Join(sessionRoot, top.Name()), top)
+	}
+
+	if bestSessionID == "" {
+		return nil, nil
+	}
+
+	msgDir, _ := GetMessageDir(bestSessionID)
+
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: msgDir,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
+}
+
+// sameProjectDir compares a session's recorded working directory against the
+// discovery project path, tolerating trailing slashes and symlink differences
+// (e.g. macOS's /tmp -> /private/tmp).
+func sameProjectDir(sessionDirectory, projectPath string) bool {
+	if sessionDirectory == "" {
+		return false
+	}
+	if filepath.Clean(sessionDirectory) == filepath.Clean(projectPath) {
+		return true
+	}
+	a, errA := filepath.EvalSymlinks(sessionDirectory)
+	b, errB := filepath.EvalSymlinks(projectPath)
+	return errA == nil && errB == nil && a == b
 }
