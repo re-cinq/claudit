@@ -304,7 +304,17 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
+// sqliteScanLimit bounds how many recent rows we pull back when scanning a
+// table for a value match, so a large history doesn't blow up query size.
+const sqliteScanLimit = 500
+
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
+//
+// OpenCode's SQLite schema has changed table/column names across releases
+// (e.g. the "session"/"message" tables gaining, losing, or renaming columns
+// such as project_id/time_updated/data). Rather than hardcode one schema
+// version, we discover tables by name and match rows by value instead of by
+// column name, so discovery keeps working across schema renames.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
@@ -316,57 +326,71 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
-	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+	sessionTable := findSQLiteTable(dbPath, "session")
+	if sessionTable == "" {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
-	// Check if this session was recent (within timeout)
-	timeQuery := fmt.Sprintf(
-		`SELECT time_updated FROM session WHERE id='%s';`,
-		sessionID,
-	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
-	timeOutput, err := cmd.Output()
-	if err == nil {
-		timeStr := strings.TrimSpace(string(timeOutput))
-		if t, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02T15:04:05.000Z", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02 15:04:05", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		}
-		// If we can't parse the time, proceed anyway — better to try than skip
+	sessionRows, err := querySQLiteJSON(dbPath, fmt.Sprintf(
+		"SELECT * FROM %s ORDER BY rowid DESC LIMIT %d;", sessionTable, sqliteScanLimit,
+	))
+	if err != nil || len(sessionRows) == 0 {
+		return nil, nil
 	}
 
-	// Get messages for this session as a JSON array
-	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
-	)
-	cmd = exec.Command("sqlite3", dbPath, msgQuery)
-	msgOutput, err := cmd.Output()
+	var sessionRow map[string]json.RawMessage
+	for _, row := range sessionRows {
+		flat := flattenRow(row)
+		if rowHasValue(flat, projectID) {
+			sessionRow = flat
+			break
+		}
+	}
+	if sessionRow == nil {
+		return nil, nil
+	}
+
+	sessionID := stringFieldCI(sessionRow, "id")
+	if sessionID == "" {
+		return nil, nil
+	}
+
+	// Skip stale sessions; if we can't find any timestamp field, proceed
+	// anyway — better to try than skip.
+	if !isRecentSessionRow(sessionRow) {
+		return nil, nil
+	}
+
+	messageTable := findSQLiteTable(dbPath, "message")
+	if messageTable == "" {
+		return nil, nil
+	}
+
+	msgRows, err := querySQLiteJSON(dbPath, fmt.Sprintf(
+		"SELECT * FROM %s ORDER BY rowid ASC;", messageTable,
+	))
 	if err != nil {
 		return nil, nil
 	}
 
-	transcriptData := []byte(strings.TrimSpace(string(msgOutput)))
-	// sqlite3 returns "[null]" when no rows match
-	if string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
+	var entries []json.RawMessage
+	for _, row := range msgRows {
+		flat := flattenRow(row)
+		if !rowHasValue(flat, sessionID) {
+			continue
+		}
+		data, err := json.Marshal(flat)
+		if err != nil {
+			continue
+		}
+		entries = append(entries, data)
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+
+	transcriptData, err := json.Marshal(entries)
+	if err != nil {
 		return nil, nil
 	}
 
@@ -377,6 +401,203 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// findSQLiteTable returns the name of a table (or view) in dbPath matching
+// hint, preferring an exact (case-insensitive) match and falling back to the
+// first name containing hint as a substring (e.g. "sessions", "opencode_session").
+func findSQLiteTable(dbPath, hint string) string {
+	cmd := exec.Command("sqlite3", dbPath, "SELECT name FROM sqlite_master WHERE type IN ('table','view');")
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	hint = strings.ToLower(hint)
+	var contains string
+	for _, name := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		lower := strings.ToLower(name)
+		if lower == hint {
+			return name
+		}
+		if contains == "" && strings.Contains(lower, hint) {
+			contains = name
+		}
+	}
+	return contains
+}
+
+// querySQLiteJSON runs a query against dbPath and returns each row as a map
+// of column name to raw JSON value.
+func querySQLiteJSON(dbPath, query string) ([]map[string]json.RawMessage, error) {
+	cmd := exec.Command("sqlite3", "-json", dbPath, query)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	trimmed := strings.TrimSpace(string(output))
+	if trimmed == "" {
+		return nil, nil
+	}
+
+	var rows []map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// flattenRow merges any nested JSON blob columns (e.g. a "data"/"payload"/
+// "body" column holding a JSON-encoded object, whether stored as a native
+// JSON value or a double-encoded string) into the top level of the row, so
+// callers can look up fields without knowing whether a given release stores
+// them as flat columns or inside a blob. The row's own columns win over
+// values unpacked from a blob (mirrors OpenCode's own json_patch(data, ...)
+// pattern of letting the outer id column override any nested id).
+func flattenRow(row map[string]json.RawMessage) map[string]json.RawMessage {
+	merged := map[string]json.RawMessage{}
+	blobKeys := map[string]bool{}
+
+	for key, raw := range row {
+		lower := strings.ToLower(key)
+		if !strings.Contains(lower, "data") && !strings.Contains(lower, "payload") && !strings.Contains(lower, "body") {
+			continue
+		}
+		inner := decodeJSONObject(raw)
+		if inner == nil {
+			continue
+		}
+		for k, v := range inner {
+			merged[k] = v
+		}
+		blobKeys[key] = true
+	}
+
+	for key, raw := range row {
+		if blobKeys[key] {
+			continue
+		}
+		merged[key] = raw
+	}
+
+	return merged
+}
+
+// decodeJSONObject decodes raw as a JSON object, unwrapping one level of
+// string-encoding if raw is a JSON string containing an object.
+func decodeJSONObject(raw json.RawMessage) map[string]json.RawMessage {
+	obj := map[string]json.RawMessage{}
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		return obj
+	}
+
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil && s != "" {
+		if err := json.Unmarshal([]byte(s), &obj); err == nil {
+			return obj
+		}
+	}
+
+	return nil
+}
+
+// rowHasValue reports whether any top-level string value in row equals target.
+func rowHasValue(row map[string]json.RawMessage, target string) bool {
+	if target == "" {
+		return false
+	}
+	for _, raw := range row {
+		var s string
+		if err := json.Unmarshal(raw, &s); err == nil && s == target {
+			return true
+		}
+	}
+	return false
+}
+
+// stringFieldCI returns the string value of the field named name (matched
+// case-insensitively), or "" if not found.
+func stringFieldCI(row map[string]json.RawMessage, name string) string {
+	for key, raw := range row {
+		if !strings.EqualFold(key, name) {
+			continue
+		}
+		var s string
+		if err := json.Unmarshal(raw, &s); err == nil {
+			return s
+		}
+	}
+	return ""
+}
+
+// isRecentSessionRow reports whether row has a timestamp-like field within
+// agent.RecentSessionTimeout of now. If no timestamp field can be found at
+// all, it returns true (proceed anyway — better to try than skip).
+func isRecentSessionRow(row map[string]json.RawMessage) bool {
+	now := time.Now()
+	foundTimestamp := false
+	for key, raw := range row {
+		lower := strings.ToLower(key)
+		if !strings.Contains(lower, "time") && !strings.Contains(lower, "updated") &&
+			!strings.Contains(lower, "created") && !strings.Contains(lower, "date") {
+			continue
+		}
+		t, ok := parseFlexibleTime(raw)
+		if !ok {
+			continue
+		}
+		foundTimestamp = true
+		diff := now.Sub(t)
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff <= agent.RecentSessionTimeout {
+			return true
+		}
+	}
+	return !foundTimestamp
+}
+
+// parseFlexibleTime attempts to parse raw as a timestamp, accepting either a
+// numeric Unix timestamp (seconds, milliseconds, or microseconds) or a
+// handful of common string time formats.
+func parseFlexibleTime(raw json.RawMessage) (time.Time, bool) {
+	var num float64
+	if err := json.Unmarshal(raw, &num); err == nil {
+		if num <= 0 {
+			return time.Time{}, false
+		}
+		switch {
+		case num > 1e15:
+			return time.UnixMicro(int64(num)), true
+		case num > 1e12:
+			return time.UnixMilli(int64(num)), true
+		default:
+			return time.Unix(int64(num), 0), true
+		}
+	}
+
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil && s != "" {
+		formats := []string{
+			time.RFC3339Nano,
+			time.RFC3339,
+			"2006-01-02T15:04:05.000Z",
+			"2006-01-02 15:04:05",
+		}
+		for _, f := range formats {
+			if t, err := time.Parse(f, s); err == nil {
+				return t, true
+			}
+		}
+	}
+
+	return time.Time{}, false
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -497,4 +718,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
