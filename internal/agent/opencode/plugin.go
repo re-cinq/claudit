@@ -22,8 +22,35 @@ const pluginTemplate = `// shiftlog plugin for OpenCode CLI
 export const ShiftlogPlugin = async ({ directory, client }) => {
   const pendingCommits = new Map();
 
+  // Record that a session is active by writing a marker file shiftlog can
+  // read directly. OpenCode's own on-disk session storage (flat JSON files
+  // vs SQLite, exact schema) has changed across releases, so a marker we
+  // control ourselves is a more reliable pointer than reverse-engineering
+  // that internal layout.
+  const recordActiveSession = (sessionID) => {
+    if (!sessionID) return;
+    try {
+      const fs = require("fs");
+      const path = require("path");
+      const shiftlogDir = path.join(directory, ".shiftlog");
+      fs.mkdirSync(shiftlogDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(shiftlogDir, "active-session.json"),
+        JSON.stringify({
+          session_id: sessionID,
+          started_at: new Date().toISOString(),
+          project_path: directory,
+        })
+      );
+    } catch (e) {
+      // Silently ignore errors to not disrupt workflow
+    }
+  };
+
   return {
     "tool.execute.before": async (input, output) => {
+      recordActiveSession(input?.sessionID);
+
       const command = output?.args?.command || output?.args?.cmd || "";
       if (command.includes("git commit") || command.includes("git-commit")) {
         pendingCommits.set(input.callID, {
