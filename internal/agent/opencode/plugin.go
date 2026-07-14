@@ -22,6 +22,15 @@ const pluginTemplate = `// shiftlog plugin for OpenCode CLI
 export const ShiftlogPlugin = async ({ directory, client }) => {
   const pendingCommits = new Map();
 
+  // Races a promise against a timeout so a stalled call (e.g. the SDK
+  // client calling back into OpenCode's own in-flight request) can never
+  // block the tool-execution lifecycle indefinitely.
+  const withTimeout = (promise, ms) =>
+    Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("shiftlog: timed out")), ms)),
+    ]);
+
   return {
     "tool.execute.before": async (input, output) => {
       const command = output?.args?.command || output?.args?.cmd || "";
@@ -39,11 +48,18 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
       if (!pending) return;
       pendingCommits.delete(input.callID);
 
-      // Try to fetch messages via the SDK client API
+      // Try to fetch messages via the SDK client API. This call can stall
+      // indefinitely on some OpenCode versions if invoked while a tool
+      // result is still being flushed, so it is bounded by a timeout and
+      // any failure (including a timeout) falls back to the data_dir
+      // approach below, which the Go binary can read from disk.
       let transcriptData = "";
       if (client && pending.sessionID) {
         try {
-          const msgs = await client.session.messages({ path: { id: pending.sessionID } });
+          const msgs = await withTimeout(
+            client.session.messages({ path: { id: pending.sessionID } }),
+            3000
+          );
           if (msgs && Array.isArray(msgs)) {
             transcriptData = JSON.stringify(msgs.map(m => ({
               role: m.role || "",
@@ -75,7 +91,7 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
         execSync("shiftlog store --agent=opencode", {
           input: hookData,
           cwd: directory,
-          timeout: 30000,
+          timeout: 10000,
           stdio: ["pipe", "pipe", "pipe"],
         });
       } catch (e) {
