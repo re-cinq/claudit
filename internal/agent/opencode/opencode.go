@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -230,9 +231,20 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+//
+// It tries three strategies, in order:
+//  1. Flat file storage nested under our own computed project ID
+//     (dataDir/storage/session/<GetProjectID>/*.json).
+//  2. A broad scan of every session file under dataDir/storage/session,
+//     matched by the session's own embedded "directory" field rather than
+//     by our computed project ID. This is the resilient path: OpenCode's
+//     on-disk project directory naming is an implementation detail that can
+//     change between releases, but the session's recorded working directory
+//     is stable, so matching on it survives that drift. See ScanAllSessions.
+//  3. SQLite storage, for OpenCode versions that persist sessions in a DB
+//     instead of flat files.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
+	// Strategy 1: flat file storage nested by our computed project ID.
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
 		return nil, err
@@ -241,7 +253,16 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
+	// Strategy 2: broad scan matched by the session's own "directory" field.
+	session, err = ScanAllSessions(projectPath)
+	if err != nil {
+		return nil, err
+	}
+	if session != nil {
+		return session, nil
+	}
+
+	// Strategy 3: SQLite storage.
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
@@ -294,7 +315,11 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}
 
 	// The transcript path for OpenCode is the message directory
-	msgDir, _ := GetMessageDir(bestSessionID)
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return nil, nil
+	}
+	msgDir := resolveMessageDir(dataDir, bestSessionID)
 
 	return &agent.SessionInfo{
 		SessionID:      bestSessionID,
@@ -454,7 +479,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +521,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```

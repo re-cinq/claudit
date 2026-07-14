@@ -1,13 +1,18 @@
+```go
 package opencode
 
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -127,3 +132,116 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+
+// ScanAllSessions scans every session file under OpenCode's session storage
+// root, regardless of how it is nested on disk, and returns the most recent
+// one whose embedded "directory" field matches projectPath.
+//
+// GetSessionDir/discoverFromFlatFiles assume OpenCode nests session files
+// under a directory named by our own computed GetProjectID (the git root
+// commit hash). That nesting scheme is our own guess at OpenCode's internal
+// layout, not a stable public contract, so newer OpenCode releases can key
+// their on-disk project directories differently and break the exact-match
+// lookup. Every session file OpenCode writes carries the session's working
+// directory internally (see sessionInfo.Directory), so matching on that
+// content instead of a computed path is resilient to that kind of drift.
+// This mirrors the same fallback pattern used by the Gemini agent's
+// ScanAllProjectDirs for the equivalent problem.
+func ScanAllSessions(projectPath string) (*agent.SessionInfo, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return nil, nil
+	}
+
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	now := time.Now()
+	var bestSessionID string
+	var bestModTime time.Time
+
+	_ = filepath.WalkDir(sessionRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // skip unreadable entries rather than aborting the whole scan
+		}
+		if d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return nil
+		}
+		if bestSessionID != "" && !modTime.After(bestModTime) {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		var session sessionInfo
+		if err := json.Unmarshal(data, &session); err != nil {
+			return nil
+		}
+		if session.Directory == "" || !agent.PathsEqual(session.Directory, projectPath) {
+			return nil
+		}
+
+		id := session.ID
+		if id == "" {
+			id = strings.TrimSuffix(d.Name(), ".json")
+		}
+
+		bestSessionID = id
+		bestModTime = modTime
+		return nil
+	})
+
+	if bestSessionID == "" {
+		return nil, nil
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: resolveMessageDir(dataDir, bestSessionID),
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
+}
+
+// resolveMessageDir locates the directory containing a session's message
+// files. It tries the known layout first, then falls back to a recursive
+// search under the storage directory for one named after the session ID —
+// insurance against the message directory being nested differently than
+// GetMessageDir assumes. Falls back to GetMessageDir's default path (which
+// may not exist) so callers still get a best-effort location.
+func resolveMessageDir(dataDir, sessionID string) string {
+	primary := filepath.Join(dataDir, "storage", "message", sessionID)
+	if info, err := os.Stat(primary); err == nil && info.IsDir() {
+		return primary
+	}
+
+	storageRoot := filepath.Join(dataDir, "storage")
+	var found string
+	_ = filepath.WalkDir(storageRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || found != "" {
+			return nil
+		}
+		if d.IsDir() && d.Name() == sessionID {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if found != "" {
+		return found
+	}
+
+	return primary
+}
+```
