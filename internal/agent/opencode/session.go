@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +129,73 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// FindSessionByDirectory scans every project directory under storage/session
+// and returns the most recently modified session whose "directory" field
+// matches projectPath exactly. Some OpenCode releases key session storage
+// differently than the git-root-commit-hash project ID GetProjectID
+// assumes, so this is used as a fallback when the project-ID-derived
+// directory has no (recent) match.
+func FindSessionByDirectory(dataDir, projectPath string) (sessionID string, found bool) {
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	projectDirs, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		return "", false
+	}
+
+	now := time.Now()
+	var bestID string
+	var bestModTime time.Time
+
+	for _, projectDir := range projectDirs {
+		if !projectDir.IsDir() {
+			continue
+		}
+
+		dirPath := filepath.Join(sessionRoot, projectDir.Name())
+		entries, err := os.ReadDir(dirPath)
+		if err != nil {
+			continue
+		}
+
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+
+			modTime := info.ModTime()
+			if now.Sub(modTime) > agent.RecentSessionTimeout {
+				continue
+			}
+
+			data, err := os.ReadFile(filepath.Join(dirPath, entry.Name()))
+			if err != nil {
+				continue
+			}
+
+			var session sessionInfo
+			if err := json.Unmarshal(data, &session); err != nil {
+				continue
+			}
+			if session.Directory != projectPath {
+				continue
+			}
+
+			if bestID == "" || modTime.After(bestModTime) {
+				bestID = strings.TrimSuffix(entry.Name(), ".json")
+				bestModTime = modTime
+			}
+		}
+	}
+
+	if bestID == "" {
+		return "", false
+	}
+	return bestID, true
 }
