@@ -39,13 +39,25 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
       if (!pending) return;
       pendingCommits.delete(input.callID);
 
-      // Try to fetch messages via the SDK client API
+      // Try to fetch messages via the SDK client API. This is bounded with a
+      // timeout: some client/server versions can leave this promise pending
+      // indefinitely (e.g. after an SDK response-shape change), which would
+      // otherwise hang the entire OpenCode run waiting on this hook.
       let transcriptData = "";
       if (client && pending.sessionID) {
         try {
-          const msgs = await client.session.messages({ path: { id: pending.sessionID } });
-          if (msgs && Array.isArray(msgs)) {
-            transcriptData = JSON.stringify(msgs.map(m => ({
+          const timeout = new Promise((resolve) => setTimeout(() => resolve(undefined), 5000));
+          const msgs = await Promise.race([
+            client.session.messages({ path: { id: pending.sessionID } }),
+            timeout,
+          ]);
+          // Newer SDK versions may wrap the array in a { data: [...] } envelope
+          // instead of returning it directly.
+          const list = Array.isArray(msgs)
+            ? msgs
+            : (msgs && Array.isArray(msgs.data) ? msgs.data : null);
+          if (list) {
+            transcriptData = JSON.stringify(list.map(m => ({
               role: m.role || "",
               id: m.id || "",
               content: m.content || "",

@@ -3,11 +3,15 @@ package opencode
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -79,6 +83,118 @@ type sessionInfo struct {
 	ProjectID string `json:"projectID,omitempty"`
 	Directory string `json:"directory,omitempty"`
 	Title     string `json:"title,omitempty"`
+}
+
+// scannedSession is the result of locating a session file on disk.
+type scannedSession struct {
+	id      string
+	modTime time.Time
+}
+
+// scanSessionDir finds the most recently modified session file in a
+// project's session directory (keyed by shiftlog's own project ID
+// computation via GetSessionDir).
+func scanSessionDir(sessionDir string) (scannedSession, bool) {
+	entries, err := os.ReadDir(sessionDir)
+	if err != nil {
+		return scannedSession{}, false
+	}
+
+	now := time.Now()
+	var best scannedSession
+	found := false
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			continue
+		}
+
+		if !found || modTime.After(best.modTime) {
+			best = scannedSession{
+				id:      strings.TrimSuffix(entry.Name(), ".json"),
+				modTime: modTime,
+			}
+			found = true
+		}
+	}
+
+	return best, found
+}
+
+// scanAllSessionsForDirectory walks the full storage/session tree under the
+// OpenCode data directory and returns the most recently modified session
+// whose recorded directory matches projectPath.
+//
+// This intentionally does not assume any particular project-ID partitioning
+// scheme: OpenCode has changed how it derives/nests project identifiers
+// across releases, so shiftlog's own reconstruction of that ID (from the git
+// root commit) can drift out of sync with OpenCode's on-disk layout even
+// though a matching session exists. Matching on the directory value each
+// session file records is robust to that drift.
+func scanAllSessionsForDirectory(dataDir, projectPath string) (scannedSession, bool) {
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	now := time.Now()
+	var best scannedSession
+	found := false
+
+	_ = filepath.WalkDir(sessionRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return nil
+		}
+		if found && !modTime.After(best.modTime) {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		var fields map[string]interface{}
+		if err := json.Unmarshal(data, &fields); err != nil {
+			return nil
+		}
+
+		dir, _ := fields["directory"].(string)
+		if dir == "" {
+			dir, _ = fields["worktree"].(string)
+		}
+		if dir == "" || !agent.PathsEqual(dir, projectPath) {
+			return nil
+		}
+
+		best = scannedSession{
+			id:      strings.TrimSuffix(d.Name(), ".json"),
+			modTime: modTime,
+		}
+		found = true
+		return nil
+	})
+
+	return best, found
 }
 
 // WriteSessionFile writes a session and its messages to OpenCode's storage.
