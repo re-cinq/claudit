@@ -73,6 +73,87 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// candidateSessionDirs returns, in priority order, directories that may
+// contain this project's OpenCode session files. OpenCode's on-disk layout
+// has changed across releases: some versions nest session files under a
+// per-project directory (storage/session/<projectID>), while others store
+// all sessions in one flat directory (storage/session/info or
+// storage/session) and record the owning project inside each session file.
+// The first entry is always the legacy per-project directory.
+func candidateSessionDirs(dataDir, projectID string) []string {
+	return []string{
+		filepath.Join(dataDir, "storage", "session", projectID),
+		filepath.Join(dataDir, "storage", "session", "info"),
+		filepath.Join(dataDir, "storage", "session"),
+	}
+}
+
+// candidateMessageDirs returns, in priority order, directories that may
+// contain message files for a session.
+func candidateMessageDirs(dataDir, sessionID string) []string {
+	return []string{
+		filepath.Join(dataDir, "storage", "session", "message", sessionID),
+		filepath.Join(dataDir, "storage", "message", sessionID),
+	}
+}
+
+// resolveMessageDir picks the first candidate message directory that
+// actually exists and contains entries, falling back to the legacy path
+// (storage/message/<sessionID>) so callers get a stable default even when
+// nothing is found on disk yet.
+func resolveMessageDir(dataDir, sessionID string) string {
+	dirs := candidateMessageDirs(dataDir, sessionID)
+	for _, dir := range dirs {
+		if entries, err := os.ReadDir(dir); err == nil && len(entries) > 0 {
+			return dir
+		}
+	}
+	return dirs[len(dirs)-1]
+}
+
+// sessionIDFromFile extracts the "id" field from a session JSON blob, if
+// present.
+func sessionIDFromFile(data []byte) string {
+	var sess struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(data, &sess) == nil {
+		return sess.ID
+	}
+	return ""
+}
+
+// sessionBelongsToProject checks whether a session JSON blob references the
+// given project, trying every field name OpenCode has used across releases
+// to record project ownership (a project ID hash, or the project's absolute
+// directory path).
+func sessionBelongsToProject(data []byte, projectID, absProjectPath string) bool {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return false
+	}
+
+	for _, key := range []string{"projectID", "project_id", "projectId"} {
+		if raw, ok := fields[key]; ok {
+			var v string
+			if json.Unmarshal(raw, &v) == nil && v == projectID {
+				return true
+			}
+		}
+	}
+
+	for _, key := range []string{"directory", "worktree", "path", "cwd"} {
+		if raw, ok := fields[key]; ok {
+			var v string
+			if json.Unmarshal(raw, &v) == nil && v == absProjectPath {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
