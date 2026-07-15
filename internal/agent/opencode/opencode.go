@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -283,8 +284,20 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 			continue
 		}
 
+		sessionID := strings.TrimSuffix(entry.Name(), ".json")
+
+		// OpenCode v1.2+ keeps writing the session index file (for `opencode
+		// session list` etc.) even after moving message storage to SQLite.
+		// Treating the index file alone as authoritative produces a session
+		// whose transcript path has no data behind it. Only accept a flat-file
+		// candidate when its message directory actually has content; otherwise
+		// let DiscoverSession fall through to the SQLite lookup below.
+		if !hasFlatFileMessages(sessionID) {
+			continue
+		}
+
 		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
 	}
@@ -302,6 +315,32 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// hasFlatFileMessages reports whether a session's flat-file message directory
+// exists and contains at least one message file.
+func hasFlatFileMessages(sessionID string) bool {
+	msgDir, err := GetMessageDir(sessionID)
+	if err != nil {
+		return false
+	}
+
+	entries, err := os.ReadDir(msgDir)
+	if err != nil {
+		return false
+	}
+
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasSuffix(name, ".json") || strings.HasSuffix(name, ".jsonl") {
+			return true
+		}
+	}
+
+	return false
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -454,7 +493,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +535,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
