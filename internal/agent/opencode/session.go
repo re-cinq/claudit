@@ -3,11 +3,15 @@ package opencode
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +130,158 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// discoverByContentScan searches the OpenCode data directory for the most
+// recently modified session belonging to projectPath, without assuming a
+// fixed on-disk layout. OpenCode's storage layout (flat files, per-project
+// subdirectories, SQLite) has changed across releases, so matching by file
+// content is more resilient than hardcoding a path shape that may no
+// longer exist in newer releases.
+func discoverByContentScan(dataDir, projectPath string) (*agent.SessionInfo, error) {
+	absProject, err := filepath.Abs(projectPath)
+	if err != nil {
+		absProject = projectPath
+	}
+	legacyProjectID := GetProjectID(projectPath)
+
+	now := time.Now()
+	var bestSessionID string
+	var bestModTime time.Time
+
+	_ = filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil || now.Sub(info.ModTime()) > agent.RecentSessionTimeout {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil
+		}
+		fields := sessionCandidateFields(raw)
+
+		id := firstJSONString(fields, "id", "sessionID", "session_id")
+		if id == "" {
+			return nil
+		}
+
+		dir := firstJSONString(fields, "directory", "cwd", "worktree", "path", "projectPath")
+		pid := firstJSONString(fields, "projectID", "project_id", "projectId")
+
+		matched := (dir != "" && (dir == absProject || dir == projectPath)) ||
+			(pid != "" && legacyProjectID != "global" && pid == legacyProjectID)
+		if !matched {
+			return nil
+		}
+
+		if bestSessionID == "" || info.ModTime().After(bestModTime) {
+			bestSessionID = id
+			bestModTime = info.ModTime()
+		}
+		return nil
+	})
+
+	if bestSessionID == "" {
+		return nil, nil
+	}
+
+	transcriptPath, transcriptData := collectMessagesFor(dataDir, bestSessionID)
+	if transcriptPath == "" && len(transcriptData) == 0 {
+		return nil, nil
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: transcriptPath,
+		TranscriptData: transcriptData,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
+}
+
+// sessionCandidateFields returns the fields to inspect for session
+// metadata, unwrapping a nested "info" object if the record uses one.
+func sessionCandidateFields(raw map[string]json.RawMessage) map[string]json.RawMessage {
+	if infoRaw, ok := raw["info"]; ok {
+		var nested map[string]json.RawMessage
+		if err := json.Unmarshal(infoRaw, &nested); err == nil {
+			return nested
+		}
+	}
+	return raw
+}
+
+// firstJSONString returns the first non-empty string value found among the
+// given keys in raw.
+func firstJSONString(raw map[string]json.RawMessage, keys ...string) string {
+	for _, key := range keys {
+		v, ok := raw[key]
+		if !ok {
+			continue
+		}
+		var s string
+		if err := json.Unmarshal(v, &s); err == nil && s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// collectMessagesFor locates the messages for sessionID under dataDir,
+// either as a same-named directory of message files (returned as
+// transcriptPath for the existing directory parser) or as individual
+// files scattered anywhere under dataDir that reference the session ID
+// (collected inline as a JSON array in transcriptData).
+func collectMessagesFor(dataDir, sessionID string) (transcriptPath string, transcriptData []byte) {
+	_ = filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if d.IsDir() && d.Name() == sessionID {
+			transcriptPath = path
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if transcriptPath != "" {
+		return transcriptPath, nil
+	}
+
+	var messages []json.RawMessage
+	_ = filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil
+		}
+		if firstJSONString(raw, "sessionID", "session_id") == sessionID {
+			messages = append(messages, json.RawMessage(append([]byte{}, data...)))
+		}
+		return nil
+	})
+
+	if len(messages) == 0 {
+		return "", nil
+	}
+	data, err := json.Marshal(messages)
+	if err != nil {
+		return "", nil
+	}
+	return "", data
 }
