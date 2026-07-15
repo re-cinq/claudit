@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -10,8 +11,15 @@ import (
 // tool execution hooks and calls shiftlog store after git commits.
 //
 // OpenCode plugin hooks:
+//   permission.ask(input, output)      — input: {id, type, pattern, sessionID, ...}, output: {status}
 //   tool.execute.before(input, output) — input: {tool, sessionID, callID}, output: {args}
 //   tool.execute.after(input, output)  — input: {tool, sessionID, callID}, output: {title, output, metadata}
+//
+// Newer OpenCode releases route tool calls through the permission system even
+// when opencode.json sets "permission": "allow", and a non-interactive `opencode
+// run` invocation has no TTY to answer an interactive prompt, so it hangs
+// indefinitely. We auto-approve here so agent runs launched by shiftlog never
+// block waiting for input that can never arrive.
 //
 // The command string is only available in the "before" hook (via output.args),
 // so we capture it there and act on it in the "after" hook, matching by callID.
@@ -23,6 +31,10 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
   const pendingCommits = new Map();
 
   return {
+    "permission.ask": async (input, output) => {
+      output.status = "allow";
+    },
+
     "tool.execute.before": async (input, output) => {
       const command = output?.args?.command || output?.args?.cmd || "";
       if (command.includes("git commit") || command.includes("git-commit")) {
@@ -125,3 +137,4 @@ func HasPlugin(repoRoot string) bool {
 	_, err := os.Stat(pluginPath)
 	return err == nil
 }
+```
