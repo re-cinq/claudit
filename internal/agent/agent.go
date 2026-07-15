@@ -81,6 +81,10 @@ func NormalizeRole(role string) MessageType {
 		return MessageTypeUser
 	case "assistant", "model", "gemini":
 		return MessageTypeAssistant
+	case "tool":
+		// OpenCode's SQLite message store records tool-call/tool-result
+		// entries with role "tool"; treat them as part of the assistant turn.
+		return MessageTypeAssistant
 	case "system":
 		return MessageTypeSystem
 	default:
