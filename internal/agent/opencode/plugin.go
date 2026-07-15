@@ -22,6 +22,17 @@ const pluginTemplate = `// shiftlog plugin for OpenCode CLI
 export const ShiftlogPlugin = async ({ directory, client }) => {
   const pendingCommits = new Map();
 
+  // Races a promise against a timeout so a single client call can never
+  // block tool completion indefinitely. Calling back into the OpenCode
+  // server from within one of its own hooks can deadlock (the server can't
+  // service the request until the current turn finishes, but the turn is
+  // waiting on this hook), so we bound the wait and fall back gracefully.
+  const withTimeout = (promise, ms) =>
+    Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), ms)),
+    ]);
+
   return {
     "tool.execute.before": async (input, output) => {
       const command = output?.args?.command || output?.args?.cmd || "";
@@ -43,7 +54,10 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
       let transcriptData = "";
       if (client && pending.sessionID) {
         try {
-          const msgs = await client.session.messages({ path: { id: pending.sessionID } });
+          const msgs = await withTimeout(
+            client.session.messages({ path: { id: pending.sessionID } }),
+            5000
+          );
           if (msgs && Array.isArray(msgs)) {
             transcriptData = JSON.stringify(msgs.map(m => ({
               role: m.role || "",

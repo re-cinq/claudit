@@ -304,6 +304,23 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
+// sqliteBusyTimeoutMS bounds how long the sqlite3 CLI will wait for a write
+// lock held by OpenCode's own process before giving up. Newer OpenCode
+// versions (1.18+) keep a longer-lived connection open for session/TUI
+// management even after "opencode run" returns, so a plain query issued
+// without a busy timeout can fail immediately with "database is locked"
+// instead of waiting briefly for the lock to clear.
+const sqliteBusyTimeoutMS = 5000
+
+// runSQLiteQuery runs a query against dbPath with a busy timeout set so
+// transient lock contention with a concurrently running OpenCode process
+// doesn't cause the query to fail outright.
+func runSQLiteQuery(extraArgs []string, dbPath, query string) ([]byte, error) {
+	pragma := fmt.Sprintf("PRAGMA busy_timeout=%d;", sqliteBusyTimeoutMS)
+	args := append(append([]string{}, extraArgs...), dbPath, pragma+" "+query)
+	return exec.Command("sqlite3", args...).Output()
+}
+
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
@@ -321,8 +338,7 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
 		projectID,
 	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
+	sessionOutput, err := runSQLiteQuery([]string{"-separator", "\t"}, dbPath, sessionQuery)
 	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
 		return nil, nil
 	}
@@ -333,8 +349,7 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		`SELECT time_updated FROM session WHERE id='%s';`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
-	timeOutput, err := cmd.Output()
+	timeOutput, err := runSQLiteQuery(nil, dbPath, timeQuery)
 	if err == nil {
 		timeStr := strings.TrimSpace(string(timeOutput))
 		if t, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
@@ -358,8 +373,7 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, msgQuery)
-	msgOutput, err := cmd.Output()
+	msgOutput, err := runSQLiteQuery(nil, dbPath, msgQuery)
 	if err != nil {
 		return nil, nil
 	}
@@ -497,4 +511,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
