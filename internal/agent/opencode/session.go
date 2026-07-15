@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +129,116 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// scanSessionCandidate probes the fields OpenCode has used across versions to
+// record which project a session belongs to (nested directory, embedded
+// projectID, embedded cwd/directory path), since the on-disk layout has
+// changed release to release.
+type scanSessionCandidate struct {
+	ID        string `json:"id"`
+	ProjectID string `json:"projectID"`
+	Directory string `json:"directory"`
+	CWD       string `json:"cwd"`
+	Path      string `json:"path"`
+}
+
+// ScanAllSessions recursively scans OpenCode's session storage tree for the
+// most recently modified session that can be matched to projectPath, falling
+// back to the single most recently modified session file overall if no
+// content match is found. This is deliberately layout-agnostic: OpenCode has
+// nested sessions under a per-project directory in some releases and stored
+// them flat (with the project recorded inside the JSON) in others, so this
+// does not assume one fixed directory structure the way GetSessionDir does.
+func ScanAllSessions(projectPath string) (*agent.SessionInfo, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return nil, nil
+	}
+
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	if _, err := os.Stat(sessionRoot); err != nil {
+		return nil, nil
+	}
+
+	projectID := GetProjectID(projectPath)
+	now := time.Now()
+
+	var bestSessionID string
+	var bestModTime time.Time
+	var bestMatchedID string
+	var bestMatchedModTime time.Time
+
+	_ = filepath.Walk(sessionRoot, func(p string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info == nil || info.IsDir() || !strings.HasSuffix(info.Name(), ".json") {
+			return nil
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return nil
+		}
+
+		// Track the most recently modified session file overall, regardless
+		// of whether it can be matched to this project. Used as a last
+		// resort below if no content match is found.
+		if bestSessionID == "" || modTime.After(bestModTime) {
+			bestSessionID = strings.TrimSuffix(info.Name(), ".json")
+			bestModTime = modTime
+		}
+
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+
+		var candidate scanSessionCandidate
+		if err := json.Unmarshal(data, &candidate); err != nil {
+			return nil
+		}
+
+		matches := candidate.ProjectID != "" && candidate.ProjectID == projectID
+		if !matches {
+			for _, dir := range []string{candidate.Directory, candidate.CWD, candidate.Path} {
+				if dir != "" && agent.PathsEqual(dir, projectPath) {
+					matches = true
+					break
+				}
+			}
+		}
+		if !matches {
+			return nil
+		}
+
+		if bestMatchedID == "" || modTime.After(bestMatchedModTime) {
+			id := candidate.ID
+			if id == "" {
+				id = strings.TrimSuffix(info.Name(), ".json")
+			}
+			bestMatchedID = id
+			bestMatchedModTime = modTime
+		}
+
+		return nil
+	})
+
+	sessionID := bestMatchedID
+	modTime := bestMatchedModTime
+	if sessionID == "" {
+		sessionID = bestSessionID
+		modTime = bestModTime
+	}
+
+	if sessionID == "" {
+		return nil, nil
+	}
+
+	msgDir, _ := GetMessageDir(sessionID)
+
+	return &agent.SessionInfo{
+		SessionID:      sessionID,
+		TranscriptPath: msgDir,
+		StartedAt:      modTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
 }
