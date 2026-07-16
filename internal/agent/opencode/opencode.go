@@ -304,6 +304,18 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
+// sqliteBusyTimeoutCmd is prepended to sqlite3 CLI scripts that read the
+// OpenCode session database. OpenCode's CLI can keep a background
+// process/connection around after "opencode run" exits (e.g. to serve
+// follow-up invocations), which can hold the WAL open or briefly lock the
+// database. Without a busy timeout, our read-only queries fail immediately
+// with SQLITE_BUSY and DiscoverSession silently returns nothing.
+//
+// This uses the ".timeout" dot-command rather than "PRAGMA busy_timeout=...;"
+// because dot-commands never produce a result row, so they can't corrupt the
+// single-value/JSON output our queries below parse.
+const sqliteBusyTimeoutCmd = ".timeout 5000\n"
+
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
@@ -317,7 +329,7 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	}
 
 	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
+	sessionQuery := sqliteBusyTimeoutCmd + fmt.Sprintf(
 		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
 		projectID,
 	)
@@ -329,7 +341,7 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	sessionID := strings.TrimSpace(string(sessionOutput))
 
 	// Check if this session was recent (within timeout)
-	timeQuery := fmt.Sprintf(
+	timeQuery := sqliteBusyTimeoutCmd + fmt.Sprintf(
 		`SELECT time_updated FROM session WHERE id='%s';`,
 		sessionID,
 	)
@@ -354,7 +366,7 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	}
 
 	// Get messages for this session as a JSON array
-	msgQuery := fmt.Sprintf(
+	msgQuery := sqliteBusyTimeoutCmd + fmt.Sprintf(
 		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
 		sessionID,
 	)
@@ -483,7 +495,6 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 		var blocks []agent.ContentBlock
 		if err := json.Unmarshal(contentRaw, &blocks); err == nil && len(blocks) > 0 {
 			msg.Content = blocks
-			return msg
 		}
 	}
 
@@ -497,4 +508,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
