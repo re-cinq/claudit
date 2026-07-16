@@ -304,10 +304,80 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
+// findSQLiteDB locates OpenCode's SQLite database. Older versions kept a
+// single "opencode.db" directly under the data directory, but newer OpenCode
+// releases may nest it under a per-project/per-instance subdirectory, or use
+// a slightly different data directory name (e.g. via Node's env-paths style
+// conventions). We search rather than assume a single fixed path so session
+// discovery keeps working across upstream storage layout changes.
+func findSQLiteDB(dataDir string) string {
+	if db := searchForDB(dataDir); db != "" {
+		return db
+	}
+
+	// The data directory name itself may have drifted (e.g. "opencode-nodejs"
+	// instead of "opencode"). Check sibling directories under the same XDG
+	// data root that look like they belong to OpenCode.
+	root := filepath.Dir(dataDir)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return ""
+	}
+	base := filepath.Base(dataDir)
+	for _, e := range entries {
+		if !e.IsDir() || e.Name() == base {
+			continue
+		}
+		if !strings.HasPrefix(strings.ToLower(e.Name()), "opencode") {
+			continue
+		}
+		if db := searchForDB(filepath.Join(root, e.Name())); db != "" {
+			return db
+		}
+	}
+	return ""
+}
+
+// searchForDB walks dir looking for an OpenCode SQLite database file.
+func searchForDB(dir string) string {
+	if _, err := os.Stat(dir); err != nil {
+		return ""
+	}
+
+	direct := filepath.Join(dir, "opencode.db")
+	if _, err := os.Stat(direct); err == nil {
+		return direct
+	}
+
+	var found string
+	var fallback string
+	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || found != "" {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if name == "opencode.db" {
+			found = path
+			return filepath.SkipAll
+		}
+		if fallback == "" && (strings.HasSuffix(name, ".db") || strings.HasSuffix(name, ".sqlite") || strings.HasSuffix(name, ".sqlite3")) {
+			fallback = path
+		}
+		return nil
+	})
+	if found != "" {
+		return found
+	}
+	return fallback
+}
+
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
-	dbPath := filepath.Join(dataDir, "opencode.db")
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+	dbPath := findSQLiteDB(dataDir)
+	if dbPath == "" {
 		return nil, nil
 	}
 
@@ -497,4 +567,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
