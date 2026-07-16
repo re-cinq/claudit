@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +129,121 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// maxSessionScanDepth bounds how deep scanForRecentSession and
+// resolveMessageDir will recurse below their root directory. OpenCode's
+// on-disk session layout has changed across releases (sessions partitioned
+// into per-project directories vs. flat files that carry the project
+// association inside the JSON payload); a shallow bounded walk lets
+// discovery tolerate either layout without scanning unbounded state.
+const maxSessionScanDepth = 4
+
+// scanForRecentSession walks root (an OpenCode "storage/session" directory)
+// for the most recently modified session JSON file, within
+// agent.RecentSessionTimeout, that belongs to projectID/projectPath. A
+// session file matches either by legacy path partitioning
+// (storage/session/<projectID>/...) or by its "projectID"/"directory"
+// fields, so this survives OpenCode changing how sessions are laid out on
+// disk between versions.
+func scanForRecentSession(root, projectID, projectPath string) (sessionInfo, time.Time, bool) {
+	var best sessionInfo
+	var bestModTime time.Time
+	found := false
+	now := time.Now()
+
+	rootDepth := strings.Count(filepath.Clean(root), string(filepath.Separator))
+
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if path == root {
+				return nil
+			}
+			depth := strings.Count(filepath.Clean(path), string(filepath.Separator)) - rootDepth
+			if depth > maxSessionScanDepth {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil || now.Sub(info.ModTime()) > agent.RecentSessionTimeout {
+			return nil
+		}
+
+		// Legacy layout: sessions partitioned under storage/session/<projectID>/...
+		rel, relErr := filepath.Rel(root, path)
+		pathMatches := relErr == nil && (rel == projectID+".json" ||
+			strings.HasPrefix(rel, projectID+string(filepath.Separator)))
+
+		data, readErr := os.ReadFile(path)
+		var s sessionInfo
+		contentMatches := false
+		if readErr == nil && json.Unmarshal(data, &s) == nil && s.ID != "" {
+			contentMatches = s.ProjectID == projectID ||
+				(s.Directory != "" && agent.PathsEqual(s.Directory, projectPath))
+		}
+
+		if !pathMatches && !contentMatches {
+			return nil
+		}
+		if s.ID == "" {
+			// Path matched but the file didn't parse into a usable session
+			// (or had no "id" field); fall back to the filename.
+			s.ID = strings.TrimSuffix(d.Name(), ".json")
+		}
+
+		if !found || info.ModTime().After(bestModTime) {
+			best = s
+			bestModTime = info.ModTime()
+			found = true
+		}
+		return nil
+	})
+
+	return best, bestModTime, found
+}
+
+// resolveMessageDir locates the message directory for a session. It first
+// tries the standard storage/message/<sessionID> path; if that doesn't
+// exist (OpenCode has moved message storage around between releases), it
+// falls back to a bounded search for a directory named after the session ID
+// under storage/.
+func resolveMessageDir(dataDir, sessionID string) string {
+	direct := filepath.Join(dataDir, "storage", "message", sessionID)
+	if info, err := os.Stat(direct); err == nil && info.IsDir() {
+		return direct
+	}
+
+	storageRoot := filepath.Join(dataDir, "storage")
+	rootDepth := strings.Count(filepath.Clean(storageRoot), string(filepath.Separator))
+	var found string
+	_ = filepath.WalkDir(storageRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil || found != "" {
+			return nil
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		depth := strings.Count(filepath.Clean(path), string(filepath.Separator)) - rootDepth
+		if depth > maxSessionScanDepth {
+			return filepath.SkipDir
+		}
+		if d.Name() == sessionID {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+
+	if found != "" {
+		return found
+	}
+	return direct
 }
