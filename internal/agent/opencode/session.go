@@ -34,6 +34,52 @@ func GetDataDir() (string, error) {
 	return filepath.Join(home, ".local", "share", "opencode"), nil
 }
 
+// GetDataDirCandidates returns every directory OpenCode might be storing its
+// data in, ordered from most to least likely. Newer OpenCode releases moved
+// session/state storage from XDG_DATA_HOME to XDG_STATE_HOME; probing both
+// keeps session discovery working regardless of which convention the
+// installed version follows. Duplicate paths (e.g. on macOS, where both
+// variables resolve to the same directory) are removed.
+func GetDataDirCandidates() ([]string, error) {
+	var candidates []string
+
+	if runtime.GOOS == "darwin" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("could not determine home directory: %w", err)
+		}
+		candidates = append(candidates, filepath.Join(home, "Library", "Application Support", "opencode"))
+	} else {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("could not determine home directory: %w", err)
+		}
+
+		if xdg := os.Getenv("XDG_STATE_HOME"); xdg != "" {
+			candidates = append(candidates, filepath.Join(xdg, "opencode"))
+		} else {
+			candidates = append(candidates, filepath.Join(home, ".local", "state", "opencode"))
+		}
+
+		if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
+			candidates = append(candidates, filepath.Join(xdg, "opencode"))
+		} else {
+			candidates = append(candidates, filepath.Join(home, ".local", "share", "opencode"))
+		}
+	}
+
+	seen := make(map[string]bool, len(candidates))
+	deduped := candidates[:0]
+	for _, c := range candidates {
+		if !seen[c] {
+			seen[c] = true
+			deduped = append(deduped, c)
+		}
+	}
+
+	return deduped, nil
+}
+
 // GetProjectID returns the project identifier for OpenCode.
 // For git repos, this is the root commit hash. For non-git dirs, it's "global".
 func GetProjectID(projectPath string) string {
