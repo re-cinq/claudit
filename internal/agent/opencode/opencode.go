@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -251,43 +252,69 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 	return discoverFromSQLite(dataDir, projectID, projectPath)
 }
 
-// discoverFromFlatFiles tries the legacy flat file session discovery.
+// discoverFromFlatFiles tries the flat file session discovery.
+//
+// OpenCode has changed how it derives the on-disk project identifier across
+// releases, so the session directory no longer necessarily matches our own
+// git-rev-list-based GetProjectID. Rather than assuming a single fixed
+// layout (storage/session/<projectID>/<sessionID>.json), this walks the
+// whole session storage tree and matches session files either by an
+// embedded directory/path field (resolved against projectPath the same way
+// we compare project paths elsewhere) or by the legacy project-ID directory
+// name, picking the most recently modified match within the recency window.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
-	if err != nil {
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	if _, err := os.Stat(sessionRoot); err != nil {
 		return nil, nil
 	}
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
+	projectID := GetProjectID(projectPath)
+
 	var bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-
-		info, err := entry.Info()
-		if err != nil {
-			continue
+	_ = filepath.Walk(sessionRoot, func(p string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info == nil || info.IsDir() || !strings.HasSuffix(info.Name(), ".json") {
+			return nil
 		}
 
 		modTime := info.ModTime()
 		if now.Sub(modTime) > recentTimeout {
-			continue
+			return nil
+		}
+
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil
+		}
+
+		if !sessionFileMatchesProject(raw, p, projectPath, projectID) {
+			return nil
+		}
+
+		id := rawStringField(raw, "id")
+		if id == "" {
+			id = strings.TrimSuffix(filepath.Base(p), ".json")
 		}
 
 		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			bestSessionID = id
 			bestModTime = modTime
 		}
-	}
+		return nil
+	})
 
 	if bestSessionID == "" {
 		return nil, nil
@@ -302,6 +329,38 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// sessionFileMatchesProject reports whether a session JSON file belongs to
+// projectPath, either via an embedded directory/path field or via the
+// legacy layout where the session lives directly under a directory named
+// after the project ID.
+func sessionFileMatchesProject(raw map[string]json.RawMessage, sessionFilePath, projectPath, projectID string) bool {
+	for _, key := range []string{"directory", "worktree", "path", "cwd"} {
+		if v := rawStringField(raw, key); v != "" && agent.PathsEqual(v, projectPath) {
+			return true
+		}
+	}
+
+	if pid := rawStringField(raw, "projectID"); pid != "" {
+		return pid == projectID
+	}
+
+	// Legacy layout: storage/session/<projectID>/<sessionID>.json
+	return filepath.Base(filepath.Dir(sessionFilePath)) == projectID
+}
+
+// rawStringField extracts a string value from a raw JSON object map.
+func rawStringField(raw map[string]json.RawMessage, key string) string {
+	v, ok := raw[key]
+	if !ok {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(v, &s); err != nil {
+		return ""
+	}
+	return s
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +556,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
