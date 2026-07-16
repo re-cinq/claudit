@@ -52,15 +52,17 @@ func GetProjectID(projectPath string) string {
 	return "global"
 }
 
-// GetSessionDir returns the session storage directory for a project.
-func GetSessionDir(projectPath string) (string, error) {
+// GetSessionDir returns the session storage directory for OpenCode.
+// OpenCode keeps all sessions in a single flat directory (not nested per
+// project); each session file records its own project via a "directory"
+// field, so callers must filter by that field rather than by path.
+func GetSessionDir() (string, error) {
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return "", err
 	}
 
-	projectID := GetProjectID(projectPath)
-	return filepath.Join(dataDir, "storage", "session", projectID), nil
+	return filepath.Join(dataDir, "storage", "session"), nil
 }
 
 // GetMessageDir returns the message storage directory for a session.
@@ -83,7 +85,7 @@ type sessionInfo struct {
 
 // WriteSessionFile writes a session and its messages to OpenCode's storage.
 func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (string, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	sessionDir, err := GetSessionDir()
 	if err != nil {
 		return "", err
 	}

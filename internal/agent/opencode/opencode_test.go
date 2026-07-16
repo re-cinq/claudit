@@ -3,7 +3,6 @@ package opencode
 import (
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -377,39 +376,16 @@ func TestGetDataDir(t *testing.T) {
 }
 
 func TestGetSessionDir(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// Init git repo with a commit
-	for _, args := range [][]string{
-		{"init"},
-		{"config", "user.email", "t@t.com"},
-		{"config", "user.name", "T"},
-	} {
-		cmd := exec.Command("git", args...)
-		cmd.Dir = tmpDir
-		cmd.CombinedOutput()
-	}
-	os.WriteFile(filepath.Join(tmpDir, "f.txt"), []byte("x"), 0644)
-	gitAdd := exec.Command("git", "add", ".")
-	gitAdd.Dir = tmpDir
-	gitAdd.CombinedOutput()
-	gitCommit := exec.Command("git", "commit", "-m", "Init")
-	gitCommit.Dir = tmpDir
-	gitCommit.CombinedOutput()
-
-	dir, err := GetSessionDir(tmpDir)
+	dir, err := GetSessionDir()
 	if err != nil {
 		t.Fatalf("GetSessionDir error: %v", err)
 	}
 
-	projectID := GetProjectID(tmpDir)
-
-	// On darwin, GetDataDir ignores XDG_DATA_HOME and uses ~/Library/Application Support
 	dataDir, err := GetDataDir()
 	if err != nil {
 		t.Fatalf("GetDataDir error: %v", err)
 	}
-	expected := filepath.Join(dataDir, "storage", "session", projectID)
+	expected := filepath.Join(dataDir, "storage", "session")
 	if dir != expected {
 		t.Errorf("GetSessionDir = %q, want %q", dir, expected)
 	}

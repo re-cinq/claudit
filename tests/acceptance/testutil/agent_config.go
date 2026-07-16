@@ -1,14 +1,11 @@
 package testutil
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 )
 
 // AgentTestConfig holds all agent-specific bits needed to parameterize tests.
@@ -253,28 +250,11 @@ func opencodeDataDir(homeDir string) string {
 }
 
 // opencodeSessionDir computes the OpenCode session directory path.
-// OpenCode: <dataDir>/storage/session/<project-id>
-// where project-id is the root commit hash (or "global" for non-git dirs).
+// OpenCode: <dataDir>/storage/session — a single flat directory shared by
+// every project; sessions record their own project via a "directory" field
+// rather than being nested under a project-specific folder.
 func opencodeSessionDir(homeDir, projectPath string) string {
-	projectID := getOpenCodeProjectID(projectPath)
-	return filepath.Join(opencodeDataDir(homeDir), "storage", "session", projectID)
-}
-
-// getOpenCodeProjectID returns the git root commit hash for the project.
-// This must match the production GetProjectID in internal/agent/opencode/session.go.
-func getOpenCodeProjectID(projectPath string) string {
-	cmd := exec.Command("git", "rev-list", "--max-parents=0", "--all")
-	cmd.Dir = projectPath
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	if err := cmd.Run(); err != nil {
-		return "global"
-	}
-	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
-	if len(lines) > 0 && lines[0] != "" {
-		return strings.TrimSpace(lines[0])
-	}
-	return "global"
+	return filepath.Join(opencodeDataDir(homeDir), "storage", "session")
 }
 
 // claudePrepareTranscript writes a Claude JSONL transcript file.
