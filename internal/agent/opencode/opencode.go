@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -316,17 +317,35 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
+	// Find the most recent session for this project. OpenCode's project-scoping
+	// scheme (which column holds the identifier, and how it's computed) has
+	// drifted across versions, so treat a project-scoped miss as "unknown"
+	// rather than "no session exists" and fall back below.
 	sessionQuery := fmt.Sprintf(
 		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
 		projectID,
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
-		return nil, nil
-	}
 	sessionID := strings.TrimSpace(string(sessionOutput))
+
+	if err != nil || sessionID == "" {
+		// Fall back to the single most recently updated session in the
+		// database, regardless of project. In practice only one OpenCode
+		// session is active on a host at a time, so recency (bounded by the
+		// timeout check below) is a reliable enough signal even if our
+		// project_id no longer matches OpenCode's scheme.
+		fallbackQuery := `SELECT id FROM session ORDER BY time_updated DESC LIMIT 1;`
+		cmd = exec.Command("sqlite3", "-separator", "\t", dbPath, fallbackQuery)
+		fallbackOutput, fbErr := cmd.Output()
+		if fbErr != nil {
+			return nil, nil
+		}
+		sessionID = strings.TrimSpace(string(fallbackOutput))
+		if sessionID == "" {
+			return nil, nil
+		}
+	}
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
@@ -347,6 +366,11 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 			}
 		} else if t, err := time.Parse("2006-01-02 15:04:05", timeStr); err == nil {
 			if time.Since(t) > agent.RecentSessionTimeout {
+				return nil, nil
+			}
+		} else if ms, err := strconv.ParseInt(timeStr, 10, 64); err == nil {
+			// OpenCode may store timestamps as Unix epoch milliseconds.
+			if time.Since(time.UnixMilli(ms)) > agent.RecentSessionTimeout {
 				return nil, nil
 			}
 		}
@@ -454,7 +478,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +520,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
