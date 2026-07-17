@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +129,82 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// ActiveSessionMarker is the record the OpenCode plugin writes on every tool
+// execution while a session is live. OpenCode's own on-disk session storage
+// format has changed across releases (flat JSON files, SQLite, ...), which
+// repeatedly broke discovery that tried to read it directly. The plugin has
+// live access to OpenCode's supported SDK client while the session runs, so
+// it captures the session ID and transcript through that API instead — this
+// marker is then readable long after the OpenCode process has exited (e.g.
+// for a manual git commit made outside the agent session).
+type ActiveSessionMarker struct {
+	SessionID      string          `json:"session_id"`
+	ProjectPath    string          `json:"project_path"`
+	UpdatedAt      string          `json:"updated_at"`
+	TranscriptData json.RawMessage `json:"transcript_data,omitempty"`
+}
+
+// activeSessionMarkerPath returns the path to the plugin-recorded session marker.
+func activeSessionMarkerPath(projectPath string) string {
+	return filepath.Join(projectPath, ".shiftlog", "opencode-session.json")
+}
+
+// WriteActiveSessionMarker records the current OpenCode session so it can be
+// discovered after the OpenCode process has exited.
+func WriteActiveSessionMarker(projectPath, sessionID string, transcriptData []byte) error {
+	if sessionID == "" {
+		return nil
+	}
+
+	dir := filepath.Join(projectPath, ".shiftlog")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("could not create .shiftlog directory: %w", err)
+	}
+
+	marker := ActiveSessionMarker{
+		SessionID:   sessionID,
+		ProjectPath: projectPath,
+		UpdatedAt:   time.Now().UTC().Format(time.RFC3339),
+	}
+	if len(transcriptData) > 0 && json.Valid(transcriptData) {
+		marker.TranscriptData = json.RawMessage(transcriptData)
+	}
+
+	data, err := json.Marshal(marker)
+	if err != nil {
+		return fmt.Errorf("could not marshal session marker: %w", err)
+	}
+
+	return os.WriteFile(activeSessionMarkerPath(projectPath), data, 0600)
+}
+
+// ReadActiveSessionMarker reads the plugin-recorded session marker, returning
+// nil if it doesn't exist, is malformed, or has aged out of the recent-session
+// window.
+func ReadActiveSessionMarker(projectPath string) (*ActiveSessionMarker, error) {
+	data, err := os.ReadFile(activeSessionMarkerPath(projectPath))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var marker ActiveSessionMarker
+	if err := json.Unmarshal(data, &marker); err != nil {
+		return nil, nil
+	}
+
+	if marker.SessionID == "" {
+		return nil, nil
+	}
+
+	updatedAt, err := time.Parse(time.RFC3339, marker.UpdatedAt)
+	if err != nil || time.Since(updatedAt) > agent.RecentSessionTimeout {
+		return nil, nil
+	}
+
+	return &marker, nil
 }
