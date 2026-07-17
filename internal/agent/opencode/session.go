@@ -73,6 +73,38 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// GetMessageDirCandidates returns every known-shape directory where OpenCode
+// may store a session's message files, newest layout first. OpenCode has
+// changed the on-disk layout across releases (message files nested under
+// "session/message/<id>" in newer builds vs. a top-level "message/<id>" in
+// older ones), so callers should try each candidate in order and use the
+// first one that exists and is non-empty.
+func GetMessageDirCandidates(sessionID string) ([]string, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return nil, err
+	}
+
+	return []string{
+		filepath.Join(dataDir, "storage", "session", "message", sessionID),
+		filepath.Join(dataDir, "storage", "message", sessionID),
+	}, nil
+}
+
+// dirHasFiles reports whether dir exists and contains at least one regular file.
+func dirHasFiles(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			return true
+		}
+	}
+	return false
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
