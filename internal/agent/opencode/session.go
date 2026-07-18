@@ -3,11 +3,16 @@ package opencode
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +131,132 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// findDatabase locates OpenCode's SQLite database under dataDir. The exact
+// filename and location have moved across OpenCode releases (it has not been
+// a stable part of the public API), so a handful of known candidates are
+// checked first, falling back to a shallow scan for any *.db file that has a
+// valid SQLite file header.
+func findDatabase(dataDir string) string {
+	candidates := []string{
+		filepath.Join(dataDir, "opencode.db"),
+		filepath.Join(dataDir, "storage", "opencode.db"),
+		filepath.Join(dataDir, "storage.db"),
+		filepath.Join(dataDir, "db", "opencode.db"),
+		filepath.Join(dataDir, "state.db"),
+	}
+	for _, candidate := range candidates {
+		if isSQLiteFile(candidate) {
+			return candidate
+		}
+	}
+
+	var found string
+	_ = filepath.WalkDir(dataDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || found != "" {
+			return nil
+		}
+		if d.IsDir() {
+			if path == dataDir {
+				return nil
+			}
+			if rel, relErr := filepath.Rel(dataDir, path); relErr == nil &&
+				strings.Count(rel, string(filepath.Separator)) >= 3 {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(d.Name(), ".db") && isSQLiteFile(path) {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
+}
+
+// isSQLiteFile reports whether path begins with the SQLite file header.
+func isSQLiteFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+
+	header := make([]byte, 16)
+	if _, err := io.ReadFull(f, header); err != nil {
+		return false
+	}
+	return string(header) == "SQLite format 3\x00"
+}
+
+// sqliteColumn runs PRAGMA table_info(table) against dbPath and returns the
+// first column name (case-insensitive) matching one of candidates, or "" if
+// the table doesn't exist or none of the candidates are present. This lets
+// session/message discovery adapt when OpenCode's SQLite schema changes
+// column names across releases instead of hardcoding a single layout.
+func sqliteColumn(dbPath, table string, candidates ...string) string {
+	cmd := exec.Command("sqlite3", dbPath, fmt.Sprintf("PRAGMA table_info(%s);", table))
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	present := make(map[string]bool)
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		fields := strings.Split(line, "|")
+		if len(fields) >= 2 {
+			present[strings.ToLower(fields[1])] = true
+		}
+	}
+
+	for _, candidate := range candidates {
+		if present[strings.ToLower(candidate)] {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// sqliteEscape escapes single quotes for safe inclusion in a SQLite string literal.
+func sqliteEscape(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
+// sessionTimeIsRecent reports whether raw (a timestamp value read from the
+// OpenCode SQLite database, in any of several formats OpenCode has used,
+// including Unix epoch seconds/milliseconds/nanoseconds) is within the
+// recent-session window. An unparseable or empty value returns true so an
+// unrecognized format never blocks discovery outright.
+func sessionTimeIsRecent(raw string) bool {
+	if raw == "" {
+		return true
+	}
+
+	if n, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		var t time.Time
+		switch {
+		case n > 1_000_000_000_000_000: // nanoseconds
+			t = time.Unix(0, n)
+		case n > 1_000_000_000_000: // milliseconds
+			t = time.UnixMilli(n)
+		default: // seconds
+			t = time.Unix(n, 0)
+		}
+		return time.Since(t) <= agent.RecentSessionTimeout
+	}
+
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02T15:04:05.000Z",
+		"2006-01-02 15:04:05",
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return time.Since(t) <= agent.RecentSessionTimeout
+		}
+	}
+	return true
 }
