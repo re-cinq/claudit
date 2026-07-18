@@ -229,26 +229,55 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 	return &agent.Transcript{Entries: entries}, nil
 }
 
+// discoverSessionAttempts and discoverSessionRetryDelay bound how long
+// DiscoverSession waits for OpenCode to finish persisting a session.
+// OpenCode's CLI process hands session/message writes off to its storage
+// layer and can exit before those writes land on disk, so a post-commit
+// hook running immediately after the CLI exits can otherwise race the
+// write and see nothing.
+const (
+	discoverSessionAttempts   = 5
+	discoverSessionRetryDelay = 400 * time.Millisecond
+)
+
 // DiscoverSession finds an active or recent OpenCode session.
 // It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// Both are retried briefly to tolerate OpenCode's asynchronous storage flush.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
-	session, err := a.discoverFromFlatFiles(projectPath)
-	if err != nil {
-		return nil, err
-	}
-	if session != nil {
-		return session, nil
+	var lastErr error
+	for attempt := 0; attempt < discoverSessionAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(discoverSessionRetryDelay)
+		}
+
+		// Try flat file storage first (pre-v1.2 OpenCode)
+		session, err := a.discoverFromFlatFiles(projectPath)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if session != nil {
+			return session, nil
+		}
+
+		// Fall back to SQLite (OpenCode v1.2+)
+		dataDir, err := GetDataDir()
+		if err != nil {
+			return nil, nil
+		}
+
+		projectID := GetProjectID(projectPath)
+		session, err = discoverFromSQLite(dataDir, projectID, projectPath)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if session != nil {
+			return session, nil
+		}
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
-	dataDir, err := GetDataDir()
-	if err != nil {
-		return nil, nil
-	}
-
-	projectID := GetProjectID(projectPath)
-	return discoverFromSQLite(dataDir, projectID, projectPath)
+	return nil, lastErr
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -497,4 +526,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
