@@ -230,9 +230,14 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It tries, in order: flat file storage nested by project ID (pre-v1.2
+// OpenCode, and some later builds that still partition sessions by project),
+// a flat scan of the session storage directory (newer OpenCode builds store
+// all sessions directly under storage/session/ regardless of project,
+// tagging each session file with a "directory"/"projectID" field instead of
+// using a per-project subdirectory), and finally SQLite (some builds).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
+	// Try flat file storage nested by project ID first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
 		return nil, err
@@ -241,14 +246,117 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
+	// Fall back to a flat scan of storage/session/ (newer OpenCode builds
+	// no longer nest sessions under a per-project directory).
+	if session := scanFlatSessionStorage(dataDir, projectPath); session != nil {
+		return session, nil
+	}
+
+	// Fall back to SQLite (some OpenCode builds)
 	projectID := GetProjectID(projectPath)
 	return discoverFromSQLite(dataDir, projectID, projectPath)
+}
+
+// scanFlatSessionStorage scans storage/session/ for a recent session
+// belonging to projectPath, without assuming sessions are nested in a
+// per-project subdirectory. It checks both files directly under
+// storage/session/ (flat layout) and one level of subdirectories (legacy
+// nested layout), matching candidates against the session's "directory" or
+// "projectID" field when present. If neither field is present, the most
+// recently modified candidate within the recent-session timeout is used as
+// a best-effort match.
+func scanFlatSessionStorage(dataDir, projectPath string) *agent.SessionInfo {
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	entries, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		return nil
+	}
+
+	projectID := GetProjectID(projectPath)
+	now := time.Now()
+
+	var best *agent.SessionInfo
+	var bestModTime time.Time
+
+	consider := func(path string, modTime time.Time) {
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return
+		}
+
+		var info sessionInfo
+		if err := json.Unmarshal(data, &info); err != nil {
+			return
+		}
+
+		if info.Directory != "" && info.Directory != projectPath {
+			return
+		}
+		if info.Directory == "" && info.ProjectID != "" && info.ProjectID != projectID {
+			return
+		}
+
+		if best != nil && !modTime.After(bestModTime) {
+			return
+		}
+
+		sessionID := info.ID
+		if sessionID == "" {
+			sessionID = strings.TrimSuffix(filepath.Base(path), ".json")
+		}
+
+		msgDir, _ := GetMessageDir(sessionID)
+		best = &agent.SessionInfo{
+			SessionID:      sessionID,
+			TranscriptPath: msgDir,
+			StartedAt:      modTime.Format(time.RFC3339),
+			ProjectPath:    projectPath,
+		}
+		bestModTime = modTime
+	}
+
+	for _, entry := range entries {
+		fullPath := filepath.Join(sessionRoot, entry.Name())
+
+		if entry.IsDir() {
+			// Legacy nested-by-project layout: check one level of subdirectories.
+			subEntries, err := os.ReadDir(fullPath)
+			if err != nil {
+				continue
+			}
+			for _, sub := range subEntries {
+				if sub.IsDir() || !strings.HasSuffix(sub.Name(), ".json") {
+					continue
+				}
+				subInfo, err := sub.Info()
+				if err != nil {
+					continue
+				}
+				consider(filepath.Join(fullPath, sub.Name()), subInfo.ModTime())
+			}
+			continue
+		}
+
+		if !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		consider(fullPath, info.ModTime())
+	}
+
+	return best
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -497,4 +605,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
