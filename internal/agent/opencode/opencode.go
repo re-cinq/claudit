@@ -251,7 +251,13 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 	return discoverFromSQLite(dataDir, projectID, projectPath)
 }
 
-// discoverFromFlatFiles tries the legacy flat file session discovery.
+// discoverFromFlatFiles tries the flat file session discovery.
+// Older OpenCode versions store each session as a single <sessionID>.json
+// file directly inside the project's session directory. Newer versions
+// (mirroring the directory-per-session layout already used for message
+// storage, see parseMessageDir) store each session as its own directory,
+// e.g. storage/session/<projectID>/<sessionID>/info.json. Both layouts are
+// supported here so discovery keeps working across OpenCode versions.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionDir(projectPath)
 	if err != nil {
@@ -269,22 +275,26 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	var bestModTime time.Time
 
 	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		var sessionID string
+		if entry.IsDir() {
+			sessionID = entry.Name()
+		} else if strings.HasSuffix(entry.Name(), ".json") {
+			sessionID = strings.TrimSuffix(entry.Name(), ".json")
+		} else {
 			continue
 		}
 
-		info, err := entry.Info()
-		if err != nil {
+		modTime, ok := sessionEntryModTime(sessionDir, entry)
+		if !ok {
 			continue
 		}
 
-		modTime := info.ModTime()
 		if now.Sub(modTime) > recentTimeout {
 			continue
 		}
 
 		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
 	}
@@ -302,6 +312,29 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// sessionEntryModTime returns the effective modification time for a session
+// directory entry. For directory-based sessions it prefers the mtime of the
+// contained info.json (which is updated as the session progresses) and
+// falls back to the directory's own mtime if info.json is absent.
+func sessionEntryModTime(sessionDir string, entry os.DirEntry) (time.Time, bool) {
+	if entry.IsDir() {
+		if info, err := os.Stat(filepath.Join(sessionDir, entry.Name(), "info.json")); err == nil {
+			return info.ModTime(), true
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return time.Time{}, false
+		}
+		return info.ModTime(), true
+	}
+
+	info, err := entry.Info()
+	if err != nil {
+		return time.Time{}, false
+	}
+	return info.ModTime(), true
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +530,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
