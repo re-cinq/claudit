@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -316,9 +317,14 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
+	// Find most recent session for this project. Newer OpenCode releases
+	// don't reliably expose a queryable "time_updated" column on the
+	// session table, so order by rowid (SQLite's implicit insertion-order
+	// column, always present) rather than a timestamp column that may not
+	// exist — a missing column fails the whole query and previously caused
+	// session discovery to silently return nothing.
 	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
+		`SELECT id FROM session WHERE project_id='%s' ORDER BY rowid DESC LIMIT 1;`,
 		projectID,
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
@@ -328,7 +334,9 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	}
 	sessionID := strings.TrimSpace(string(sessionOutput))
 
-	// Check if this session was recent (within timeout)
+	// Check if this session was recent (within timeout). This check is
+	// best-effort: if "time_updated" doesn't exist or its value doesn't
+	// parse, we skip the recency check instead of aborting discovery.
 	timeQuery := fmt.Sprintf(
 		`SELECT time_updated FROM session WHERE id='%s';`,
 		sessionID,
@@ -353,9 +361,16 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
 
-	// Get messages for this session as a JSON array
+	// Get messages for this session as a JSON array. Select "data" as-is
+	// instead of re-injecting an "id" field via json_patch/json_object:
+	// newer OpenCode releases don't reliably expose a separate queryable
+	// "id" column on the message table, and "data" already contains the
+	// full self-describing message JSON (id, role, content, time). Order
+	// by rowid instead of "time_created" for the same reason the session
+	// query above avoids "time_updated" — a missing column fails the
+	// query outright rather than degrading gracefully.
 	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
+		`SELECT json_group_array(json(data)) FROM message WHERE session_id='%s' ORDER BY rowid;`,
 		sessionID,
 	)
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
@@ -497,4 +512,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
