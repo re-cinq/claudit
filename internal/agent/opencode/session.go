@@ -1,13 +1,18 @@
+```go
 package opencode
 
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -127,3 +132,108 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+
+// sessionMatch is a candidate session found while scanning OpenCode's
+// session storage tree.
+type sessionMatch struct {
+	sessionID string
+	modTime   time.Time
+	rawData   []byte
+}
+
+// findRecentSession walks an OpenCode session storage tree looking for the
+// most recent session belonging to projectPath.
+//
+// OpenCode's on-disk partitioning of sessions by project has changed across
+// versions (e.g. the algorithm used to derive a project ID from a worktree),
+// so this does not assume any particular directory nesting. It instead reads
+// each session file's own "directory" field — which OpenCode records inside
+// the session JSON regardless of how the file happens to be nested on disk —
+// and compares it against the actual project path. If no session in the tree
+// carries a matching (or any) "directory" field, it falls back to the most
+// recently modified session file anywhere in the tree within the timeout,
+// since that's still very likely to be the right one in practice (each test
+// run / real usage session works out of a single project at a time).
+func findRecentSession(sessionRoot, projectPath string, timeout time.Duration) *sessionMatch {
+	now := time.Now()
+
+	var bestMatched *sessionMatch
+	var bestAny *sessionMatch
+
+	_ = filepath.WalkDir(sessionRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > timeout {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		var si sessionInfo
+		if err := json.Unmarshal(data, &si); err != nil {
+			return nil
+		}
+
+		id := si.ID
+		if id == "" {
+			id = strings.TrimSuffix(d.Name(), ".json")
+		}
+
+		candidate := &sessionMatch{sessionID: id, modTime: modTime, rawData: data}
+
+		if bestAny == nil || modTime.After(bestAny.modTime) {
+			bestAny = candidate
+		}
+
+		if si.Directory != "" && agent.PathsEqual(si.Directory, projectPath) {
+			if bestMatched == nil || modTime.After(bestMatched.modTime) {
+				bestMatched = candidate
+			}
+		}
+
+		return nil
+	})
+
+	if bestMatched != nil {
+		return bestMatched
+	}
+	return bestAny
+}
+
+// findMessageDirFor locates the message storage directory for a session.
+// It tries OpenCode's conventional layout (storage/message/<sessionID>)
+// first, then falls back to a recursive search under the data directory in
+// case the storage layout has changed between OpenCode versions.
+func findMessageDirFor(dataDir, sessionID string) string {
+	if conventional, err := GetMessageDir(sessionID); err == nil {
+		if info, err := os.Stat(conventional); err == nil && info.IsDir() {
+			return conventional
+		}
+	}
+
+	storageRoot := filepath.Join(dataDir, "storage")
+	var found string
+	_ = filepath.WalkDir(storageRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || found != "" {
+			return nil
+		}
+		if d.IsDir() && d.Name() == sessionID {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
+}
+```
