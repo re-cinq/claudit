@@ -73,6 +73,42 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// sessionDirCandidates returns, in priority order, the directories where
+// OpenCode may store session info files for a project. OpenCode has changed
+// its on-disk storage layout across releases (e.g. introducing a nested
+// "session/" grouping for info/message data), so discovery probes multiple
+// known layouts rather than assuming a single fixed one.
+func sessionDirCandidates(dataDir, projectID string) []string {
+	return []string{
+		filepath.Join(dataDir, "storage", "session", projectID),
+		filepath.Join(dataDir, "storage", "session", "info", projectID),
+		filepath.Join(dataDir, "storage", "session", projectID, "info"),
+	}
+}
+
+// messageDirCandidates returns, in priority order, the directories where
+// OpenCode may store message files for a session.
+func messageDirCandidates(dataDir, projectID, sessionID string) []string {
+	return []string{
+		filepath.Join(dataDir, "storage", "message", sessionID),
+		filepath.Join(dataDir, "storage", "session", "message", sessionID),
+		filepath.Join(dataDir, "storage", "session", projectID, "message", sessionID),
+	}
+}
+
+// findExistingDir returns the first candidate directory that exists and
+// contains at least one entry, along with its entries. Returns "", nil if
+// none of the candidates have any content.
+func findExistingDir(candidates []string) (string, []os.DirEntry) {
+	for _, dir := range candidates {
+		entries, err := os.ReadDir(dir)
+		if err == nil && len(entries) > 0 {
+			return dir, entries
+		}
+	}
+	return "", nil
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`

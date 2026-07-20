@@ -251,15 +251,19 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 	return discoverFromSQLite(dataDir, projectID, projectPath)
 }
 
-// discoverFromFlatFiles tries the legacy flat file session discovery.
+// discoverFromFlatFiles tries the flat file session discovery. OpenCode's
+// on-disk storage layout has changed across releases, so this probes
+// multiple known directory layouts for both session info and message data
+// rather than assuming a single fixed convention.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
+	projectID := GetProjectID(projectPath)
 
-	dirEntries, err := os.ReadDir(sessionDir)
-	if err != nil {
+	sessionDir, dirEntries := findExistingDir(sessionDirCandidates(dataDir, projectID))
+	if sessionDir == "" {
 		return nil, nil
 	}
 
@@ -293,8 +297,14 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		return nil, nil
 	}
 
-	// The transcript path for OpenCode is the message directory
+	// The transcript path for OpenCode is the message directory. OpenCode
+	// has moved where it stores message files across versions, so try the
+	// known layouts and use whichever one actually has data; fall back to
+	// the legacy convention if none of them do yet.
 	msgDir, _ := GetMessageDir(bestSessionID)
+	if dir, entries := findExistingDir(messageDirCandidates(dataDir, projectID, bestSessionID)); dir != "" && len(entries) > 0 {
+		msgDir = dir
+	}
 
 	return &agent.SessionInfo{
 		SessionID:      bestSessionID,
@@ -497,4 +507,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
