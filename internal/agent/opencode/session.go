@@ -74,11 +74,16 @@ func GetMessageDir(sessionID string) (string, error) {
 }
 
 // sessionInfo represents an OpenCode session JSON file.
+// Role/Type are only present on message entries (never on sessions) and
+// are used to distinguish the two when scanning storage for sessions.
 type sessionInfo struct {
-	ID        string `json:"id"`
-	ProjectID string `json:"projectID,omitempty"`
-	Directory string `json:"directory,omitempty"`
-	Title     string `json:"title,omitempty"`
+	ID        string          `json:"id"`
+	ProjectID string          `json:"projectID,omitempty"`
+	Directory string          `json:"directory,omitempty"`
+	Cwd       string          `json:"cwd,omitempty"`
+	Title     string          `json:"title,omitempty"`
+	Role      json.RawMessage `json:"role,omitempty"`
+	Type      json.RawMessage `json:"type,omitempty"`
 }
 
 // WriteSessionFile writes a session and its messages to OpenCode's storage.
