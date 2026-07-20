@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -293,15 +294,75 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		return nil, nil
 	}
 
-	// The transcript path for OpenCode is the message directory
-	msgDir, _ := GetMessageDir(bestSessionID)
+	// Read the message directory ourselves rather than handing back a bare
+	// path. OpenCode may not have flushed the per-message files to disk yet
+	// by the time the post-commit hook runs (e.g. short, tool-free
+	// exchanges), and a dangling path would make the caller fail to read a
+	// transcript at all, discarding the session we just found. Reading here
+	// tolerates a missing/empty directory and still returns a usable (if
+	// sparse) transcript so the session gets recorded.
+	msgDir, err := GetMessageDir(bestSessionID)
+	var transcriptData []byte
+	if err == nil {
+		transcriptData = readMessageDirAsJSON(msgDir)
+	}
 
 	return &agent.SessionInfo{
 		SessionID:      bestSessionID,
-		TranscriptPath: msgDir,
+		TranscriptData: transcriptData,
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// readMessageDirAsJSON reads all message files from an OpenCode message
+// directory and combines them into a JSON array, mirroring how the store
+// command reads a message directory. Unlike a bare directory path, this
+// never fails: a missing or empty directory yields an empty array so that a
+// discovered session can still be recorded even if its messages haven't
+// been persisted to disk yet.
+func readMessageDirAsJSON(dir string) []byte {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return []byte("[]")
+	}
+
+	var messages []json.RawMessage
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		isJSON := strings.HasSuffix(name, ".json")
+		isJSONL := strings.HasSuffix(name, ".jsonl")
+		if !isJSON && !isJSONL {
+			continue
+		}
+
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			continue
+		}
+
+		if isJSONL {
+			for _, line := range strings.Split(string(data), "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				messages = append(messages, json.RawMessage(line))
+			}
+			continue
+		}
+
+		messages = append(messages, json.RawMessage(data))
+	}
+
+	data, err := json.Marshal(messages)
+	if err != nil {
+		return []byte("[]")
+	}
+	return data
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +558,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
