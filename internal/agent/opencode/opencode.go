@@ -252,6 +252,12 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
+// Older OpenCode versions store each session as a single "<sessionID>.json"
+// file directly under the session directory. Newer versions (observed as of
+// opencode-ai 1.18.x) instead store each session as a subdirectory named
+// after the session ID, containing one or more files (e.g. info.json). Both
+// layouts are supported here since we cannot rely on a fixed schema for the
+// files inside a session subdirectory.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionDir(projectPath)
 	if err != nil {
@@ -269,22 +275,36 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	var bestModTime time.Time
 
 	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		var sessionID string
+		var modTime time.Time
+
+		if entry.IsDir() {
+			sessionID = entry.Name()
+			modTime = latestModTimeInDir(filepath.Join(sessionDir, entry.Name()))
+			if modTime.IsZero() {
+				info, err := entry.Info()
+				if err != nil {
+					continue
+				}
+				modTime = info.ModTime()
+			}
+		} else if strings.HasSuffix(entry.Name(), ".json") {
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			sessionID = strings.TrimSuffix(entry.Name(), ".json")
+			modTime = info.ModTime()
+		} else {
 			continue
 		}
 
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
 		if now.Sub(modTime) > recentTimeout {
 			continue
 		}
 
 		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
 	}
@@ -302,6 +322,31 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// latestModTimeInDir returns the most recent modification time among the
+// regular files directly inside dir (non-recursive), or the zero time if dir
+// can't be read or contains no files.
+func latestModTimeInDir(dir string) time.Time {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return time.Time{}
+	}
+
+	var latest time.Time
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(latest) {
+			latest = info.ModTime()
+		}
+	}
+	return latest
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +542,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
