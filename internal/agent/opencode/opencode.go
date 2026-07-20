@@ -304,6 +304,57 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
+// sqliteSessionRow mirrors the JSON envelope OpenCode stores for a session,
+// whether on disk (flat files) or inside the "data" blob column of the
+// SQLite session table.
+type sqliteSessionRow struct {
+	ID        string `json:"id"`
+	ProjectID string `json:"projectID"`
+	Directory string `json:"directory"`
+}
+
+// findRecentSessionID returns the id of the most recently touched session
+// belonging to projectPath. OpenCode's internal project ID scheme (the
+// value used to index/filter the session table) has changed across
+// releases, so rather than depending on a specific column name or hashing
+// scheme, this reads each session's own "data" JSON blob and matches on the
+// recorded "directory" field — the one signal that reliably identifies
+// which project a session belongs to regardless of storage-layer internals.
+// The independently computed projectID is still checked as a fallback for
+// older OpenCode releases.
+func findRecentSessionID(dbPath, projectID, projectPath string) string {
+	absProjectPath, err := filepath.Abs(projectPath)
+	if err != nil {
+		absProjectPath = projectPath
+	}
+
+	cmd := exec.Command("sqlite3", "-json", dbPath,
+		"SELECT data FROM session ORDER BY rowid DESC;")
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	var rows []struct {
+		Data string `json:"data"`
+	}
+	if err := json.Unmarshal(output, &rows); err != nil {
+		return ""
+	}
+
+	for _, row := range rows {
+		var s sqliteSessionRow
+		if err := json.Unmarshal([]byte(row.Data), &s); err != nil {
+			continue
+		}
+		if s.Directory == absProjectPath || s.Directory == projectPath || s.ProjectID == projectID {
+			return s.ID
+		}
+	}
+
+	return ""
+}
+
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
@@ -316,41 +367,9 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
-	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+	sessionID := findRecentSessionID(dbPath, projectID, projectPath)
+	if sessionID == "" {
 		return nil, nil
-	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
-
-	// Check if this session was recent (within timeout)
-	timeQuery := fmt.Sprintf(
-		`SELECT time_updated FROM session WHERE id='%s';`,
-		sessionID,
-	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
-	timeOutput, err := cmd.Output()
-	if err == nil {
-		timeStr := strings.TrimSpace(string(timeOutput))
-		if t, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02T15:04:05.000Z", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02 15:04:05", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		}
-		// If we can't parse the time, proceed anyway — better to try than skip
 	}
 
 	// Get messages for this session as a JSON array
@@ -358,7 +377,7 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, msgQuery)
+	cmd := exec.Command("sqlite3", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
 	if err != nil {
 		return nil, nil
@@ -497,4 +516,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
