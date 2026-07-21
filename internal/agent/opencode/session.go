@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -73,6 +76,78 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// ScanAllProjectSessionDirs scans every project subdirectory under
+// <dataDir>/storage/session/ for the most recently modified session file.
+// Used as a fallback when GetSessionDir's computed project ID (the git root
+// commit hash) doesn't match OpenCode's own project scoping scheme — e.g.
+// after an OpenCode upgrade changes how projects are keyed on disk. This
+// mirrors the Gemini agent's ScanAllProjectDirs fallback used for the same
+// class of problem (session directory keying changing between versions).
+func ScanAllProjectSessionDirs(projectPath string) (*agent.SessionInfo, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return nil, nil
+	}
+
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	projectDirs, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		return nil, nil
+	}
+
+	now := time.Now()
+	var bestPath string
+	var bestSessionID string
+	var bestModTime time.Time
+
+	for _, projectDir := range projectDirs {
+		if !projectDir.IsDir() {
+			continue
+		}
+
+		dir := filepath.Join(sessionRoot, projectDir.Name())
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+
+		for _, f := range files {
+			if f.IsDir() || !strings.HasSuffix(f.Name(), ".json") {
+				continue
+			}
+
+			info, err := f.Info()
+			if err != nil {
+				continue
+			}
+
+			modTime := info.ModTime()
+			if now.Sub(modTime) > agent.RecentSessionTimeout {
+				continue
+			}
+
+			if bestPath == "" || modTime.After(bestModTime) {
+				bestPath = filepath.Join(dir, f.Name())
+				bestSessionID = strings.TrimSuffix(f.Name(), ".json")
+				bestModTime = modTime
+			}
+		}
+	}
+
+	if bestPath == "" {
+		return nil, nil
+	}
+
+	msgDir, _ := GetMessageDir(bestSessionID)
+
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: msgDir,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
@@ -111,6 +186,10 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 		return "", fmt.Errorf("could not write session file: %w", err)
 	}
 
+	if err := os.WriteFile(sessionPath, data, 0600); err != nil {
+		return "", fmt.Errorf("could not write session file: %w", err)
+	}
+
 	// Write messages from transcript data
 	msgDir, err := GetMessageDir(sessionID)
 	if err != nil {
@@ -126,4 +205,15 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// AddOrUpdateSessionEntry adds or updates a session entry in the index.
+func AddOrUpdateSessionEntry(index *SessionsIndex, entry SessionEntry) {
+	for i, e := range index.Entries {
+		if e.SessionID == entry.SessionID {
+			index.Entries[i] = entry
+			return
+		}
+	}
+	index.Entries = append(index.Entries, entry)
 }
