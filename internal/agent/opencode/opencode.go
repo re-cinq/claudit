@@ -252,6 +252,9 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
+// OpenCode has stored session info both as a single flat "<sessionID>.json"
+// file and (in newer releases) as a "<sessionID>/" directory containing
+// info.json plus other session-scoped files, so both shapes are recognized.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionDir(projectPath)
 	if err != nil {
@@ -269,22 +272,57 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	var bestModTime time.Time
 
 	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		var candidateID string
+		var modTime time.Time
+
+		if entry.IsDir() {
+			// Newer OpenCode versions may store a session as a directory
+			// (e.g. "<sessionID>/info.json") rather than a flat file.
+			nestedPath := filepath.Join(sessionDir, entry.Name())
+			nested, err := os.ReadDir(nestedPath)
+			if err != nil || len(nested) == 0 {
+				continue
+			}
+
+			dirInfo, err := entry.Info()
+			if err != nil {
+				continue
+			}
+
+			hasJSON := false
+			latest := dirInfo.ModTime()
+			for _, n := range nested {
+				if n.IsDir() || !strings.HasSuffix(n.Name(), ".json") {
+					continue
+				}
+				hasJSON = true
+				if ni, err := n.Info(); err == nil && ni.ModTime().After(latest) {
+					latest = ni.ModTime()
+				}
+			}
+			if !hasJSON {
+				continue
+			}
+
+			candidateID = entry.Name()
+			modTime = latest
+		} else if strings.HasSuffix(entry.Name(), ".json") {
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			candidateID = strings.TrimSuffix(entry.Name(), ".json")
+			modTime = info.ModTime()
+		} else {
 			continue
 		}
 
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
 		if now.Sub(modTime) > recentTimeout {
 			continue
 		}
 
 		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			bestSessionID = candidateID
 			bestModTime = modTime
 		}
 	}
@@ -454,7 +492,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +534,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-

@@ -76,7 +76,10 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
           input: hookData,
           cwd: directory,
           timeout: 30000,
-          stdio: ["pipe", "pipe", "pipe"],
+          // stdout/stderr are discarded (not piped) so a lingering descendant
+          // process holding the pipe open can't block execSync past the
+          // timeout - Node only blocks draining pipes it actually created.
+          stdio: ["pipe", "ignore", "ignore"],
         });
       } catch (e) {
         // Silently ignore errors to not disrupt workflow
