@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +129,119 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// scanExactSessionDir looks for the most recently modified session file
+// directly inside sessionDir (the fast path: dataDir/storage/session/<projectID>/).
+func scanExactSessionDir(sessionDir string) (sessionID string, modTime time.Time) {
+	dirEntries, err := os.ReadDir(sessionDir)
+	if err != nil {
+		return "", time.Time{}
+	}
+
+	now := time.Now()
+	for _, entry := range dirEntries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		mt := info.ModTime()
+		if now.Sub(mt) > agent.RecentSessionTimeout {
+			continue
+		}
+
+		if sessionID == "" || mt.After(modTime) {
+			sessionID = strings.TrimSuffix(entry.Name(), ".json")
+			modTime = mt
+		}
+	}
+
+	return sessionID, modTime
+}
+
+// scanAllSessionDirs recursively searches the entire session storage tree for a
+// session belonging to projectPath, without assuming any particular
+// project-directory naming or nesting scheme. This is a fallback for OpenCode
+// versions that key or nest project directories differently than
+// GetSessionDir() expects (e.g. a hash instead of the git root commit, or an
+// extra subdirectory level) — matching is done using the session file's own
+// "directory"/"projectID" fields rather than the folder structure.
+func scanAllSessionDirs(dataDir, projectPath string) (sessionID string, modTime time.Time) {
+	root := filepath.Join(dataDir, "storage", "session")
+	projectID := GetProjectID(projectPath)
+	now := time.Now()
+
+	_ = filepath.Walk(root, func(p string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info == nil || info.IsDir() || !strings.HasSuffix(info.Name(), ".json") {
+			return nil
+		}
+
+		mt := info.ModTime()
+		if now.Sub(mt) > agent.RecentSessionTimeout {
+			return nil
+		}
+
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+
+		var sess sessionInfo
+		if err := json.Unmarshal(data, &sess); err != nil {
+			return nil
+		}
+
+		id := sess.ID
+		if id == "" {
+			id = strings.TrimSuffix(filepath.Base(p), ".json")
+		}
+
+		matches := (sess.Directory != "" && agent.PathsEqual(sess.Directory, projectPath)) ||
+			(sess.ProjectID != "" && sess.ProjectID == projectID)
+		if !matches {
+			return nil
+		}
+
+		if sessionID == "" || mt.After(modTime) {
+			sessionID = id
+			modTime = mt
+		}
+		return nil
+	})
+
+	return sessionID, modTime
+}
+
+// resolveMessageDir locates the message storage location for a session ID.
+// It tries the standard dataDir/storage/message/<sessionID> layout first, then
+// falls back to a recursive search for a directory literally named after the
+// session ID anywhere under storage — handling OpenCode versions that nest
+// message storage differently (e.g. under the session's project directory).
+func resolveMessageDir(dataDir, sessionID string) string {
+	msgDir := filepath.Join(dataDir, "storage", "message", sessionID)
+	if info, err := os.Stat(msgDir); err == nil && info.IsDir() {
+		return msgDir
+	}
+
+	var found string
+	_ = filepath.Walk(filepath.Join(dataDir, "storage"), func(p string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || found != "" || info == nil {
+			return nil
+		}
+		if info.IsDir() && info.Name() == sessionID {
+			found = p
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	if found != "" {
+		return found
+	}
+
+	return msgDir
 }
