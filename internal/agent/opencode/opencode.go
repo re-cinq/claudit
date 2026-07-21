@@ -252,6 +252,12 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
+//
+// Older OpenCode versions store each session as a single flat file
+// (storage/session/<projectID>/<sessionID>.json). Newer versions store each
+// session in its own directory instead (storage/session/<projectID>/<sessionID>/...),
+// mirroring how messages are already stored under storage/message/<sessionID>/.
+// Both layouts are handled here so discovery keeps working across versions.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionDir(projectPath)
 	if err != nil {
@@ -269,7 +275,13 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	var bestModTime time.Time
 
 	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		var sessionID string
+		switch {
+		case entry.IsDir():
+			sessionID = entry.Name()
+		case strings.HasSuffix(entry.Name(), ".json"):
+			sessionID = strings.TrimSuffix(entry.Name(), ".json")
+		default:
 			continue
 		}
 
@@ -284,7 +296,7 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		}
 
 		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
 	}
@@ -497,4 +509,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
