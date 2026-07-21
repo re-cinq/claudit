@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -22,6 +23,12 @@ const pluginTemplate = `// shiftlog plugin for OpenCode CLI
 export const ShiftlogPlugin = async ({ directory, client }) => {
   const pendingCommits = new Map();
 
+  const withTimeout = (promise, ms) =>
+    Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("shiftlog: client call timed out")), ms)),
+    ]);
+
   return {
     "tool.execute.before": async (input, output) => {
       const command = output?.args?.command || output?.args?.cmd || "";
@@ -39,13 +46,22 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
       if (!pending) return;
       pendingCommits.delete(input.callID);
 
-      // Try to fetch messages via the SDK client API
+      // Try to fetch messages via the SDK client API. This call must never be
+      // allowed to hang: a slow, unresponsive, or incompatible client/SDK version
+      // would otherwise block OpenCode's entire tool-execution loop indefinitely,
+      // so we bound it with a timeout and always fall back to the data_dir
+      // reconstruction approach below on failure.
       let transcriptData = "";
       if (client && pending.sessionID) {
         try {
-          const msgs = await client.session.messages({ path: { id: pending.sessionID } });
-          if (msgs && Array.isArray(msgs)) {
-            transcriptData = JSON.stringify(msgs.map(m => ({
+          const msgs = await withTimeout(
+            client.session.messages({ path: { id: pending.sessionID } }),
+            5000
+          );
+          // Some SDK versions return a raw array, others wrap it as { data: [...] }.
+          const list = Array.isArray(msgs) ? msgs : (Array.isArray(msgs?.data) ? msgs.data : null);
+          if (list) {
+            transcriptData = JSON.stringify(list.map(m => ({
               role: m.role || "",
               id: m.id || "",
               content: m.content || "",
@@ -125,3 +141,4 @@ func HasPlugin(repoRoot string) bool {
 	_, err := os.Stat(pluginPath)
 	return err == nil
 }
+```
