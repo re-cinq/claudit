@@ -73,6 +73,75 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// candidateSessionDirs returns known/possible locations for a project's
+// session metadata files, newest layout first. OpenCode has changed its
+// on-disk layout across releases (e.g. nesting storage under a per-project
+// directory, or splitting session metadata into a "session/info" bucket),
+// so discovery checks each candidate rather than assuming a single fixed
+// layout.
+func candidateSessionDirs(dataDir, projectID string) []string {
+	return []string{
+		filepath.Join(dataDir, "storage", "session", projectID),
+		filepath.Join(dataDir, "project", projectID, "storage", "session"),
+		filepath.Join(dataDir, "project", projectID, "storage", "session", "info"),
+	}
+}
+
+// candidateSessionIndexDirs returns directories that may hold session
+// metadata for ALL projects (not scoped to a single project on disk).
+// Callers must match project association by inspecting file contents.
+func candidateSessionIndexDirs(dataDir string) []string {
+	return []string{
+		filepath.Join(dataDir, "storage", "session", "info"),
+		filepath.Join(dataDir, "storage", "session"),
+	}
+}
+
+// candidateMessageDirs returns known/possible locations for a session's
+// message files, newest layout first.
+func candidateMessageDirs(dataDir, sessionID string) []string {
+	return []string{
+		filepath.Join(dataDir, "storage", "message", sessionID),
+		filepath.Join(dataDir, "storage", "session", "message", sessionID),
+	}
+}
+
+// sessionFileBelongsToProject reports whether a session metadata JSON blob
+// is associated with the given project, matching either by project ID or
+// by a directory/path field pointing at the project's working directory.
+func sessionFileBelongsToProject(data []byte, projectID, projectPath string) bool {
+	var fields struct {
+		ProjectID  string `json:"projectID"`
+		ProjectID2 string `json:"project_id"`
+		Directory  string `json:"directory"`
+		Path       string `json:"path"`
+		CWD        string `json:"cwd"`
+		Worktree   string `json:"worktree"`
+	}
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return false
+	}
+
+	if projectID != "" && (fields.ProjectID == projectID || fields.ProjectID2 == projectID) {
+		return true
+	}
+
+	absProject, err := filepath.Abs(projectPath)
+	if err != nil {
+		return false
+	}
+	for _, candidate := range []string{fields.Directory, fields.Path, fields.CWD, fields.Worktree} {
+		if candidate == "" {
+			continue
+		}
+		if absCandidate, err := filepath.Abs(candidate); err == nil && absCandidate == absProject {
+			return true
+		}
+	}
+
+	return false
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
