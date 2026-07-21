@@ -13,6 +13,9 @@ type SessionStartInput struct {
 	SessionID      string `json:"session_id"`
 	TranscriptPath string `json:"transcript_path"`
 	Cwd            string `json:"cwd"`
+	// TranscriptData carries inline transcript content for agents (e.g.
+	// OpenCode) that don't expose a single on-disk transcript file path.
+	TranscriptData string `json:"transcript_data"`
 }
 
 var sessionStartCmd = &cobra.Command{
@@ -39,8 +42,10 @@ func runSessionStart(cmd *cobra.Command, args []string) error {
 
 	cli.LogDebug("session-start: session=%s cwd=%s transcript=%s", hook.SessionID, hook.Cwd, hook.TranscriptPath)
 
-	// Validate required fields
-	if hook.SessionID == "" || hook.TranscriptPath == "" {
+	// Validate required fields. Some agents (e.g. OpenCode) don't expose a
+	// single transcript file path and report inline transcript data
+	// instead, so only one of the two is required.
+	if hook.SessionID == "" || (hook.TranscriptPath == "" && hook.TranscriptData == "") {
 		cli.LogWarning("missing required fields in hook data")
 		return nil
 	}
@@ -51,6 +56,9 @@ func runSessionStart(cmd *cobra.Command, args []string) error {
 		TranscriptPath: hook.TranscriptPath,
 		StartedAt:      time.Now().UTC().Format(time.RFC3339),
 		ProjectPath:    hook.Cwd,
+	}
+	if hook.TranscriptData != "" {
+		activeSession.TranscriptData = []byte(hook.TranscriptData)
 	}
 
 	// Write active session file

@@ -16,6 +16,9 @@ type ActiveSession struct {
 	TranscriptPath string `json:"transcript_path"`
 	StartedAt      string `json:"started_at"`
 	ProjectPath    string `json:"project_path"`
+	// TranscriptData holds inline transcript content for agents (e.g.
+	// OpenCode) that don't expose a single on-disk transcript file.
+	TranscriptData []byte `json:"transcript_data,omitempty"`
 }
 
 const (
