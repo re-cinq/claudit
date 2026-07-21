@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -284,7 +285,14 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		}
 
 		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			// Newer OpenCode versions may name the session file differently
+			// from its actual session ID, so read the "id" field from the
+			// file contents rather than trusting the filename.
+			sessionID := sessionIDFromFile(filepath.Join(sessionDir, entry.Name()), entry.Name())
+			if sessionID == "" {
+				continue
+			}
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
 	}
@@ -302,6 +310,25 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// sessionIDFromFile reads the "id" field from an OpenCode session JSON file,
+// falling back to the filename (without extension) if the field is missing,
+// empty, or the file cannot be read/parsed.
+func sessionIDFromFile(path, fileName string) string {
+	fallback := strings.TrimSuffix(fileName, ".json")
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fallback
+	}
+
+	var info sessionInfo
+	if err := json.Unmarshal(data, &info); err != nil || info.ID == "" {
+		return fallback
+	}
+
+	return info.ID
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +524,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
