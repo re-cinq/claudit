@@ -230,7 +230,11 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// OpenCode's on-disk storage layout has changed across versions, so this
+// tries several strategies in order: flat files at the exact legacy path
+// (pre-v1.2), a content-based scan that tolerates directory reorganizations
+// (e.g. an added "project/<id>/" wrapper directory), and finally SQLite
+// (some v1.x releases).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
@@ -241,12 +245,19 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
+	// Newer OpenCode releases have reorganized session/message storage (e.g.
+	// nesting it under an additional "project/<id>/" directory). Scan for a
+	// matching session by content instead of assuming an exact path.
+	if session := discoverByScanning(dataDir, projectPath); session != nil {
+		return session, nil
+	}
+
+	// Fall back to SQLite (some OpenCode v1.x releases)
 	projectID := GetProjectID(projectPath)
 	return discoverFromSQLite(dataDir, projectID, projectPath)
 }
@@ -497,4 +508,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
