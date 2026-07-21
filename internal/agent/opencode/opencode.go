@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -269,7 +270,18 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	var bestModTime time.Time
 
 	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		// Newer OpenCode releases store each session as its own directory
+		// (e.g. storage/session/<projectID>/<sessionID>/info.json) instead of
+		// a flat <sessionID>.json file. Support both layouts: for a directory
+		// entry the name IS the session ID, while a file entry's name has the
+		// ".json" suffix trimmed.
+		var sessionID string
+		switch {
+		case entry.IsDir():
+			sessionID = entry.Name()
+		case strings.HasSuffix(entry.Name(), ".json"):
+			sessionID = strings.TrimSuffix(entry.Name(), ".json")
+		default:
 			continue
 		}
 
@@ -284,7 +296,7 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		}
 
 		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
 	}
@@ -497,4 +509,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
