@@ -39,18 +39,31 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
       if (!pending) return;
       pendingCommits.delete(input.callID);
 
-      // Try to fetch messages via the SDK client API
+      // Try to fetch messages via the SDK client API.
+      // Newer SDK clients wrap list responses as { data: [...] } instead of
+      // returning a bare array, and messages are split into an "info" object
+      // (role, id, time) plus a separate "parts" array (text/tool content)
+      // rather than a flat { role, content } shape. Handle both so this
+      // keeps working across SDK versions.
       let transcriptData = "";
       if (client && pending.sessionID) {
         try {
-          const msgs = await client.session.messages({ path: { id: pending.sessionID } });
-          if (msgs && Array.isArray(msgs)) {
-            transcriptData = JSON.stringify(msgs.map(m => ({
-              role: m.role || "",
-              id: m.id || "",
-              content: m.content || "",
-              time: m.time || {},
-            })));
+          const res = await client.session.messages({ path: { id: pending.sessionID } });
+          const msgs = Array.isArray(res) ? res : (Array.isArray(res?.data) ? res.data : null);
+          if (msgs) {
+            transcriptData = JSON.stringify(msgs.map(m => {
+              const info = m.info || m;
+              const parts = Array.isArray(m.parts) ? m.parts : null;
+              const content = info.content || (parts
+                ? parts.filter(p => p && (p.type === "text" || typeof p.text === "string")).map(p => p.text || "").join("")
+                : "");
+              return {
+                role: info.role || "",
+                id: info.id || m.id || "",
+                content,
+                time: info.time || m.time || {},
+              };
+            }));
           }
         } catch (e) {
           // Fall back to data_dir approach below
