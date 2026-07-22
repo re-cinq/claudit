@@ -52,7 +52,9 @@ func GetProjectID(projectPath string) string {
 	return "global"
 }
 
-// GetSessionDir returns the session storage directory for a project.
+// GetSessionDir returns the legacy (pre-v1.x) session storage directory for
+// a project, where sessions across all projects shared a single
+// "storage/session" tree keyed only by project ID at the leaf.
 func GetSessionDir(projectPath string) (string, error) {
 	dataDir, err := GetDataDir()
 	if err != nil {
@@ -63,7 +65,7 @@ func GetSessionDir(projectPath string) (string, error) {
 	return filepath.Join(dataDir, "storage", "session", projectID), nil
 }
 
-// GetMessageDir returns the message storage directory for a session.
+// GetMessageDir returns the legacy message storage directory for a session.
 func GetMessageDir(sessionID string) (string, error) {
 	dataDir, err := GetDataDir()
 	if err != nil {
@@ -71,6 +73,23 @@ func GetMessageDir(sessionID string) (string, error) {
 	}
 
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
+}
+
+// GetProjectStorageDir returns the newer (OpenCode v1.x+) project-scoped
+// storage root. Modern OpenCode nests a project's entire storage tree
+// (sessions, messages, etc.) under its own "project/<projectID>" directory
+// instead of sharing a single "storage/session/<projectID>" tree keyed only
+// by project at the leaf. Session files live at
+// "<root>/session/<sessionID>.json" and message files at
+// "<root>/message/<sessionID>/<messageID>.json" under the returned root.
+func GetProjectStorageDir(projectPath string) (string, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return "", err
+	}
+
+	projectID := GetProjectID(projectPath)
+	return filepath.Join(dataDir, "project", projectID, "storage"), nil
 }
 
 // sessionInfo represents an OpenCode session JSON file.
