@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -7,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -353,20 +356,43 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
 
-	// Get messages for this session as a JSON array
-	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
-	)
-	cmd = exec.Command("sqlite3", dbPath, msgQuery)
+	// Get messages for this session. The SQL column names used to reference
+	// the owning session and creation time on the "message" table have
+	// changed across OpenCode releases, so rather than querying by column we
+	// fetch every message's JSON payload (the "data" column, which is stable
+	// across versions) and filter/sort using the fields embedded in it.
+	cmd = exec.Command("sqlite3", dbPath, "SELECT data FROM message;")
 	msgOutput, err := cmd.Output()
 	if err != nil {
 		return nil, nil
 	}
 
-	transcriptData := []byte(strings.TrimSpace(string(msgOutput)))
-	// sqlite3 returns "[null]" when no rows match
-	if string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
+	var messages []json.RawMessage
+	for _, line := range strings.Split(strings.TrimSpace(string(msgOutput)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(line), &raw); err != nil {
+			continue
+		}
+		if messageSessionID(raw) != sessionID {
+			continue
+		}
+		messages = append(messages, json.RawMessage(append([]byte{}, line...)))
+	}
+
+	if len(messages) == 0 {
+		return nil, nil
+	}
+
+	sort.SliceStable(messages, func(i, j int) bool {
+		return messageCreatedAt(messages[i]) < messageCreatedAt(messages[j])
+	})
+
+	transcriptData, err := json.Marshal(messages)
+	if err != nil {
 		return nil, nil
 	}
 
@@ -377,6 +403,51 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// messageSessionID extracts the owning session ID from a raw OpenCode
+// message payload. The field name for this has varied across OpenCode
+// releases, so multiple conventions are tried.
+func messageSessionID(raw map[string]json.RawMessage) string {
+	for _, key := range []string{"sessionID", "session_id", "sessionId"} {
+		v, ok := raw[key]
+		if !ok {
+			continue
+		}
+		var id string
+		if err := json.Unmarshal(v, &id); err == nil && id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+// messageCreatedAt extracts a sortable creation timestamp from a raw
+// OpenCode message payload's "time.created" field, which may be encoded as
+// either a number (epoch) or a string depending on OpenCode version.
+func messageCreatedAt(raw json.RawMessage) float64 {
+	var msg struct {
+		Time struct {
+			Created json.RawMessage `json:"created"`
+		} `json:"time"`
+	}
+	if err := json.Unmarshal(raw, &msg); err != nil || len(msg.Time.Created) == 0 {
+		return 0
+	}
+
+	var f float64
+	if err := json.Unmarshal(msg.Time.Created, &f); err == nil {
+		return f
+	}
+
+	var s string
+	if err := json.Unmarshal(msg.Time.Created, &s); err == nil {
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return f
+		}
+	}
+
+	return 0
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -497,4 +568,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
