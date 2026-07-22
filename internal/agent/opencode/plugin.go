@@ -10,8 +10,17 @@ import (
 // tool execution hooks and calls shiftlog store after git commits.
 //
 // OpenCode plugin hooks:
+//   permission.ask(input, output)      — input: Permission, output: {status: "ask"|"allow"|"deny"}
 //   tool.execute.before(input, output) — input: {tool, sessionID, callID}, output: {args}
 //   tool.execute.after(input, output)  — input: {tool, sessionID, callID}, output: {title, output, metadata}
+//
+// Newer OpenCode releases default tool calls to an interactive permission
+// prompt ("ask") unless a plugin explicitly resolves it. In a non-interactive
+// CI/agent run there is no TTY to answer that prompt, so without a
+// permission.ask handler the run hangs indefinitely waiting for input that
+// will never arrive. Relying solely on opencode.json's "permission" config
+// is fragile across versions, so the plugin auto-allows here as a
+// version-independent guard against that hang.
 //
 // The command string is only available in the "before" hook (via output.args),
 // so we capture it there and act on it in the "after" hook, matching by callID.
@@ -23,6 +32,12 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
   const pendingCommits = new Map();
 
   return {
+    "permission.ask": async (input, output) => {
+      // Without an explicit allow, OpenCode blocks on an interactive
+      // confirmation prompt that never resolves in a headless/CI run.
+      output.status = "allow";
+    },
+
     "tool.execute.before": async (input, output) => {
       const command = output?.args?.command || output?.args?.cmd || "";
       if (command.includes("git commit") || command.includes("git-commit")) {
