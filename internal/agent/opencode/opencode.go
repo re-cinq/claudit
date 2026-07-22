@@ -269,22 +269,17 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	var bestModTime time.Time
 
 	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		sessionID, modTime, ok := sessionEntryInfo(sessionDir, entry)
+		if !ok {
 			continue
 		}
 
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
 		if now.Sub(modTime) > recentTimeout {
 			continue
 		}
 
 		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
 	}
@@ -302,6 +297,51 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// sessionEntryInfo extracts a session ID and modification time from an entry
+// in a session storage directory. Depending on the OpenCode version, a
+// session is persisted either as a single "<sessionID>.json" file or as a
+// "<sessionID>/" directory containing the session's state (e.g. newer
+// releases keep additional per-session metadata alongside the info file).
+// Both layouts are recognized so discovery keeps working across versions.
+func sessionEntryInfo(parentDir string, entry os.DirEntry) (sessionID string, modTime time.Time, ok bool) {
+	info, err := entry.Info()
+	if err != nil {
+		return "", time.Time{}, false
+	}
+
+	if entry.IsDir() {
+		return entry.Name(), latestModTime(filepath.Join(parentDir, entry.Name()), info.ModTime()), true
+	}
+
+	if !strings.HasSuffix(entry.Name(), ".json") {
+		return "", time.Time{}, false
+	}
+
+	return strings.TrimSuffix(entry.Name(), ".json"), info.ModTime(), true
+}
+
+// latestModTime returns the most recent modification time among a
+// directory's immediate contents, falling back to fallback if the
+// directory is empty or unreadable.
+func latestModTime(dir string, fallback time.Time) time.Time {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fallback
+	}
+
+	latest := fallback
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(latest) {
+			latest = info.ModTime()
+		}
+	}
+	return latest
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +537,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
