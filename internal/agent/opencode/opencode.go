@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -229,9 +230,66 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 	return &agent.Transcript{Entries: entries}, nil
 }
 
+// sessionSnapshot is written by the OpenCode plugin (see plugin.go) on every
+// tool call, capturing the active session so it can be discovered by the
+// post-commit hook process, which has no access to OpenCode's SDK client and
+// cannot rely on OpenCode's internal on-disk session storage layout (which
+// has changed across OpenCode releases).
+type sessionSnapshot struct {
+	SessionID      string `json:"session_id"`
+	Timestamp      int64  `json:"timestamp"`
+	TranscriptData string `json:"transcript_data"`
+}
+
+// snapshotPath returns the path to the plugin-written session snapshot file
+// for a given project.
+func snapshotPath(projectPath string) string {
+	return filepath.Join(projectPath, ".opencode", "shiftlog-session.json")
+}
+
+// discoverFromSnapshot reads the session snapshot written by the shiftlog
+// OpenCode plugin on every tool call. This is the primary session discovery
+// mechanism because it doesn't depend on OpenCode's internal storage format.
+func (a *Agent) discoverFromSnapshot(projectPath string) (*agent.SessionInfo, error) {
+	data, err := os.ReadFile(snapshotPath(projectPath))
+	if err != nil {
+		return nil, nil
+	}
+
+	var snap sessionSnapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return nil, nil
+	}
+	if snap.SessionID == "" || snap.TranscriptData == "" {
+		return nil, nil
+	}
+
+	snapTime := time.UnixMilli(snap.Timestamp)
+	if time.Since(snapTime) > agent.RecentSessionTimeout {
+		return nil, nil
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      snap.SessionID,
+		TranscriptPath: "",
+		StartedAt:      snapTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+		TranscriptData: []byte(snap.TranscriptData),
+	}, nil
+}
+
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first checks the plugin-written session snapshot (works regardless of
+// OpenCode version), then falls back to flat file storage (pre-v1.2
+// OpenCode), then SQLite (v1.2+), for compatibility with setups where the
+// snapshot isn't available (e.g. an older installed plugin).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	if session, err := a.discoverFromSnapshot(projectPath); err != nil {
+		return nil, err
+	} else if session != nil {
+		return session, nil
+	}
+
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
@@ -454,7 +512,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +554,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
