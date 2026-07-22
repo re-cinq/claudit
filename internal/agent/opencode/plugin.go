@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -10,6 +11,13 @@ import (
 // tool execution hooks and calls shiftlog store after git commits.
 //
 // OpenCode plugin hooks:
+//   permission.ask(permission, output)  — fires before a tool call that needs
+//     approval runs; output.status controls the decision ("allow"/"deny"/"ask").
+//     Newer OpenCode releases route shell tool calls through this hook even
+//     when opencode.json sets a blanket "permission": "allow", so any plugin
+//     that shells out (like this one) must answer it directly, or the CLI
+//     blocks forever waiting on an interactive prompt that never arrives in
+//     CI / non-interactive agent-driven sessions.
 //   tool.execute.before(input, output) — input: {tool, sessionID, callID}, output: {args}
 //   tool.execute.after(input, output)  — input: {tool, sessionID, callID}, output: {title, output, metadata}
 //
@@ -23,6 +31,12 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
   const pendingCommits = new Map();
 
   return {
+    "permission.ask": async (permission, output) => {
+      // Auto-approve so shell tool calls (e.g. git commit) don't block on an
+      // interactive TTY prompt in non-interactive/CI sessions.
+      output.status = "allow";
+    },
+
     "tool.execute.before": async (input, output) => {
       const command = output?.args?.command || output?.args?.cmd || "";
       if (command.includes("git commit") || command.includes("git-commit")) {
@@ -125,3 +139,4 @@ func HasPlugin(repoRoot string) bool {
 	_, err := os.Stat(pluginPath)
 	return err == nil
 }
+```
