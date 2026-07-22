@@ -1,9 +1,11 @@
+```go
 package opencode
 
 import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -230,9 +232,25 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+//
+// OpenCode's on-disk storage layout has changed across versions (and may
+// change again), so we no longer assume a single fixed directory shape.
+// Strategy, in order:
+//  1. discoverByDataDirScan: layout-agnostic — scan the data directory for
+//     the most recently touched session file whose recorded working
+//     directory matches projectPath. This keeps working even if OpenCode
+//     restructures how it partitions storage by project.
+//  2. discoverFromFlatFiles: the previously-known fixed convention
+//     (storage/session/<projectID>/<sessionID>.json), kept as a fallback.
+//  3. discoverFromSQLite: OpenCode v1.2+ SQLite-backed storage.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
+	if session, err := a.discoverByDataDirScan(projectPath); err != nil {
+		return nil, err
+	} else if session != nil {
+		return session, nil
+	}
+
+	// Try flat file storage (fixed project-directory convention)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
 		return nil, err
@@ -249,6 +267,173 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 
 	projectID := GetProjectID(projectPath)
 	return discoverFromSQLite(dataDir, projectID, projectPath)
+}
+
+// discoverByDataDirScan scans the OpenCode data directory for the most
+// recently modified session whose recorded working directory matches
+// projectPath. Unlike discoverFromFlatFiles, it does not assume sessions are
+// nested under a project-ID directory, so it tolerates OpenCode changing how
+// it lays out storage on disk between versions.
+func (a *Agent) discoverByDataDirScan(projectPath string) (*agent.SessionInfo, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return nil, nil
+	}
+
+	storageDir := filepath.Join(dataDir, "storage")
+	if _, err := os.Stat(storageDir); err != nil {
+		return nil, nil
+	}
+
+	now := time.Now()
+	recentTimeout := agent.RecentSessionTimeout
+
+	var bestSessionID string
+	var bestModTime time.Time
+	visited := 0
+
+	_ = filepath.WalkDir(storageDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		visited++
+		if visited > 50000 {
+			return filepath.SkipAll
+		}
+
+		info, err := d.Info()
+		if err != nil || now.Sub(info.ModTime()) > recentTimeout {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil
+		}
+
+		dir := firstStringField(raw, "directory", "cwd", "worktree", "path", "project_dir")
+		if dir == "" || !agent.PathsEqual(dir, projectPath) {
+			return nil
+		}
+
+		sessionID := firstStringField(raw, "id", "sessionID", "session_id")
+		if sessionID == "" {
+			sessionID = strings.TrimSuffix(d.Name(), ".json")
+		}
+
+		if bestSessionID == "" || info.ModTime().After(bestModTime) {
+			bestSessionID = sessionID
+			bestModTime = info.ModTime()
+		}
+		return nil
+	})
+
+	if bestSessionID == "" {
+		return nil, nil
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: "",
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+		TranscriptData: collectMessagesForSession(storageDir, bestSessionID, now, recentTimeout),
+	}, nil
+}
+
+// firstStringField returns the value of the first present string field
+// among the given keys.
+func firstStringField(raw map[string]json.RawMessage, keys ...string) string {
+	for _, key := range keys {
+		v, ok := raw[key]
+		if !ok {
+			continue
+		}
+		var s string
+		if err := json.Unmarshal(v, &s); err == nil && s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// collectMessagesForSession walks storageDir for message files belonging to
+// sessionID — either because they live in a directory named after the
+// session, or because their content carries a matching sessionID field — and
+// combines them into a single JSON array. Returns nil if none are found.
+func collectMessagesForSession(storageDir, sessionID string, now time.Time, recentTimeout time.Duration) []byte {
+	var messages []json.RawMessage
+	visited := 0
+
+	_ = filepath.WalkDir(storageDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".json") && !strings.HasSuffix(d.Name(), ".jsonl") {
+			return nil
+		}
+
+		visited++
+		if visited > 50000 {
+			return filepath.SkipAll
+		}
+
+		info, err := d.Info()
+		if err != nil || now.Sub(info.ModTime()) > recentTimeout {
+			return nil
+		}
+
+		inSessionDir := filepath.Base(filepath.Dir(path)) == sessionID
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		if strings.HasSuffix(d.Name(), ".jsonl") {
+			for _, line := range strings.Split(string(data), "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				if inSessionDir || documentBelongsToSession(line, sessionID) {
+					messages = append(messages, json.RawMessage(append([]byte{}, line...)))
+				}
+			}
+			return nil
+		}
+
+		if inSessionDir || documentBelongsToSession(string(data), sessionID) {
+			messages = append(messages, json.RawMessage(append([]byte{}, data...)))
+		}
+		return nil
+	})
+
+	if len(messages) == 0 {
+		return nil
+	}
+
+	out, err := json.Marshal(messages)
+	if err != nil {
+		return nil
+	}
+	return out
+}
+
+// documentBelongsToSession reports whether a JSON document's sessionID (or
+// session_id) field matches sessionID.
+func documentBelongsToSession(doc, sessionID string) bool {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(doc), &raw); err != nil {
+		return false
+	}
+	return firstStringField(raw, "sessionID", "session_id") == sessionID
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -497,4 +682,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
