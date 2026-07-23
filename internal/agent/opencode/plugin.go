@@ -71,13 +71,23 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
       });
 
       try {
-        const { execSync } = await import("child_process");
-        execSync("shiftlog store --agent=opencode", {
-          input: hookData,
+        // Spawn detached and unref'd rather than using execSync: newer OpenCode
+        // runtimes await this hook before letting the run finish, so a
+        // synchronous, blocking call here can stall (or even hang) the whole
+        // "opencode run" invocation if the child process is slow to exit.
+        // Firing the store call in the background keeps the hook itself fast
+        // regardless of how long shiftlog takes to complete.
+        const { spawn } = await import("child_process");
+        const child = spawn("shiftlog", ["store", "--agent=opencode"], {
           cwd: directory,
-          timeout: 30000,
-          stdio: ["pipe", "pipe", "pipe"],
+          stdio: ["pipe", "ignore", "ignore"],
+          detached: true,
         });
+        child.on("error", () => {});
+        child.stdin.on("error", () => {});
+        child.stdin.write(hookData);
+        child.stdin.end();
+        child.unref();
       } catch (e) {
         // Silently ignore errors to not disrupt workflow
       }
