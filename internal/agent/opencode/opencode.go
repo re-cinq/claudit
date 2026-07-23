@@ -323,10 +323,25 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
-		return nil, nil
-	}
 	sessionID := strings.TrimSpace(string(sessionOutput))
+	if err != nil || sessionID == "" {
+		// OpenCode's project identifier scheme is an internal implementation
+		// detail (not a stable public API) and has changed across releases,
+		// so our computed projectID may not match what this OpenCode version
+		// actually stored the session under. Fall back to the most recently
+		// updated session across all projects; it is still validated against
+		// the recent-session timeout below. This mirrors the analogous
+		// fallback used by the Gemini agent's ScanAllProjectDirs, which
+		// exists for the same reason (a CLI's project-keying scheme moving
+		// out from under us between versions).
+		fallbackQuery := `SELECT id FROM session ORDER BY time_updated DESC LIMIT 1;`
+		cmd = exec.Command("sqlite3", "-separator", "\t", dbPath, fallbackQuery)
+		fallbackOutput, ferr := cmd.Output()
+		sessionID = strings.TrimSpace(string(fallbackOutput))
+		if ferr != nil || sessionID == "" {
+			return nil, nil
+		}
+	}
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
@@ -497,4 +512,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
