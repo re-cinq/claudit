@@ -316,24 +316,17 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
-	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+	sessionID := findRecentSQLiteSession(dbPath, projectID, projectPath)
+	if sessionID == "" {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
 		`SELECT time_updated FROM session WHERE id='%s';`,
-		sessionID,
+		escapeSQLiteLiteral(sessionID),
 	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
+	cmd := exec.Command("sqlite3", dbPath, timeQuery)
 	timeOutput, err := cmd.Output()
 	if err == nil {
 		timeStr := strings.TrimSpace(string(timeOutput))
@@ -356,7 +349,7 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	// Get messages for this session as a JSON array
 	msgQuery := fmt.Sprintf(
 		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
+		escapeSQLiteLiteral(sessionID),
 	)
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
@@ -377,6 +370,51 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// findRecentSQLiteSession locates the most recently updated OpenCode session
+// for a project. OpenCode's internal project identifier (both the column
+// used to scope sessions to a project and the value format) has changed
+// across versions, so our independently-computed projectID may not match
+// what a given OpenCode version actually stored. Scoped lookups are tried
+// in order of specificity — first by working directory, then by the legacy
+// project_id hash — before falling back to the most recently updated
+// session in the database regardless of project. Each candidate query
+// degrades gracefully (returns no match) if the column it references
+// doesn't exist in the installed OpenCode version's schema.
+func findRecentSQLiteSession(dbPath, projectID, projectPath string) string {
+	scopedQueries := []string{
+		fmt.Sprintf(`SELECT id FROM session WHERE directory='%s' ORDER BY time_updated DESC LIMIT 1;`,
+			escapeSQLiteLiteral(projectPath)),
+		fmt.Sprintf(`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
+			escapeSQLiteLiteral(projectID)),
+	}
+
+	for _, query := range scopedQueries {
+		if id := runSQLiteScalar(dbPath, query); id != "" {
+			return id
+		}
+	}
+
+	return runSQLiteScalar(dbPath, `SELECT id FROM session ORDER BY time_updated DESC LIMIT 1;`)
+}
+
+// runSQLiteScalar runs a query expected to return a single scalar value.
+// It returns "" if the query errors (e.g. it references a column that
+// doesn't exist in this OpenCode version's schema) or returns no rows.
+func runSQLiteScalar(dbPath, query string) string {
+	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, query)
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+
+// escapeSQLiteLiteral escapes single quotes for safe inclusion in a
+// single-quoted SQLite string literal.
+func escapeSQLiteLiteral(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -497,4 +535,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
