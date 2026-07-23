@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +129,87 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// FindSessionByProject searches the OpenCode data directory for the most
+// recently modified session file. OpenCode's on-disk layout has changed
+// across releases (e.g. project-scoped subdirectories, renamed folders), so
+// rather than assuming one fixed path depth we walk the whole data directory
+// looking for a JSON file that looks like session info.
+//
+// It prefers a session whose "projectID" field matches, but falls back to
+// the most recently modified session file overall if no exact match is
+// found (or if the field isn't present in the current version's format).
+func FindSessionByProject(dataDir, projectID string) (sessionID string, ok bool) {
+	type candidate struct {
+		id      string
+		modTime time.Time
+		matched bool
+	}
+	var best *candidate
+	now := time.Now()
+
+	_ = filepath.WalkDir(dataDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil || now.Sub(info.ModTime()) > agent.RecentSessionTimeout {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		var sess struct {
+			ID        string `json:"id"`
+			ProjectID string `json:"projectID"`
+		}
+		if json.Unmarshal(data, &sess) != nil || sess.ID == "" {
+			return nil
+		}
+
+		matched := sess.ProjectID == "" || sess.ProjectID == projectID
+		switch {
+		case best == nil:
+			best = &candidate{id: sess.ID, modTime: info.ModTime(), matched: matched}
+		case matched && !best.matched:
+			best = &candidate{id: sess.ID, modTime: info.ModTime(), matched: matched}
+		case matched == best.matched && info.ModTime().After(best.modTime):
+			best = &candidate{id: sess.ID, modTime: info.ModTime(), matched: matched}
+		}
+		return nil
+	})
+
+	if best == nil {
+		return "", false
+	}
+	return best.id, true
+}
+
+// FindMessageDir searches the OpenCode data directory for a directory named
+// after the given session ID, tolerating layout changes (e.g. a "message"
+// folder nested under a project-scoped path) instead of assuming a fixed
+// location.
+func FindMessageDir(dataDir, sessionID string) (string, bool) {
+	if sessionID == "" {
+		return "", false
+	}
+
+	var found string
+	_ = filepath.WalkDir(dataDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		if d.Name() == sessionID {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+
+	return found, found != ""
 }

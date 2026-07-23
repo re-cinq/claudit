@@ -22,6 +22,15 @@ const pluginTemplate = `// shiftlog plugin for OpenCode CLI
 export const ShiftlogPlugin = async ({ directory, client }) => {
   const pendingCommits = new Map();
 
+  // Races a promise against a timeout so a slow or hung SDK call can never
+  // block the tool call indefinitely (OpenCode's client SDK shape/behavior
+  // has changed across versions and may not resolve as expected).
+  const withTimeout = (promise, ms) =>
+    Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("shiftlog: SDK call timed out")), ms)),
+    ]);
+
   return {
     "tool.execute.before": async (input, output) => {
       const command = output?.args?.command || output?.args?.cmd || "";
@@ -39,13 +48,21 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
       if (!pending) return;
       pendingCommits.delete(input.callID);
 
-      // Try to fetch messages via the SDK client API
+      // Try to fetch messages via the SDK client API. Bounded by a timeout so
+      // an unresponsive or incompatible SDK call can't hang the tool call;
+      // on any failure we fall back to the data_dir approach below.
       let transcriptData = "";
       if (client && pending.sessionID) {
         try {
-          const msgs = await client.session.messages({ path: { id: pending.sessionID } });
-          if (msgs && Array.isArray(msgs)) {
-            transcriptData = JSON.stringify(msgs.map(m => ({
+          const msgs = await withTimeout(
+            client.session.messages({ path: { id: pending.sessionID } }),
+            5000
+          );
+          const msgList = Array.isArray(msgs)
+            ? msgs
+            : (msgs && Array.isArray(msgs.data) ? msgs.data : null);
+          if (msgList) {
+            transcriptData = JSON.stringify(msgList.map(m => ({
               role: m.role || "",
               id: m.id || "",
               content: m.content || "",
