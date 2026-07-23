@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +129,64 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// activeSessionMarkerFile is the name of the marker file the shiftlog
+// OpenCode plugin writes on every tool call, recording the current session
+// and a live-fetched transcript snapshot (see plugin.go). It lives under
+// the project's own .shiftlog directory, keyed by project path rather than
+// OpenCode's internal project ID scheme.
+const activeSessionMarkerFile = "opencode-active-session.json"
+
+// activeSessionMarker mirrors the JSON written by the shiftlog plugin.
+type activeSessionMarker struct {
+	SessionID      string `json:"session_id"`
+	TranscriptData string `json:"transcript_data,omitempty"`
+}
+
+// ReadActiveSessionMarker reads the OpenCode active-session marker written
+// by the shiftlog plugin (see plugin.go) on every tool call. This is the
+// preferred session discovery mechanism because it's populated via
+// OpenCode's live SDK client rather than reverse-engineered from
+// OpenCode's on-disk storage layout, which has changed across versions.
+//
+// Returns nil (with no error) if the marker is missing, unreadable, or
+// stale (older than agent.RecentSessionTimeout).
+func ReadActiveSessionMarker(projectPath string) (*agent.SessionInfo, error) {
+	markerPath := filepath.Join(projectPath, ".shiftlog", activeSessionMarkerFile)
+
+	info, err := os.Stat(markerPath)
+	if err != nil {
+		return nil, nil
+	}
+	if time.Since(info.ModTime()) > agent.RecentSessionTimeout {
+		return nil, nil
+	}
+
+	data, err := os.ReadFile(markerPath)
+	if err != nil {
+		return nil, nil
+	}
+
+	var marker activeSessionMarker
+	if err := json.Unmarshal(data, &marker); err != nil {
+		return nil, nil
+	}
+	if marker.SessionID == "" {
+		return nil, nil
+	}
+
+	session := &agent.SessionInfo{
+		SessionID:   marker.SessionID,
+		StartedAt:   info.ModTime().Format(time.RFC3339),
+		ProjectPath: projectPath,
+	}
+
+	if marker.TranscriptData != "" {
+		session.TranscriptData = []byte(marker.TranscriptData)
+	} else if msgDir, err := GetMessageDir(marker.SessionID); err == nil {
+		session.TranscriptPath = msgDir
+	}
+
+	return session, nil
 }
