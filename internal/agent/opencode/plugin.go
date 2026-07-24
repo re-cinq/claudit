@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -39,11 +40,25 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
       if (!pending) return;
       pendingCommits.delete(input.callID);
 
-      // Try to fetch messages via the SDK client API
+      // Try to fetch messages via the SDK client API. This calls back into
+      // OpenCode's own local server, which may still be busy handling the
+      // very tool-execution event that triggered this hook, so it must
+      // never be allowed to block indefinitely - race it against a short
+      // deadline and fall back to the data_dir approach below on timeout.
       let transcriptData = "";
       if (client && pending.sessionID) {
         try {
-          const msgs = await client.session.messages({ path: { id: pending.sessionID } });
+          const withTimeout = (promise, ms) => new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error("timeout")), ms);
+            promise.then(
+              (v) => { clearTimeout(timer); resolve(v); },
+              (e) => { clearTimeout(timer); reject(e); },
+            );
+          });
+          const msgs = await withTimeout(
+            client.session.messages({ path: { id: pending.sessionID } }),
+            2000,
+          );
           if (msgs && Array.isArray(msgs)) {
             transcriptData = JSON.stringify(msgs.map(m => ({
               role: m.role || "",
@@ -70,13 +85,20 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
         ...(transcriptData ? { transcript_data: transcriptData } : {}),
       });
 
+      // Use the async, non-blocking form of exec rather than execSync.
+      // execSync freezes the whole JS thread - and with it OpenCode's own
+      // event loop and local SDK server - until the child exits. Invoked
+      // from inside a plugin hook that OpenCode is awaiting as part of its
+      // own single-threaded event processing, that block can deadlock the
+      // CLI instead of just delaying it, hanging the entire session.
       try {
-        const { execSync } = await import("child_process");
-        execSync("shiftlog store --agent=opencode", {
-          input: hookData,
-          cwd: directory,
-          timeout: 30000,
-          stdio: ["pipe", "pipe", "pipe"],
+        const { exec } = await import("child_process");
+        await new Promise((resolve) => {
+          const child = exec("shiftlog store --agent=opencode", {
+            cwd: directory,
+            timeout: 30000,
+          }, () => resolve());
+          child.stdin.end(hookData);
         });
       } catch (e) {
         // Silently ignore errors to not disrupt workflow
@@ -125,3 +147,4 @@ func HasPlugin(repoRoot string) bool {
 	_, err := os.Stat(pluginPath)
 	return err == nil
 }
+```
