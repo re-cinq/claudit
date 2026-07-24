@@ -1,1 +1,3 @@
-- [x] Add todo listTue Jul 21 08:53:06 UTC 2026
+# TODO list
+- [ ] Add a new feature
+- [ ] Fix a bug
