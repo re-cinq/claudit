@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -39,11 +40,26 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
       if (!pending) return;
       pendingCommits.delete(input.callID);
 
-      // Try to fetch messages via the SDK client API
+      // Try to fetch messages via the SDK client API. This call is bounded
+      // by a timeout so that a broken or hung client (e.g. after an
+      // OpenCode client API change) cannot block this hook - and therefore
+      // the whole OpenCode process - indefinitely. On timeout or error we
+      // fall back to the data_dir/SQLite reconstruction below.
       let transcriptData = "";
       if (client && pending.sessionID) {
         try {
-          const msgs = await client.session.messages({ path: { id: pending.sessionID } });
+          const withTimeout = (promise, ms) =>
+            Promise.race([
+              promise,
+              new Promise((_, reject) =>
+                setTimeout(() => reject(new Error("shiftlog: client call timed out")), ms)
+              ),
+            ]);
+
+          const msgs = await withTimeout(
+            client.session.messages({ path: { id: pending.sessionID } }),
+            5000
+          );
           if (msgs && Array.isArray(msgs)) {
             transcriptData = JSON.stringify(msgs.map(m => ({
               role: m.role || "",
@@ -125,3 +141,4 @@ func HasPlugin(repoRoot string) bool {
 	_, err := os.Stat(pluginPath)
 	return err == nil
 }
+```

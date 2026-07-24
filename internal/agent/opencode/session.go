@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -73,6 +74,66 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// QuerySessionMessages queries all messages for a session from OpenCode's
+// SQLite database and returns them as a JSON array ordered by creation time.
+func QuerySessionMessages(dbPath, sessionID string) ([]byte, error) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		return nil, fmt.Errorf("sqlite3 not available")
+	}
+
+	msgQuery := fmt.Sprintf(
+		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
+		sessionID,
+	)
+	cmd := exec.Command("sqlite3", dbPath, msgQuery)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	data := strings.TrimSpace(string(output))
+	if data == "" || data == "[null]" || data == "[]" {
+		return nil, fmt.Errorf("no messages found for session %q", sessionID)
+	}
+
+	return []byte(data), nil
+}
+
+// QueryMostRecentSessionID returns the most recently updated session ID from
+// OpenCode's SQLite database. When projectID is non-empty, only sessions
+// matching that project are considered. Pass an empty projectID to fall back
+// to the single most recent session regardless of project association -
+// needed because OpenCode's project identification scheme is not stable
+// across versions (project_id may no longer match a git root commit hash).
+func QueryMostRecentSessionID(dbPath, projectID string) (string, error) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		return "", fmt.Errorf("sqlite3 not available")
+	}
+
+	var query string
+	if projectID != "" {
+		query = fmt.Sprintf(
+			`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
+			projectID,
+		)
+	} else {
+		query = `SELECT id FROM session ORDER BY time_updated DESC LIMIT 1;`
+	}
+
+	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, query)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+
+	sessionID := strings.TrimSpace(string(output))
+	if sessionID == "" {
+		return "", fmt.Errorf("no session found")
+	}
+
+	return sessionID, nil
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
@@ -127,3 +188,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
