@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -251,7 +252,13 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 	return discoverFromSQLite(dataDir, projectID, projectPath)
 }
 
-// discoverFromFlatFiles tries the legacy flat file session discovery.
+// discoverFromFlatFiles tries the flat file session discovery.
+// Older OpenCode releases (pre-v1.2) store each session as a single
+// <sessionID>.json file directly under the project's session directory.
+// Newer releases (v1.18+) store each session as its own subdirectory
+// (e.g. storage/session/<projectID>/<sessionID>/info.json), matching the
+// directory-per-session layout already used for message storage. Both
+// layouts are supported here.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionDir(projectPath)
 	if err != nil {
@@ -269,22 +276,35 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	var bestModTime time.Time
 
 	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		var sessionID string
+		var modTime time.Time
+
+		if entry.IsDir() {
+			// Session stored as a subdirectory (OpenCode v1.18+).
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			sessionID = entry.Name()
+			modTime = newestModTime(filepath.Join(sessionDir, entry.Name()), info.ModTime())
+		} else if strings.HasSuffix(entry.Name(), ".json") {
+			// Session stored as a flat file (pre-v1.2 OpenCode).
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			sessionID = strings.TrimSuffix(entry.Name(), ".json")
+			modTime = info.ModTime()
+		} else {
 			continue
 		}
 
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
 		if now.Sub(modTime) > recentTimeout {
 			continue
 		}
 
 		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
 	}
@@ -302,6 +322,30 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// newestModTime returns the modification time of the most recently
+// modified entry directly inside dir, falling back to fallback (typically
+// the directory's own mtime) when dir has no readable entries. This lets
+// session recency checks work regardless of what files OpenCode writes
+// inside a per-session directory.
+func newestModTime(dir string, fallback time.Time) time.Time {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fallback
+	}
+
+	best := fallback
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(best) {
+			best = info.ModTime()
+		}
+	}
+	return best
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +541,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
