@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +129,125 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// candidateSession is a loosely-typed view of an OpenCode session JSON file,
+// tolerant of field names/casing that may differ across OpenCode versions.
+type candidateSession struct {
+	ID          string `json:"id"`
+	ProjectID   string `json:"projectID"`
+	ProjectID2  string `json:"project_id"`
+	Directory   string `json:"directory"`
+	Directory2  string `json:"path"`
+	Directory3  string `json:"cwd"`
+	Directory4  string `json:"worktree"`
+	ProjectPath string `json:"projectPath"`
+}
+
+func (c candidateSession) matchesProject(projectID, projectPath string) bool {
+	for _, id := range []string{c.ProjectID, c.ProjectID2} {
+		if id != "" && id == projectID {
+			return true
+		}
+	}
+	for _, dir := range []string{c.Directory, c.Directory2, c.Directory3, c.Directory4, c.ProjectPath} {
+		if dir != "" && agent.PathsEqual(dir, projectPath) {
+			return true
+		}
+	}
+	return false
+}
+
+// ScanAllProjectDirs scans every directory under storage/session/ for a session
+// belonging to projectPath, matching by the session file's own recorded
+// project/directory fields rather than trusting that OpenCode named the
+// directory after the project ID computed by GetProjectID.
+//
+// This is a fallback used when the primary project-ID-named directory lookup
+// (GetSessionDir) finds nothing — e.g. when the on-disk project scoping
+// scheme changes between OpenCode versions and no longer matches the git
+// root-commit-hash assumption baked into GetProjectID.
+func ScanAllProjectDirs(projectPath string) (*agent.SessionInfo, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return nil, nil
+	}
+
+	sessionsRoot := filepath.Join(dataDir, "storage", "session")
+	projectDirs, err := os.ReadDir(sessionsRoot)
+	if err != nil {
+		return nil, nil
+	}
+
+	projectID := GetProjectID(projectPath)
+	now := time.Now()
+	var bestSessionID string
+	var bestModTime time.Time
+
+	for _, pd := range projectDirs {
+		if !pd.IsDir() {
+			continue
+		}
+
+		dir := filepath.Join(sessionsRoot, pd.Name())
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+
+		// Fast path: this directory is already named after the project ID.
+		// (GetSessionDir would have found it, but scan it too in case the
+		// primary lookup bailed out early for an unrelated reason.)
+		matchesByName := pd.Name() == projectID
+
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+
+			modTime := info.ModTime()
+			if now.Sub(modTime) > agent.RecentSessionTimeout {
+				continue
+			}
+			if bestSessionID != "" && !modTime.After(bestModTime) {
+				continue
+			}
+
+			filePath := filepath.Join(dir, entry.Name())
+
+			if !matchesByName {
+				data, err := os.ReadFile(filePath)
+				if err != nil {
+					continue
+				}
+				var candidate candidateSession
+				if err := json.Unmarshal(data, &candidate); err != nil {
+					continue
+				}
+				if !candidate.matchesProject(projectID, projectPath) {
+					continue
+				}
+			}
+
+			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			bestModTime = modTime
+		}
+	}
+
+	if bestSessionID == "" {
+		return nil, nil
+	}
+
+	msgDir, _ := GetMessageDir(bestSessionID)
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: msgDir,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
 }
