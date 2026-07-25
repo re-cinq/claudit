@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -230,8 +231,26 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+//
+// OpenCode's on-disk session storage format is not stable across releases
+// (it has changed between major versions and isn't part of any documented,
+// versioned API). Rather than reverse-engineer that format for every
+// release, we first check the active-session marker maintained by the
+// shiftlog OpenCode plugin (see plugin.go): on every tool call, the plugin
+// fetches the transcript via OpenCode's stable plugin SDK client and writes
+// it to .shiftlog/opencode-active-session.json. This lets manual (non-agent)
+// commits be attributed correctly regardless of OpenCode's storage layout.
+//
+// If that marker is missing or stale (e.g. the plugin isn't installed, or
+// an older shiftlog init generated an older plugin), we fall back to
+// reading OpenCode's storage directly: flat file storage (pre-v1.2), then
+// SQLite (v1.2+). These fallbacks are best-effort and may not work with
+// every OpenCode version.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	if session, err := discoverFromActiveSession(projectPath); err == nil && session != nil {
+		return session, nil
+	}
+
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
@@ -249,6 +268,57 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 
 	projectID := GetProjectID(projectPath)
 	return discoverFromSQLite(dataDir, projectID, projectPath)
+}
+
+// activeSessionMarker mirrors the JSON written by the shiftlog OpenCode
+// plugin (plugin.go) to .shiftlog/opencode-active-session.json on every tool
+// call. It carries the transcript inline (fetched via the plugin SDK client)
+// since OpenCode's own on-disk session storage format isn't stable across
+// versions.
+type activeSessionMarker struct {
+	SessionID      string `json:"session_id"`
+	TranscriptData string `json:"transcript_data"`
+	ProjectPath    string `json:"project_path"`
+	UpdatedAt      string `json:"updated_at"`
+}
+
+// discoverFromActiveSession reads the active-session marker written by the
+// shiftlog OpenCode plugin. Returns nil, nil if the marker is missing,
+// stale, unparseable, or belongs to a different project.
+func discoverFromActiveSession(projectPath string) (*agent.SessionInfo, error) {
+	markerPath := filepath.Join(projectPath, ".shiftlog", "opencode-active-session.json")
+
+	info, err := os.Stat(markerPath)
+	if err != nil {
+		return nil, nil
+	}
+	if time.Since(info.ModTime()) > agent.RecentSessionTimeout {
+		return nil, nil
+	}
+
+	data, err := os.ReadFile(markerPath)
+	if err != nil {
+		return nil, nil
+	}
+
+	var marker activeSessionMarker
+	if err := json.Unmarshal(data, &marker); err != nil {
+		return nil, nil
+	}
+
+	if marker.SessionID == "" {
+		return nil, nil
+	}
+	if marker.ProjectPath != "" && !agent.PathsEqual(marker.ProjectPath, projectPath) {
+		return nil, nil
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      marker.SessionID,
+		StartedAt:      marker.UpdatedAt,
+		ProjectPath:    projectPath,
+		TranscriptData: []byte(marker.TranscriptData),
+	}, nil
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -497,4 +567,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
