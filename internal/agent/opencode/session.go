@@ -73,6 +73,57 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// opencodeLayout describes one candidate on-disk layout for OpenCode's
+// session/message storage. OpenCode has changed this layout across
+// releases (e.g. moving from a flat "storage/session/<projectID>" tree to a
+// project-scoped "project/<projectID>/storage/session" tree), so session
+// discovery tries each known layout in turn rather than assuming a single
+// fixed structure.
+type opencodeLayout struct {
+	sessionDir func(dataDir, projectID string) string
+	messageDir func(dataDir, projectID, sessionID string) string
+}
+
+// opencodeLayouts lists candidate storage layouts, newest/most-likely first.
+var opencodeLayouts = []opencodeLayout{
+	{
+		// Project-scoped layout: project/<projectID>/storage/session
+		sessionDir: func(dataDir, projectID string) string {
+			return filepath.Join(dataDir, "project", projectID, "storage", "session")
+		},
+		messageDir: func(dataDir, projectID, sessionID string) string {
+			return filepath.Join(dataDir, "project", projectID, "storage", "message", sessionID)
+		},
+	},
+	{
+		// Legacy layout: storage/session/<projectID>
+		sessionDir: func(dataDir, projectID string) string {
+			return filepath.Join(dataDir, "storage", "session", projectID)
+		},
+		messageDir: func(dataDir, _, sessionID string) string {
+			return filepath.Join(dataDir, "storage", "message", sessionID)
+		},
+	},
+	{
+		// Project-scoped layout without a "storage" segment: project/<projectID>/session
+		sessionDir: func(dataDir, projectID string) string {
+			return filepath.Join(dataDir, "project", projectID, "session")
+		},
+		messageDir: func(dataDir, projectID, sessionID string) string {
+			return filepath.Join(dataDir, "project", projectID, "message", sessionID)
+		},
+	},
+	{
+		// Flat layout with no per-project session directory at all.
+		sessionDir: func(dataDir, _ string) string {
+			return filepath.Join(dataDir, "storage", "session")
+		},
+		messageDir: func(dataDir, _, sessionID string) string {
+			return filepath.Join(dataDir, "storage", "message", sessionID)
+		},
+	},
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
