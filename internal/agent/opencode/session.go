@@ -63,6 +63,27 @@ func GetSessionDir(projectPath string) (string, error) {
 	return filepath.Join(dataDir, "storage", "session", projectID), nil
 }
 
+// sessionDirCandidates returns candidate session storage directories for a
+// project. Newer OpenCode releases nest project storage under
+// project/<projectID>/storage instead of storage/<kind>/<projectID> directly
+// under the data dir, so both layouts are checked during discovery.
+func sessionDirCandidates(dataDir, projectID string) []string {
+	return []string{
+		filepath.Join(dataDir, "storage", "session", projectID),
+		filepath.Join(dataDir, "project", projectID, "storage", "session"),
+	}
+}
+
+// messageDirCandidates returns candidate message storage directories for a
+// session, covering both the legacy flat layout and the newer project-scoped
+// layout (see sessionDirCandidates).
+func messageDirCandidates(dataDir, projectID, sessionID string) []string {
+	return []string{
+		filepath.Join(dataDir, "storage", "message", sessionID),
+		filepath.Join(dataDir, "project", projectID, "storage", "message", sessionID),
+	}
+}
+
 // GetMessageDir returns the message storage directory for a session.
 func GetMessageDir(sessionID string) (string, error) {
 	dataDir, err := GetDataDir()
