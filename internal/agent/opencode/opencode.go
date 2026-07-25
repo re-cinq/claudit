@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -258,50 +259,150 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		return nil, nil
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
-	if err != nil {
-		return nil, nil
-	}
-
 	now := time.Now()
-	recentTimeout := agent.RecentSessionTimeout
-	var bestSessionID string
-	var bestModTime time.Time
+	timeout := agent.RecentSessionTimeout
 
-	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
-
-		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
-			bestModTime = modTime
-		}
+	sessionID, modTime, ok := newestSession(sessionDir, now, timeout)
+	if !ok {
+		// OpenCode's on-disk session layout (project-scoped bucketing,
+		// flat "<id>.json" files vs. per-session directories) has changed
+		// across versions. Fall back to scanning every bucket under
+		// storage/session for the most recently touched session rather
+		// than assuming our computed project ID matches OpenCode's own.
+		sessionRoot := filepath.Dir(sessionDir)
+		sessionID, modTime, ok = newestSessionAcrossBuckets(sessionRoot, now, timeout)
 	}
 
-	if bestSessionID == "" {
+	if !ok {
 		return nil, nil
 	}
 
 	// The transcript path for OpenCode is the message directory
-	msgDir, _ := GetMessageDir(bestSessionID)
+	msgDir, _ := GetMessageDir(sessionID)
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
+		SessionID:      sessionID,
 		TranscriptPath: msgDir,
-		StartedAt:      bestModTime.Format(time.RFC3339),
+		StartedAt:      modTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// newestSession returns the id and modification time of the most recently
+// modified session within dir. OpenCode has stored sessions both as
+// "<id>.json" files and as "<id>/" directories depending on version, so
+// both layouts are considered.
+func newestSession(dir string, now time.Time, timeout time.Duration) (string, time.Time, bool) {
+	return newestSessionEntry(dir, now, timeout, true)
+}
+
+// newestSessionAcrossBuckets scans every project-scoped bucket under
+// sessionRoot, plus sessionRoot itself (in case OpenCode stores sessions
+// without project bucketing), for the most recently modified session.
+func newestSessionAcrossBuckets(sessionRoot string, now time.Time, timeout time.Duration) (string, time.Time, bool) {
+	entries, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		return "", time.Time{}, false
+	}
+
+	var bestID string
+	var bestMod time.Time
+	consider := func(id string, modTime time.Time, ok bool) {
+		if !ok {
+			return
+		}
+		if bestID == "" || modTime.After(bestMod) {
+			bestID, bestMod = id, modTime
+		}
+	}
+
+	// Sessions stored directly under storage/session/, with no
+	// project-scoped subdirectory.
+	consider(newestSessionEntry(sessionRoot, now, timeout, false))
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		consider(newestSession(filepath.Join(sessionRoot, entry.Name()), now, timeout))
+	}
+
+	if bestID == "" {
+		return "", time.Time{}, false
+	}
+	return bestID, bestMod, true
+}
+
+// newestSessionEntry scans dir for the most recently modified session,
+// within timeout of now. When includeDirs is true, subdirectories are
+// treated as sessions (id = directory name, modTime = newest file inside);
+// this must be false when dir's subdirectories are actually project
+// buckets rather than sessions themselves.
+func newestSessionEntry(dir string, now time.Time, timeout time.Duration, includeDirs bool) (string, time.Time, bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", time.Time{}, false
+	}
+
+	var bestID string
+	var bestMod time.Time
+
+	for _, entry := range entries {
+		var id string
+		var modTime time.Time
+
+		switch {
+		case entry.IsDir():
+			if !includeDirs {
+				continue
+			}
+			id = entry.Name()
+			modTime = newestModTimeIn(filepath.Join(dir, entry.Name()))
+		case strings.HasSuffix(entry.Name(), ".json"):
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			id = strings.TrimSuffix(entry.Name(), ".json")
+			modTime = info.ModTime()
+		default:
+			continue
+		}
+
+		if modTime.IsZero() || now.Sub(modTime) > timeout {
+			continue
+		}
+
+		if bestID == "" || modTime.After(bestMod) {
+			bestID, bestMod = id, modTime
+		}
+	}
+
+	if bestID == "" {
+		return "", time.Time{}, false
+	}
+	return bestID, bestMod, true
+}
+
+// newestModTimeIn returns the most recent modification time of any entry
+// directly inside dir, or the zero value if dir is empty or unreadable.
+func newestModTimeIn(dir string) time.Time {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return time.Time{}
+	}
+
+	var latest time.Time
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(latest) {
+			latest = info.ModTime()
+		}
+	}
+	return latest
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +598,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
