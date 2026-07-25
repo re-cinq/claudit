@@ -1,9 +1,11 @@
+```go
 package opencode
 
 import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -230,7 +232,12 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It tries, in order: legacy flat file storage sharded by project ID
+// (pre-v1.2 OpenCode), a resilient scan of the data directory for session
+// files that record their originating project directory (current OpenCode
+// versions, which do not shard session storage by our locally-computed
+// project ID), and finally a legacy SQLite database (an intermediate
+// OpenCode storage format).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
@@ -241,12 +248,23 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
+	// Current OpenCode versions don't shard session storage by the project ID
+	// we compute locally, so scan the data directory for a session file that
+	// self-reports the project's directory instead of assuming a fixed path.
+	session, err = discoverFromScan(dataDir, projectPath)
+	if err != nil {
+		return nil, err
+	}
+	if session != nil {
+		return session, nil
+	}
+
+	// Fall back to SQLite (an intermediate OpenCode storage format)
 	projectID := GetProjectID(projectPath)
 	return discoverFromSQLite(dataDir, projectID, projectPath)
 }
@@ -302,6 +320,111 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// discoverFromScan performs a layout-agnostic scan of OpenCode's data
+// directory for the most recently modified session file that records the
+// given project directory, and collects any files that reference that
+// session as inline transcript data. It does not assume a specific
+// directory shape (project-sharded, flat, or nested-by-session), only that
+// session files embed a "directory"/"worktree"/"cwd" field and that message
+// files embed a "sessionID"/"session_id" field, which is the common
+// convention across coding agent CLIs.
+func discoverFromScan(dataDir, projectPath string) (*agent.SessionInfo, error) {
+	root := filepath.Join(dataDir, "storage")
+	if _, err := os.Stat(root); err != nil {
+		root = dataDir
+	}
+	if _, err := os.Stat(root); err != nil {
+		return nil, nil
+	}
+
+	cleanProject := filepath.Clean(projectPath)
+	now := time.Now()
+	timeout := agent.RecentSessionTimeout
+
+	var bestSessionID string
+	var bestModTime time.Time
+	messagesByID := map[string][]json.RawMessage{}
+
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if !strings.HasSuffix(name, ".json") && !strings.HasSuffix(name, ".jsonl") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil || now.Sub(info.ModTime()) > timeout {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		var probe map[string]json.RawMessage
+		if err := json.Unmarshal(data, &probe); err != nil {
+			return nil
+		}
+
+		if dirField := firstStringField(probe, "directory", "worktree", "cwd"); dirField != "" {
+			if filepath.Clean(dirField) != cleanProject {
+				return nil
+			}
+			id := firstStringField(probe, "id", "sessionID", "session_id")
+			if id == "" {
+				id = strings.TrimSuffix(name, filepath.Ext(name))
+			}
+			if bestSessionID == "" || info.ModTime().After(bestModTime) {
+				bestSessionID = id
+				bestModTime = info.ModTime()
+			}
+			return nil
+		}
+
+		if sid := firstStringField(probe, "sessionID", "session_id"); sid != "" {
+			messagesByID[sid] = append(messagesByID[sid], json.RawMessage(append([]byte{}, data...)))
+		}
+
+		return nil
+	})
+
+	if bestSessionID == "" {
+		return nil, nil
+	}
+
+	var transcriptData []byte
+	if msgs := messagesByID[bestSessionID]; len(msgs) > 0 {
+		transcriptData, _ = json.Marshal(msgs)
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: "",
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+		TranscriptData: transcriptData,
+	}, nil
+}
+
+// firstStringField returns the first non-empty string value found in raw
+// for the given keys, in order.
+func firstStringField(raw map[string]json.RawMessage, keys ...string) string {
+	for _, key := range keys {
+		v, ok := raw[key]
+		if !ok {
+			continue
+		}
+		var s string
+		if err := json.Unmarshal(v, &s); err == nil && s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +620,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
