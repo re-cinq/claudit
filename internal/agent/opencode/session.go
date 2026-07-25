@@ -73,6 +73,46 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// candidateMessageDirs returns the possible on-disk locations for a
+// session's message storage. Newer OpenCode releases nest message storage
+// under "storage/session/message", while older releases used a top-level
+// "storage/message" bucket; we check both to stay compatible across
+// versions.
+func candidateMessageDirs(dataDir, sessionID string) []string {
+	return []string{
+		filepath.Join(dataDir, "storage", "message", sessionID),
+		filepath.Join(dataDir, "storage", "session", "message", sessionID),
+	}
+}
+
+// ResolveMessageDir returns whichever known message directory layout
+// actually exists on disk for the given session, falling back to the
+// legacy path if neither is present yet.
+func ResolveMessageDir(dataDir, sessionID string) string {
+	candidates := candidateMessageDirs(dataDir, sessionID)
+	for _, dir := range candidates {
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			return dir
+		}
+	}
+	return candidates[0]
+}
+
+// candidateSessionDirs returns the possible on-disk locations for a
+// project's session storage, in order of preference: the legacy
+// project-keyed directory, a project-keyed "info" bucket, and flat/"info"
+// layouts that don't nest sessions by project at all. OpenCode's storage
+// scheme has changed across versions, so we probe each in turn rather than
+// assuming a single fixed layout.
+func candidateSessionDirs(dataDir, projectID string) []string {
+	return []string{
+		filepath.Join(dataDir, "storage", "session", projectID),
+		filepath.Join(dataDir, "storage", "session", projectID, "info"),
+		filepath.Join(dataDir, "storage", "session", "info"),
+		filepath.Join(dataDir, "storage", "session"),
+	}
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
