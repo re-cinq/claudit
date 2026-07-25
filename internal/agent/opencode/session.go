@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +129,144 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// discoveredSession is a session found while scanning OpenCode's on-disk
+// storage for a recently active session.
+type discoveredSession struct {
+	sessionID string
+	modTime   time.Time
+}
+
+// findRecentSessionInDir returns the most recently modified *.json session
+// file directly inside dir (non-recursive), within RecentSessionTimeout.
+func findRecentSessionInDir(dir string) *discoveredSession {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+
+	now := time.Now()
+	var best *discoveredSession
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			continue
+		}
+
+		if best == nil || modTime.After(best.modTime) {
+			best = &discoveredSession{
+				sessionID: strings.TrimSuffix(entry.Name(), ".json"),
+				modTime:   modTime,
+			}
+		}
+	}
+
+	return best
+}
+
+// sessionFileMeta captures the fields OpenCode has used, across releases, to
+// record which working directory a session belongs to. Newer releases have
+// changed how sessions are keyed on disk (dropping or renaming the
+// project-ID subdirectory), so matching on these fields lets discovery keep
+// working even when the on-disk layout shifts between versions.
+type sessionFileMeta struct {
+	ID        string `json:"id"`
+	Directory string `json:"directory"`
+	Path      string `json:"path"`
+	Cwd       string `json:"cwd"`
+	Worktree  string `json:"worktree"`
+}
+
+func (m sessionFileMeta) matchesProject(projectPath string) bool {
+	for _, candidate := range []string{m.Directory, m.Path, m.Cwd, m.Worktree} {
+		if candidate != "" && agent.PathsEqual(candidate, projectPath) {
+			return true
+		}
+	}
+	return false
+}
+
+// findRecentSessionByDirectory walks an OpenCode session storage tree —
+// which may nest sessions under a project-ID subdirectory, store them flat,
+// or store them as <sessionID>/info.json depending on the OpenCode version —
+// and returns the most recently modified session whose recorded working
+// directory matches projectPath. This is used as a fallback when the
+// project-ID-keyed directory OpenCode is currently expected to use doesn't
+// yield a session, so discovery survives on-disk layout changes across
+// OpenCode releases.
+func findRecentSessionByDirectory(root, projectPath string) *discoveredSession {
+	now := time.Now()
+	var best *discoveredSession
+
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		// Message payloads live under directories named "message"; those
+		// aren't session metadata, skip them.
+		if strings.Contains(filepath.ToSlash(path), "/message/") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		var meta sessionFileMeta
+		if err := json.Unmarshal(data, &meta); err != nil || !meta.matchesProject(projectPath) {
+			return nil
+		}
+
+		sessionID := meta.ID
+		if sessionID == "" {
+			sessionID = strings.TrimSuffix(d.Name(), ".json")
+		}
+
+		if best == nil || modTime.After(best.modTime) {
+			best = &discoveredSession{sessionID: sessionID, modTime: modTime}
+		}
+		return nil
+	})
+
+	return best
+}
+
+// resolveMessagePath finds where a session's messages are stored on disk.
+// It tries the historical flat "storage/message/<sessionID>" layout first,
+// then falls back to "storage/session/<sessionID>/message" used by newer
+// OpenCode releases that nest messages alongside their session metadata.
+func resolveMessagePath(dataDir, sessionID string) string {
+	flat := filepath.Join(dataDir, "storage", "message", sessionID)
+	nested := filepath.Join(dataDir, "storage", "session", sessionID, "message")
+
+	for _, candidate := range []string{flat, nested} {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+
+	return flat
 }
