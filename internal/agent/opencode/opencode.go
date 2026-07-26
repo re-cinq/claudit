@@ -353,30 +353,46 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
 
-	// Get messages for this session as a JSON array
+	// Get messages for this session as a JSON array.
+	// Message rows can lag slightly behind the session row for very short,
+	// single-turn sessions (the OpenCode CLI process may exit before its
+	// final message writes are flushed to the database), so retry briefly
+	// before giving up on an otherwise-valid session.
 	msgQuery := fmt.Sprintf(
 		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, msgQuery)
-	msgOutput, err := cmd.Output()
-	if err != nil {
-		return nil, nil
+
+	const maxMessageAttempts = 5
+	const messageRetryDelay = 400 * time.Millisecond
+
+	for attempt := 0; attempt < maxMessageAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(messageRetryDelay)
+		}
+
+		cmd = exec.Command("sqlite3", dbPath, msgQuery)
+		msgOutput, err := cmd.Output()
+		if err != nil {
+			return nil, nil
+		}
+
+		transcriptData := []byte(strings.TrimSpace(string(msgOutput)))
+		// sqlite3 returns "[null]" when no rows match
+		if string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
+			continue
+		}
+
+		return &agent.SessionInfo{
+			SessionID:      sessionID,
+			TranscriptPath: "", // no file path for SQLite
+			StartedAt:      time.Now().Format(time.RFC3339),
+			ProjectPath:    projectPath,
+			TranscriptData: transcriptData,
+		}, nil
 	}
 
-	transcriptData := []byte(strings.TrimSpace(string(msgOutput)))
-	// sqlite3 returns "[null]" when no rows match
-	if string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
-		return nil, nil
-	}
-
-	return &agent.SessionInfo{
-		SessionID:      sessionID,
-		TranscriptPath: "", // no file path for SQLite
-		StartedAt:      time.Now().Format(time.RFC3339),
-		ProjectPath:    projectPath,
-		TranscriptData: transcriptData,
-	}, nil
+	return nil, nil
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -497,4 +513,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
