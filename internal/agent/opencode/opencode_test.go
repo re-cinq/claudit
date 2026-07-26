@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -283,64 +284,83 @@ func TestHasPlugin(t *testing.T) {
 	}
 }
 
+// TestGetProjectID verifies OpenCode's project ID caching behavior: a stable
+// identifier is read from (or created in) <repo>/.git/opencode, matching how
+// OpenCode itself persists a per-project marker rather than deriving an ID
+// from git commit history.
 func TestGetProjectID(t *testing.T) {
-	tmpDir := t.TempDir()
+	t.Run("non-git directory returns global", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		if id := GetProjectID(tmpDir); id != "global" {
+			t.Errorf("GetProjectID for non-git dir = %q, want 'global'", id)
+		}
+	})
 
-	// Init git repo
-	gitInit := exec.Command("git", "init")
-	gitInit.Dir = tmpDir
-	if out, err := gitInit.CombinedOutput(); err != nil {
-		t.Fatalf("git init failed: %v\n%s", err, out)
-	}
+	t.Run("git repo gets a stable cached ID", func(t *testing.T) {
+		tmpDir := t.TempDir()
 
-	gitConfig := exec.Command("git", "config", "user.email", "test@test.com")
-	gitConfig.Dir = tmpDir
-	gitConfig.CombinedOutput()
+		gitInit := exec.Command("git", "init")
+		gitInit.Dir = tmpDir
+		if out, err := gitInit.CombinedOutput(); err != nil {
+			t.Fatalf("git init failed: %v\n%s", err, out)
+		}
 
-	gitConfig2 := exec.Command("git", "config", "user.name", "Test")
-	gitConfig2.Dir = tmpDir
-	gitConfig2.CombinedOutput()
+		id := GetProjectID(tmpDir)
+		if id == "" || id == "global" {
+			t.Errorf("GetProjectID for git dir = %q, want a cached project ID", id)
+		}
 
-	// Before any commits, should return "global"
-	if id := GetProjectID(tmpDir); id != "global" {
-		t.Errorf("GetProjectID before any commit = %q, want 'global'", id)
-	}
+		// The ID is cached in .git/opencode for OpenCode itself to reuse.
+		markerPath := filepath.Join(tmpDir, ".git", "opencode")
+		data, err := os.ReadFile(markerPath)
+		if err != nil {
+			t.Fatalf("expected marker file %s to be created: %v", markerPath, err)
+		}
+		if strings.TrimSpace(string(data)) != id {
+			t.Errorf("marker file content = %q, want %q", data, id)
+		}
 
-	// Create initial commit
-	os.WriteFile(filepath.Join(tmpDir, "test.txt"), []byte("hello"), 0644)
-	gitAdd := exec.Command("git", "add", ".")
-	gitAdd.Dir = tmpDir
-	gitAdd.CombinedOutput()
+		// Calling again returns the same ID rather than regenerating it.
+		if got := GetProjectID(tmpDir); got != id {
+			t.Errorf("GetProjectID second call = %q, want stable %q", got, id)
+		}
 
-	gitCommit := exec.Command("git", "commit", "-m", "Initial")
-	gitCommit.Dir = tmpDir
-	gitCommit.CombinedOutput()
+		// Committing shouldn't change the cached project ID.
+		gitConfig := exec.Command("git", "config", "user.email", "test@test.com")
+		gitConfig.Dir = tmpDir
+		gitConfig.CombinedOutput()
+		gitConfig2 := exec.Command("git", "config", "user.name", "Test")
+		gitConfig2.Dir = tmpDir
+		gitConfig2.CombinedOutput()
 
-	// After commit, should return root commit hash
-	gitRevList := exec.Command("git", "rev-list", "--max-parents=0", "--all")
-	gitRevList.Dir = tmpDir
-	rootOutput, _ := gitRevList.Output()
-	expectedRoot := strings.TrimSpace(string(rootOutput))
+		os.WriteFile(filepath.Join(tmpDir, "test.txt"), []byte("hello"), 0644)
+		gitAdd := exec.Command("git", "add", ".")
+		gitAdd.Dir = tmpDir
+		gitAdd.CombinedOutput()
+		gitCommit := exec.Command("git", "commit", "-m", "Initial")
+		gitCommit.Dir = tmpDir
+		gitCommit.CombinedOutput()
 
-	got := GetProjectID(tmpDir)
-	if got != expectedRoot {
-		t.Errorf("GetProjectID = %q, want root commit %q", got, expectedRoot)
-	}
+		if got := GetProjectID(tmpDir); got != id {
+			t.Errorf("GetProjectID after commit = %q, want stable %q", got, id)
+		}
+	})
 
-	// Add more commits — project ID should still be the root commit
-	os.WriteFile(filepath.Join(tmpDir, "test2.txt"), []byte("world"), 0644)
-	gitAdd2 := exec.Command("git", "add", ".")
-	gitAdd2.Dir = tmpDir
-	gitAdd2.CombinedOutput()
+	t.Run("respects a pre-existing marker file", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		gitInit := exec.Command("git", "init")
+		gitInit.Dir = tmpDir
+		gitInit.CombinedOutput()
 
-	gitCommit2 := exec.Command("git", "commit", "-m", "Second")
-	gitCommit2.Dir = tmpDir
-	gitCommit2.CombinedOutput()
+		markerPath := filepath.Join(tmpDir, ".git", "opencode")
+		if err := os.WriteFile(markerPath, []byte("preset-id-123"), 0644); err != nil {
+			t.Fatalf("failed to write marker: %v", err)
+		}
 
-	got2 := GetProjectID(tmpDir)
-	if got2 != expectedRoot {
-		t.Errorf("GetProjectID after 2nd commit = %q, want root commit %q", got2, expectedRoot)
-	}
+		if got := GetProjectID(tmpDir); got != "preset-id-123" {
+			t.Errorf("GetProjectID = %q, want %q", got, "preset-id-123")
+		}
+	})
 }
 
 func TestGetDataDir(t *testing.T) {
@@ -448,3 +468,4 @@ func TestNormalizeOpenCodeRole(t *testing.T) {
 		}
 	}
 }
+```

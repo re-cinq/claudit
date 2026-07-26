@@ -1,11 +1,12 @@
+```go
 package testutil
 
 import (
-	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -254,27 +255,36 @@ func opencodeDataDir(homeDir string) string {
 
 // opencodeSessionDir computes the OpenCode session directory path.
 // OpenCode: <dataDir>/storage/session/<project-id>
-// where project-id is the root commit hash (or "global" for non-git dirs).
+// where project-id is a cached marker from <projectPath>/.git/opencode
+// (or "global" for non-git dirs).
 func opencodeSessionDir(homeDir, projectPath string) string {
 	projectID := getOpenCodeProjectID(projectPath)
 	return filepath.Join(opencodeDataDir(homeDir), "storage", "session", projectID)
 }
 
-// getOpenCodeProjectID returns the git root commit hash for the project.
+// getOpenCodeProjectID returns OpenCode's cached per-project identifier,
+// reading it from <projectPath>/.git/opencode or creating one if absent.
 // This must match the production GetProjectID in internal/agent/opencode/session.go.
 func getOpenCodeProjectID(projectPath string) string {
-	cmd := exec.Command("git", "rev-list", "--max-parents=0", "--all")
-	cmd.Dir = projectPath
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	if err := cmd.Run(); err != nil {
+	gitDir := filepath.Join(projectPath, ".git")
+	if info, err := os.Stat(gitDir); err != nil || !info.IsDir() {
 		return "global"
 	}
-	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
-	if len(lines) > 0 && lines[0] != "" {
-		return strings.TrimSpace(lines[0])
+
+	idPath := filepath.Join(gitDir, "opencode")
+	if data, err := os.ReadFile(idPath); err == nil {
+		if id := strings.TrimSpace(string(data)); id != "" {
+			return id
+		}
 	}
-	return "global"
+
+	buf := make([]byte, 20)
+	if _, err := rand.Read(buf); err != nil {
+		return "global"
+	}
+	id := hex.EncodeToString(buf)
+	_ = os.WriteFile(idPath, []byte(id), 0600)
+	return id
 }
 
 // claudePrepareTranscript writes a Claude JSONL transcript file.
@@ -288,3 +298,4 @@ func geminiPrepareTranscript(baseDir, sessionID, transcript string) (string, err
 	path := filepath.Join(baseDir, "transcript.json")
 	return path, os.WriteFile(path, []byte(transcript), 0644)
 }
+```

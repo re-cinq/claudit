@@ -1,14 +1,20 @@
+```go
 package opencode
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 )
+
+// opencodeProjectIDFile is the name of the marker file OpenCode caches
+// inside a repository's .git directory to identify the project.
+const opencodeProjectIDFile = "opencode"
 
 // GetDataDir returns the OpenCode data directory.
 // OpenCode follows XDG conventions: it uses $XDG_DATA_HOME/opencode on Linux
@@ -35,21 +41,40 @@ func GetDataDir() (string, error) {
 }
 
 // GetProjectID returns the project identifier for OpenCode.
-// For git repos, this is the root commit hash. For non-git dirs, it's "global".
+// OpenCode caches a stable per-project ID in <repo>/.git/opencode the first
+// time it runs against a git repository, rather than deriving it from commit
+// history. We mirror that: read the cached marker if present, otherwise
+// generate and persist a new one so future lookups (by us or by OpenCode
+// itself) stay consistent. For non-git dirs, it's "global".
 func GetProjectID(projectPath string) string {
-	cmd := exec.Command("git", "rev-list", "--max-parents=0", "--all")
-	cmd.Dir = projectPath
-	output, err := cmd.Output()
-	if err != nil {
+	gitDir := filepath.Join(projectPath, ".git")
+	if info, err := os.Stat(gitDir); err != nil || !info.IsDir() {
 		return "global"
 	}
 
-	// Take the first line (first root commit)
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	if len(lines) > 0 && lines[0] != "" {
-		return strings.TrimSpace(lines[0])
+	idPath := filepath.Join(gitDir, opencodeProjectIDFile)
+	if data, err := os.ReadFile(idPath); err == nil {
+		if id := strings.TrimSpace(string(data)); id != "" {
+			return id
+		}
 	}
-	return "global"
+
+	id, err := generateProjectID()
+	if err != nil {
+		return "global"
+	}
+	_ = os.WriteFile(idPath, []byte(id), 0600)
+	return id
+}
+
+// generateProjectID creates a random 40-character hex identifier, matching
+// the format OpenCode itself writes to .git/opencode.
+func generateProjectID() (string, error) {
+	buf := make([]byte, 20)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
 }
 
 // GetSessionDir returns the session storage directory for a project.
@@ -127,3 +152,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
