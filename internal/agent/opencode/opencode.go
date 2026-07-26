@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -251,15 +252,23 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 	return discoverFromSQLite(dataDir, projectID, projectPath)
 }
 
-// discoverFromFlatFiles tries the legacy flat file session discovery.
+// discoverFromFlatFiles scans OpenCode's flat file session storage for the most
+// recent session belonging to projectPath.
+//
+// Sessions are not assumed to live under a directory keyed by our own computed
+// project ID — that scheme is fragile across OpenCode versions and doesn't
+// reliably match the CLI's own layout. Instead, like the Codex and Copilot
+// integrations, we walk the whole session storage tree and confirm ownership
+// by comparing each session's own recorded "directory" field against
+// projectPath via agent.PathsEqual.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
-	if err != nil {
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	if _, err := os.Stat(sessionRoot); err != nil {
 		return nil, nil
 	}
 
@@ -268,26 +277,41 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	var bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
+	_ = filepath.Walk(sessionRoot, func(p string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return nil
 		}
-
-		info, err := entry.Info()
-		if err != nil {
-			continue
+		if info.IsDir() || !strings.HasSuffix(info.Name(), ".json") {
+			return nil
 		}
 
 		modTime := info.ModTime()
 		if now.Sub(modTime) > recentTimeout {
-			continue
+			return nil
+		}
+
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+
+		var sess sessionInfo
+		if err := json.Unmarshal(data, &sess); err != nil || sess.ID == "" {
+			return nil
+		}
+
+		// Only match sessions we can confirm belong to this project. If the
+		// session doesn't record a directory, fall back to trusting recency.
+		if sess.Directory != "" && !agent.PathsEqual(sess.Directory, projectPath) {
+			return nil
 		}
 
 		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			bestSessionID = sess.ID
 			bestModTime = modTime
 		}
-	}
+		return nil
+	})
 
 	if bestSessionID == "" {
 		return nil, nil
@@ -497,4 +521,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
