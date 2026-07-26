@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -39,11 +40,24 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
       if (!pending) return;
       pendingCommits.delete(input.callID);
 
-      // Try to fetch messages via the SDK client API
+      // Try to fetch messages via the SDK client API. This calls back into
+      // the running OpenCode server, which may still be busy processing the
+      // current turn (the one that triggered this very hook) — bound it
+      // with a timeout so a slow or unresponsive client can never stall
+      // tool execution. On timeout or any error we fall back to the
+      // data_dir approach below instead of hanging indefinitely.
       let transcriptData = "";
       if (client && pending.sessionID) {
         try {
-          const msgs = await client.session.messages({ path: { id: pending.sessionID } });
+          const withTimeout = (promise, ms) => new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error("timed out")), ms);
+            promise.then((v) => { clearTimeout(timer); resolve(v); },
+                         (e) => { clearTimeout(timer); reject(e); });
+          });
+          const msgs = await withTimeout(
+            client.session.messages({ path: { id: pending.sessionID } }),
+            3000
+          );
           if (msgs && Array.isArray(msgs)) {
             transcriptData = JSON.stringify(msgs.map(m => ({
               role: m.role || "",
@@ -125,3 +139,4 @@ func HasPlugin(repoRoot string) bool {
 	_, err := os.Stat(pluginPath)
 	return err == nil
 }
+```
