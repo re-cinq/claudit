@@ -251,16 +251,24 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 	return discoverFromSQLite(dataDir, projectID, projectPath)
 }
 
-// discoverFromFlatFiles tries the legacy flat file session discovery.
+// discoverFromFlatFiles tries flat file session discovery.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionDir(projectPath)
 	if err != nil {
 		return nil, nil
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
+	// Current OpenCode versions store session metadata under an "info"
+	// subdirectory (storage/session/<projectID>/info/<sessionID>.json)
+	// instead of directly inside the project directory. Fall back to the
+	// older flat layout (storage/session/<projectID>/<sessionID>.json)
+	// for backward compatibility with older OpenCode versions.
+	dirEntries, err := os.ReadDir(filepath.Join(sessionDir, "info"))
 	if err != nil {
-		return nil, nil
+		dirEntries, err = os.ReadDir(sessionDir)
+		if err != nil {
+			return nil, nil
+		}
 	}
 
 	now := time.Now()
@@ -497,4 +505,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
