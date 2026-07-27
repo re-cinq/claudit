@@ -81,6 +81,32 @@ type sessionInfo struct {
 	Title     string `json:"title,omitempty"`
 }
 
+// sessionFileMatchesProject reports whether the OpenCode session file at path
+// records a working directory matching projectPath. It returns false if the
+// file can't be read/parsed or doesn't record a directory, in which case the
+// caller should fall back to recency-based selection instead of an exact
+// match — this keeps discovery working even when OpenCode's on-disk session
+// schema changes between versions.
+func sessionFileMatchesProject(path, projectPath string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+
+	var info sessionInfo
+	if err := json.Unmarshal(data, &info); err != nil || info.Directory == "" {
+		return false
+	}
+
+	want, err1 := filepath.Abs(projectPath)
+	got, err2 := filepath.Abs(info.Directory)
+	if err1 != nil || err2 != nil {
+		return info.Directory == projectPath
+	}
+
+	return filepath.Clean(want) == filepath.Clean(got)
+}
+
 // WriteSessionFile writes a session and its messages to OpenCode's storage.
 func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (string, error) {
 	sessionDir, err := GetSessionDir(projectPath)
