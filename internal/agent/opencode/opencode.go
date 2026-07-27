@@ -229,9 +229,56 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 	return &agent.Transcript{Entries: entries}, nil
 }
 
+// sessionMarker is the local, version-independent marker of the most recent
+// OpenCode session, written by the shiftlog plugin on every tool call (see
+// plugin.go). It lets DiscoverSession find the active session without having
+// to know how OpenCode itself stores sessions on disk, which has changed
+// across OpenCode releases (flat JSON files, then SQLite, ...).
+type sessionMarker struct {
+	SessionID      string `json:"session_id"`
+	UpdatedAt      string `json:"updated_at"`
+	TranscriptData string `json:"transcript_data,omitempty"`
+}
+
+// discoverFromMarker reads the plugin-written session marker, if present and
+// recent. Returns nil if no usable marker is found.
+func discoverFromMarker(projectPath string) *agent.SessionInfo {
+	markerPath := filepath.Join(projectPath, ".shiftlog", "opencode-session.json")
+	data, err := os.ReadFile(markerPath)
+	if err != nil {
+		return nil
+	}
+
+	var marker sessionMarker
+	if err := json.Unmarshal(data, &marker); err != nil || marker.SessionID == "" {
+		return nil
+	}
+
+	if updatedAt, err := time.Parse(time.RFC3339, marker.UpdatedAt); err == nil {
+		if time.Since(updatedAt) > agent.RecentSessionTimeout {
+			return nil
+		}
+	}
+
+	info := &agent.SessionInfo{
+		SessionID:   marker.SessionID,
+		StartedAt:   marker.UpdatedAt,
+		ProjectPath: projectPath,
+	}
+	if marker.TranscriptData != "" {
+		info.TranscriptData = []byte(marker.TranscriptData)
+	}
+	return info
+}
+
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first checks the plugin-written session marker (version-independent),
+// then falls back to flat file storage (pre-v1.2), then SQLite (v1.2+).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	if marker := discoverFromMarker(projectPath); marker != nil {
+		return marker, nil
+	}
+
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
@@ -454,7 +501,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +543,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
