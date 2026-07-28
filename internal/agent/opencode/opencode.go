@@ -1,17 +1,25 @@
 package opencode
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/re-cinq/shift-log/internal/agent"
 )
+
+// sqliteQueryTimeout bounds every sqlite3 invocation used for session
+// discovery. Without it, a query against a database still held open by a
+// live OpenCode process can block indefinitely, which in turn hangs the
+// git commit (and the agent tool call) that triggered discovery.
+const sqliteQueryTimeout = 5 * time.Second
 
 func init() {
 	agent.Register(&Agent{})
@@ -316,25 +324,17 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
-	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+	sessionID := findRecentSessionID(dbPath, projectID, projectPath)
+	if sessionID == "" {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
 		`SELECT time_updated FROM session WHERE id='%s';`,
-		sessionID,
+		sqliteEscape(sessionID),
 	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
-	timeOutput, err := cmd.Output()
+	timeOutput, err := runSQLite(dbPath, timeQuery)
 	if err == nil {
 		timeStr := strings.TrimSpace(string(timeOutput))
 		if t, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
@@ -349,6 +349,12 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 			if time.Since(t) > agent.RecentSessionTimeout {
 				return nil, nil
 			}
+		} else if ms, err := strconv.ParseInt(timeStr, 10, 64); err == nil {
+			// Newer OpenCode releases store time_updated as a Unix
+			// millisecond timestamp rather than a formatted string.
+			if time.Since(time.UnixMilli(ms)) > agent.RecentSessionTimeout {
+				return nil, nil
+			}
 		}
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
@@ -356,17 +362,16 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	// Get messages for this session as a JSON array
 	msgQuery := fmt.Sprintf(
 		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
+		sqliteEscape(sessionID),
 	)
-	cmd = exec.Command("sqlite3", dbPath, msgQuery)
-	msgOutput, err := cmd.Output()
+	msgOutput, err := runSQLite(dbPath, msgQuery)
 	if err != nil {
 		return nil, nil
 	}
 
 	transcriptData := []byte(strings.TrimSpace(string(msgOutput)))
 	// sqlite3 returns "[null]" when no rows match
-	if string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
+	if string(transcriptData) == "[null]" || string(transcriptData) == "[]" || len(transcriptData) == 0 {
 		return nil, nil
 	}
 
@@ -377,6 +382,57 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// findRecentSessionID returns the most recent session ID for a project.
+// It matches by project_id first, then falls back to matching by the
+// session's working directory. OpenCode has changed how it derives the
+// project identifier across releases; the "directory" a session was
+// started in is a far more stable field to match against, so the fallback
+// keeps discovery working even if the project-id scheme changes again.
+func findRecentSessionID(dbPath, projectID, projectPath string) string {
+	byProjectID := fmt.Sprintf(
+		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
+		sqliteEscape(projectID),
+	)
+	if out, err := runSQLite(dbPath, byProjectID); err == nil {
+		if id := strings.TrimSpace(string(out)); id != "" {
+			return id
+		}
+	}
+
+	absPath, err := filepath.Abs(projectPath)
+	if err != nil {
+		absPath = projectPath
+	}
+	byDirectory := fmt.Sprintf(
+		`SELECT id FROM session WHERE directory='%s' ORDER BY time_updated DESC LIMIT 1;`,
+		sqliteEscape(absPath),
+	)
+	if out, err := runSQLite(dbPath, byDirectory); err == nil {
+		if id := strings.TrimSpace(string(out)); id != "" {
+			return id
+		}
+	}
+
+	return ""
+}
+
+// runSQLite executes a query against the given SQLite database with a
+// bounded timeout, so a locked or busy database (e.g. one still held open
+// by a live OpenCode process) can never hang the calling shiftlog command.
+func runSQLite(dbPath, query string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), sqliteQueryTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sqlite3", dbPath, query)
+	return cmd.Output()
+}
+
+// sqliteEscape escapes single quotes for safe inclusion in a single-quoted
+// SQLite string literal.
+func sqliteEscape(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -497,4 +553,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
