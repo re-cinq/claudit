@@ -194,7 +194,50 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 
 	var entries []agent.TranscriptEntry
 	for _, de := range dirEntries {
-		if de.IsDir() || !strings.HasSuffix(de.Name(), ".json") {
+		if de.IsDir() {
+			// Newer OpenCode versions (v1.18+) can store each message as
+			// its own directory (e.g. split into "part" files) instead of
+			// a single flat <messageID>.json file. Recurse one level to
+			// pick up any JSON/JSONL files inside.
+			subEntries, err := os.ReadDir(filepath.Join(dir, de.Name()))
+			if err != nil {
+				continue
+			}
+			for _, sub := range subEntries {
+				if sub.IsDir() {
+					continue
+				}
+				subPath := filepath.Join(dir, de.Name(), sub.Name())
+				switch {
+				case strings.HasSuffix(sub.Name(), ".jsonl"):
+					f, err := os.Open(subPath)
+					if err != nil {
+						continue
+					}
+					transcript, err := a.ParseTranscript(f)
+					_ = f.Close()
+					if err == nil {
+						entries = append(entries, transcript.Entries...)
+					}
+				case strings.HasSuffix(sub.Name(), ".json"):
+					data, err := os.ReadFile(subPath)
+					if err != nil {
+						continue
+					}
+					var raw map[string]json.RawMessage
+					if err := json.Unmarshal(data, &raw); err != nil {
+						continue
+					}
+					entry := parseOpenCodeEntry(raw, data)
+					if entry.Type != "" {
+						entries = append(entries, entry)
+					}
+				}
+			}
+			continue
+		}
+
+		if !strings.HasSuffix(de.Name(), ".json") {
 			// Handle .jsonl files too
 			if strings.HasSuffix(de.Name(), ".jsonl") {
 				f, err := os.Open(filepath.Join(dir, de.Name()))
@@ -269,22 +312,41 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	var bestModTime time.Time
 
 	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		var sessionID string
+		var modTime time.Time
+
+		switch {
+		case entry.IsDir():
+			// Newer OpenCode versions (v1.18+) store each session as its own
+			// directory (e.g. <sessionID>/info.json) instead of a single flat
+			// <sessionID>.json file. Use info.json's mtime when present,
+			// otherwise fall back to the directory's own mtime.
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			modTime = info.ModTime()
+			if infoStat, err := os.Stat(filepath.Join(sessionDir, entry.Name(), "info.json")); err == nil {
+				modTime = infoStat.ModTime()
+			}
+			sessionID = entry.Name()
+		case strings.HasSuffix(entry.Name(), ".json"):
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			modTime = info.ModTime()
+			sessionID = strings.TrimSuffix(entry.Name(), ".json")
+		default:
 			continue
 		}
 
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
 		if now.Sub(modTime) > recentTimeout {
 			continue
 		}
 
 		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
 	}
@@ -497,4 +559,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
