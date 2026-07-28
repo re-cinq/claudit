@@ -1,13 +1,20 @@
+```go
 package opencode
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -127,3 +134,140 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+
+// findRecentSessionFile recursively searches dataDir/storage for the most
+// recently modified session record belonging to projectID, tolerating
+// directory-layout differences across OpenCode versions (e.g. sessions
+// nested under "session/info/" rather than directly under "session/<id>/").
+// It matches either by parent directory name or by a projectID/directory
+// field inside the JSON content. Returns "" if nothing recent is found.
+func findRecentSessionFile(dataDir, projectID, projectPath string) (string, time.Time) {
+	storageDir := filepath.Join(dataDir, "storage")
+	now := time.Now()
+	sep := string(filepath.Separator)
+
+	var bestID string
+	var bestMod time.Time
+
+	_ = filepath.WalkDir(storageDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+		if !strings.Contains(path, sep+"session"+sep) {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return nil
+		}
+
+		sessionID := strings.TrimSuffix(d.Name(), ".json")
+		matches := filepath.Base(filepath.Dir(path)) == projectID
+
+		if !matches {
+			data, rerr := os.ReadFile(path)
+			if rerr != nil {
+				return nil
+			}
+			var probe struct {
+				ID        string `json:"id"`
+				ProjectID string `json:"projectID"`
+				Project   string `json:"project_id"`
+				Directory string `json:"directory"`
+				Worktree  string `json:"worktree"`
+			}
+			if json.Unmarshal(data, &probe) != nil {
+				return nil
+			}
+			if probe.ProjectID != projectID && probe.Project != projectID &&
+				probe.Directory != projectPath && probe.Worktree != projectPath {
+				return nil
+			}
+			if probe.ID != "" {
+				sessionID = probe.ID
+			}
+		}
+
+		if bestID == "" || modTime.After(bestMod) {
+			bestID = sessionID
+			bestMod = modTime
+		}
+		return nil
+	})
+
+	return bestID, bestMod
+}
+
+// findSessionMessages recursively searches dataDir/storage for message
+// files belonging to sessionID, tolerating nesting differences across
+// OpenCode versions (e.g. messages nested under "session/message/<id>/"
+// rather than directly under "message/<id>/"). Matching files are combined
+// into a single JSON array. Returns nil if no message files are found.
+func findSessionMessages(dataDir, sessionID string) []byte {
+	if sessionID == "" {
+		return nil
+	}
+
+	storageDir := filepath.Join(dataDir, "storage")
+	sep := string(filepath.Separator)
+
+	var paths []string
+	_ = filepath.WalkDir(storageDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if !strings.HasSuffix(name, ".json") && !strings.HasSuffix(name, ".jsonl") {
+			return nil
+		}
+		if strings.Contains(path, sep+sessionID+sep) || strings.HasPrefix(name, sessionID) {
+			paths = append(paths, path)
+		}
+		return nil
+	})
+	sort.Strings(paths)
+
+	var messages []json.RawMessage
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		trimmed := bytes.TrimSpace(data)
+		if len(trimmed) == 0 {
+			continue
+		}
+		if trimmed[0] == '[' {
+			var arr []json.RawMessage
+			if json.Unmarshal(trimmed, &arr) == nil {
+				messages = append(messages, arr...)
+				continue
+			}
+		}
+		if strings.HasSuffix(p, ".jsonl") {
+			for _, line := range strings.Split(string(trimmed), "\n") {
+				line = strings.TrimSpace(line)
+				if line != "" {
+					messages = append(messages, json.RawMessage(line))
+				}
+			}
+			continue
+		}
+		messages = append(messages, json.RawMessage(trimmed))
+	}
+
+	if len(messages) == 0 {
+		return nil
+	}
+	out, err := json.Marshal(messages)
+	if err != nil {
+		return nil
+	}
+	return out
+}
+```
