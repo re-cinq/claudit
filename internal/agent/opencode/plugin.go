@@ -44,12 +44,13 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
       if (client && pending.sessionID) {
         try {
           const msgs = await client.session.messages({ path: { id: pending.sessionID } });
-          if (msgs && Array.isArray(msgs)) {
-            transcriptData = JSON.stringify(msgs.map(m => ({
-              role: m.role || "",
-              id: m.id || "",
-              content: m.content || "",
-              time: m.time || {},
+          const msgList = Array.isArray(msgs) ? msgs : Array.isArray(msgs?.data) ? msgs.data : null;
+          if (msgList) {
+            transcriptData = JSON.stringify(msgList.map(m => ({
+              role: m.role || m.info?.role || "",
+              id: m.id || m.info?.id || "",
+              content: m.content || m.parts || "",
+              time: m.time || m.info?.time || {},
             })));
           }
         } catch (e) {
@@ -75,7 +76,7 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
         execSync("shiftlog store --agent=opencode", {
           input: hookData,
           cwd: directory,
-          timeout: 30000,
+          timeout: 10000,
           stdio: ["pipe", "pipe", "pipe"],
         });
       } catch (e) {
