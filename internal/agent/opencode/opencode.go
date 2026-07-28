@@ -316,24 +316,21 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
-	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+	// Find most recent session for this project. The column used to order by
+	// recency has changed across OpenCode releases (e.g. "time_updated" is
+	// not present in every schema version), so try a couple of candidates
+	// instead of letting the whole lookup fail if one is missing.
+	sessionID := querySessionID(dbPath, projectID)
+	if sessionID == "" {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
 		`SELECT time_updated FROM session WHERE id='%s';`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
+	cmd := exec.Command("sqlite3", dbPath, timeQuery)
 	timeOutput, err := cmd.Output()
 	if err == nil {
 		timeStr := strings.TrimSpace(string(timeOutput))
@@ -352,6 +349,8 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		}
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
+	// If the query itself failed (e.g. the column doesn't exist in this
+	// OpenCode version), proceed anyway rather than dropping the session.
 
 	// Get messages for this session as a JSON array
 	msgQuery := fmt.Sprintf(
@@ -377,6 +376,29 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// querySessionID finds the most recent session ID for a project, trying
+// several ORDER BY columns in turn. OpenCode's session table schema has
+// changed across releases (e.g. "time_updated" is not guaranteed to exist),
+// so a query that fails due to an unknown column falls back to ordering by
+// "rowid", which SQLite always provides and approximates insertion order.
+func querySessionID(dbPath, projectID string) string {
+	for _, orderCol := range []string{"time_updated", "rowid"} {
+		query := fmt.Sprintf(
+			`SELECT id FROM session WHERE project_id='%s' ORDER BY %s DESC LIMIT 1;`,
+			projectID, orderCol,
+		)
+		cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, query)
+		output, err := cmd.Output()
+		if err != nil {
+			continue
+		}
+		if id := strings.TrimSpace(string(output)); id != "" {
+			return id
+		}
+	}
+	return ""
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -497,4 +519,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
