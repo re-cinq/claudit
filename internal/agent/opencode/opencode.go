@@ -1,6 +1,8 @@
+```go
 package opencode
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +14,12 @@ import (
 
 	"github.com/re-cinq/shift-log/internal/agent"
 )
+
+// sqliteQueryTimeout bounds how long we wait on the sqlite3 CLI when
+// reverse-engineering OpenCode's session database. OpenCode may hold the
+// database open in a long-running background process, so queries must not
+// be allowed to block indefinitely.
+const sqliteQueryTimeout = 5 * time.Second
 
 func init() {
 	agent.Register(&Agent{})
@@ -305,6 +313,9 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
+// All sqlite3 subprocess calls are bounded by sqliteQueryTimeout: OpenCode may keep
+// the database open from a long-running background process, and an unbounded call
+// here would otherwise be able to hang session discovery indefinitely.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
@@ -321,7 +332,9 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
 		projectID,
 	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
+	sessionCtx, sessionCancel := context.WithTimeout(context.Background(), sqliteQueryTimeout)
+	defer sessionCancel()
+	cmd := exec.CommandContext(sessionCtx, "sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
 	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
 		return nil, nil
@@ -333,7 +346,9 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		`SELECT time_updated FROM session WHERE id='%s';`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
+	timeCtx, timeCancel := context.WithTimeout(context.Background(), sqliteQueryTimeout)
+	defer timeCancel()
+	cmd = exec.CommandContext(timeCtx, "sqlite3", dbPath, timeQuery)
 	timeOutput, err := cmd.Output()
 	if err == nil {
 		timeStr := strings.TrimSpace(string(timeOutput))
@@ -358,7 +373,9 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, msgQuery)
+	msgCtx, msgCancel := context.WithTimeout(context.Background(), sqliteQueryTimeout)
+	defer msgCancel()
+	cmd = exec.CommandContext(msgCtx, "sqlite3", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
 	if err != nil {
 		return nil, nil
@@ -454,7 +471,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +513,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
