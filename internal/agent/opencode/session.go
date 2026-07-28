@@ -73,6 +73,85 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// sessionDirCandidate is a directory that may contain OpenCode session JSON
+// files. When projectScoped is true, the directory path itself already
+// narrows results to the current project (e.g. it includes the project ID
+// as a path segment), so any JSON file found there can be trusted as
+// belonging to this project. When false, the directory may contain sessions
+// for multiple projects (e.g. a flat, non-nested layout), so callers must
+// inspect file content to confirm the project before accepting a match.
+type sessionDirCandidate struct {
+	path          string
+	projectScoped bool
+}
+
+// candidateSessionDirs returns directories that may contain OpenCode session
+// JSON files for a given project. OpenCode has changed its on-disk storage
+// layout across releases (e.g. "storage/session/<id>" vs a newer
+// "storage/session/info/<id>" layout, with or without a top-level
+// "project/<id>" nesting), so we probe several known shapes rather than
+// assuming a single fixed layout.
+func candidateSessionDirs(dataDir, projectID string) []sessionDirCandidate {
+	return []sessionDirCandidate{
+		{filepath.Join(dataDir, "storage", "session", projectID), true},
+		{filepath.Join(dataDir, "storage", "session", "info", projectID), true},
+		{filepath.Join(dataDir, "project", projectID, "storage", "session"), true},
+		{filepath.Join(dataDir, "project", projectID, "storage", "session", "info"), true},
+		// Flat layouts with no per-project directory nesting: sessions for
+		// all projects live side by side, keyed by a "projectID"/"directory"
+		// field inside each session file instead.
+		{filepath.Join(dataDir, "storage", "session", "info"), false},
+		{filepath.Join(dataDir, "storage", "session"), false},
+	}
+}
+
+// candidateMessageDirs returns directories that may contain OpenCode message
+// JSON files for a session, mirroring the storage layout variations handled
+// by candidateSessionDirs.
+func candidateMessageDirs(dataDir, projectID, sessionID string) []string {
+	return []string{
+		filepath.Join(dataDir, "storage", "message", sessionID),
+		filepath.Join(dataDir, "storage", "session", "message", sessionID),
+		filepath.Join(dataDir, "project", projectID, "storage", "message", sessionID),
+		filepath.Join(dataDir, "project", projectID, "storage", "session", "message", sessionID),
+	}
+}
+
+// resolveMessageDir returns the first existing candidate message directory
+// for a session, falling back to the legacy default path if none exist yet
+// (e.g. the message directory hasn't been created at discovery time).
+func resolveMessageDir(dataDir, projectID, sessionID string) string {
+	for _, dir := range candidateMessageDirs(dataDir, projectID, sessionID) {
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			return dir
+		}
+	}
+	return filepath.Join(dataDir, "storage", "message", sessionID)
+}
+
+// sessionMatchesProject reports whether session JSON data belongs to the
+// given project, checking field names used across OpenCode versions.
+func sessionMatchesProject(data []byte, projectID, projectPath string) bool {
+	var probe struct {
+		ProjectID string `json:"projectID"`
+		Directory string `json:"directory"`
+		Path      string `json:"path"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return false
+	}
+	if probe.ProjectID != "" && probe.ProjectID == projectID {
+		return true
+	}
+	if probe.Directory != "" && probe.Directory == projectPath {
+		return true
+	}
+	if probe.Path != "" && probe.Path == projectPath {
+		return true
+	}
+	return false
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
