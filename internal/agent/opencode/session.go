@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -8,6 +9,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -81,6 +85,67 @@ type sessionInfo struct {
 	Title     string `json:"title,omitempty"`
 }
 
+// sessionCacheFileName is the shiftlog-managed cache file, written under the
+// repo's .shiftlog directory, that tracks the most recently active OpenCode
+// session's transcript.
+//
+// OpenCode's own on-disk storage (flat JSON files vs. SQLite, directory
+// layout, table/column names) is an internal implementation detail that has
+// changed across releases and is not a stable integration point. Instead,
+// the shiftlog plugin (see plugin.go) proactively caches the transcript via
+// OpenCode's SDK client (client.session.messages) on every tool call, while
+// the agent process is still running and the client is reachable. Manual /
+// post-commit session discovery reads this cache first, and only falls back
+// to scanning OpenCode's on-disk storage when no cache is present (e.g. the
+// very first run before the plugin has written one).
+const sessionCacheFileName = "opencode-session.json"
+
+// sessionCache is the JSON structure written by the shiftlog plugin to
+// <repoRoot>/.shiftlog/opencode-session.json.
+type sessionCache struct {
+	SessionID      string `json:"session_id"`
+	TranscriptData string `json:"transcript_data"`
+	UpdatedAt      string `json:"updated_at"`
+	ProjectDir     string `json:"project_dir"`
+}
+
+// readSessionCache reads the shiftlog-managed session cache for a project.
+// It returns nil if no cache file exists, it's malformed, or it has gone stale.
+func readSessionCache(projectPath string) *sessionCache {
+	cachePath := filepath.Join(projectPath, ".shiftlog", sessionCacheFileName)
+
+	data, err := os.ReadFile(cachePath)
+	if err != nil {
+		return nil
+	}
+
+	var cache sessionCache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		return nil
+	}
+
+	if cache.SessionID == "" || cache.TranscriptData == "" {
+		return nil
+	}
+
+	updatedAt, err := time.Parse(time.RFC3339, cache.UpdatedAt)
+	if err != nil {
+		// Fall back to the file's own modification time if the timestamp
+		// field is missing or malformed.
+		info, statErr := os.Stat(cachePath)
+		if statErr != nil {
+			return nil
+		}
+		updatedAt = info.ModTime()
+	}
+
+	if time.Since(updatedAt) > agent.RecentSessionTimeout {
+		return nil
+	}
+
+	return &cache
+}
+
 // WriteSessionFile writes a session and its messages to OpenCode's storage.
 func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (string, error) {
 	sessionDir, err := GetSessionDir(projectPath)
@@ -127,3 +192,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
