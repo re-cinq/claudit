@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -64,13 +65,44 @@ func GetSessionDir(projectPath string) (string, error) {
 }
 
 // GetMessageDir returns the message storage directory for a session.
+// OpenCode has used more than one layout for message storage across
+// releases (a top-level "storage/message/<id>" directory, and later a
+// "storage/session/message/<id>" layout nested under session, optionally
+// namespaced per project). If a directory from a newer layout already
+// exists on disk, prefer it; otherwise fall back to the original layout,
+// which is also what RestoreSession writes to.
 func GetMessageDir(sessionID string) (string, error) {
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return "", err
 	}
 
-	return filepath.Join(dataDir, "storage", "message", sessionID), nil
+	legacy := filepath.Join(dataDir, "storage", "message", sessionID)
+
+	candidates := []string{
+		filepath.Join(dataDir, "storage", "session", "message", sessionID),
+	}
+
+	projectRoot := filepath.Join(dataDir, "project")
+	if entries, err := os.ReadDir(projectRoot); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			candidates = append(candidates,
+				filepath.Join(projectRoot, e.Name(), "storage", "session", "message", sessionID),
+				filepath.Join(projectRoot, e.Name(), "storage", "message", sessionID),
+			)
+		}
+	}
+
+	for _, candidate := range candidates {
+		if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+			return candidate, nil
+		}
+	}
+
+	return legacy, nil
 }
 
 // sessionInfo represents an OpenCode session JSON file.
@@ -127,3 +159,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
