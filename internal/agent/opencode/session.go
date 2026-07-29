@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +129,75 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// FindSessionByScanning walks OpenCode's entire storage tree and returns the
+// most recently modified session belonging to projectPath, matched by the
+// session file's embedded "directory" or "projectID" field rather than by
+// reconstructing the expected storage path.
+//
+// OpenCode has changed how it names per-project session directories across
+// releases (e.g. the project-ID hashing scheme, or whether sessions are
+// nested under a project subdirectory at all). Relying on a fixed path
+// derived from GetProjectID breaks silently whenever that scheme changes.
+// Scanning and matching on the data actually recorded inside each session
+// file is resilient to that kind of internal reshuffling.
+func FindSessionByScanning(dataDir, projectPath string) (*agent.SessionInfo, error) {
+	storageRoot := filepath.Join(dataDir, "storage")
+	expectedProjectID := GetProjectID(projectPath)
+
+	now := time.Now()
+	var bestPath, bestID string
+	var bestModTime time.Time
+
+	_ = filepath.Walk(storageRoot, func(p string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info == nil || info.IsDir() || !strings.HasSuffix(info.Name(), ".json") {
+			return nil
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return nil
+		}
+
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+
+		var meta sessionInfo
+		if err := json.Unmarshal(data, &meta); err != nil || meta.ID == "" {
+			return nil
+		}
+
+		matches := false
+		if meta.Directory != "" && agent.PathsEqual(meta.Directory, projectPath) {
+			matches = true
+		} else if meta.ProjectID != "" && meta.ProjectID == expectedProjectID {
+			matches = true
+		}
+		if !matches {
+			return nil
+		}
+
+		if bestPath == "" || modTime.After(bestModTime) {
+			bestPath = p
+			bestID = meta.ID
+			bestModTime = modTime
+		}
+		return nil
+	})
+
+	if bestPath == "" {
+		return nil, nil
+	}
+
+	msgDir, _ := GetMessageDir(bestID)
+
+	return &agent.SessionInfo{
+		SessionID:      bestID,
+		TranscriptPath: msgDir,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
 }
