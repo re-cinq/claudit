@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -52,7 +53,9 @@ func GetProjectID(projectPath string) string {
 	return "global"
 }
 
-// GetSessionDir returns the session storage directory for a project.
+// GetSessionDir returns the legacy project-nested session storage directory:
+// storage/session/<projectID>/. Older OpenCode versions grouped session files
+// under a directory named after the project.
 func GetSessionDir(projectPath string) (string, error) {
 	dataDir, err := GetDataDir()
 	if err != nil {
@@ -64,6 +67,8 @@ func GetSessionDir(projectPath string) (string, error) {
 }
 
 // GetMessageDir returns the message storage directory for a session.
+// This is the legacy (pre-refactor) location, where messages live directly
+// under "storage/message/" rather than nested under "storage/session/".
 func GetMessageDir(sessionID string) (string, error) {
 	dataDir, err := GetDataDir()
 	if err != nil {
@@ -71,6 +76,32 @@ func GetMessageDir(sessionID string) (string, error) {
 	}
 
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
+}
+
+// GetSessionInfoDir returns the flat (non project-nested) session info
+// directory used by newer OpenCode versions: storage/session/info/<id>.json.
+// Unlike GetSessionDir, sessions here are not nested under a project ID
+// directory — each session file carries its own working directory field,
+// so callers must filter by content rather than by directory name.
+func GetSessionInfoDir() (string, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(dataDir, "storage", "session", "info"), nil
+}
+
+// GetSessionMessageDir returns the newer nested message directory used by
+// OpenCode versions that store messages under "storage/session/message/"
+// instead of the legacy top-level "storage/message/" location.
+func GetSessionMessageDir(sessionID string) (string, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(dataDir, "storage", "session", "message", sessionID), nil
 }
 
 // sessionInfo represents an OpenCode session JSON file.
@@ -127,3 +158,65 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+
+// sqliteColumns returns the set of column names for a table in the given
+// SQLite database, using PRAGMA table_info. Returns nil if the query fails
+// (e.g. sqlite3 unavailable, db unreadable, or table doesn't exist) so
+// callers can gracefully skip schema-dependent logic.
+func sqliteColumns(dbPath, table string) map[string]bool {
+	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, fmt.Sprintf("PRAGMA table_info(%s);", table))
+	output, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	trimmed := strings.TrimSpace(string(output))
+	if trimmed == "" {
+		return nil
+	}
+
+	cols := make(map[string]bool)
+	for _, line := range strings.Split(trimmed, "\n") {
+		fields := strings.Split(line, "\t")
+		if len(fields) >= 2 {
+			cols[fields[1]] = true
+		}
+	}
+	return cols
+}
+
+// querySQLiteValue runs a single-value SQLite query and returns the trimmed
+// output, or "" on any error.
+func querySQLiteValue(dbPath, query string) string {
+	cmd := exec.Command("sqlite3", dbPath, query)
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+
+// querySQLiteRows runs a SQLite query and returns each row split into
+// tab-separated fields, or nil on any error.
+func querySQLiteRows(dbPath, query string) [][]string {
+	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, query)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	trimmed := strings.TrimSpace(string(output))
+	if trimmed == "" {
+		return nil
+	}
+
+	var rows [][]string
+	for _, line := range strings.Split(trimmed, "\n") {
+		if line == "" {
+			continue
+		}
+		rows = append(rows, strings.Split(line, "\t"))
+	}
+	return rows
+}
+```
