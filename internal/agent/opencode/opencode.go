@@ -229,10 +229,41 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 	return &agent.Transcript{Entries: entries}, nil
 }
 
+// discoverSessionTimeout bounds how long DiscoverSession will retry before
+// giving up when no session is found yet.
+const discoverSessionTimeout = 3 * time.Second
+
+// discoverSessionRetryInterval is the delay between discovery attempts.
+const discoverSessionRetryInterval = 300 * time.Millisecond
+
 // DiscoverSession finds an active or recent OpenCode session.
 // It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// Newer OpenCode releases persist session/message data to disk asynchronously
+// rather than synchronously before the CLI process exits, so a session that
+// was just created may not be visible immediately; discovery is retried for
+// a short window to tolerate that lag.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
+	deadline := time.Now().Add(discoverSessionTimeout)
+
+	for {
+		session, err := a.discoverOnce(projectPath)
+		if err != nil {
+			return nil, err
+		}
+		if session != nil {
+			return session, nil
+		}
+
+		if time.Now().After(deadline) {
+			return nil, nil
+		}
+		time.Sleep(discoverSessionRetryInterval)
+	}
+}
+
+// discoverOnce performs a single discovery attempt: flat file storage first
+// (pre-v1.2 OpenCode), then SQLite (OpenCode v1.2+).
+func (a *Agent) discoverOnce(projectPath string) (*agent.SessionInfo, error) {
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
 		return nil, err
@@ -454,7 +485,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +527,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-

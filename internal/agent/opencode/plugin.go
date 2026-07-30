@@ -22,6 +22,38 @@ const pluginTemplate = `// shiftlog plugin for OpenCode CLI
 export const ShiftlogPlugin = async ({ directory, client }) => {
   const pendingCommits = new Map();
 
+  // withTimeout guards against SDK/client calls that hang instead of
+  // rejecting, which would otherwise block this hook (and OpenCode's
+  // single-threaded runtime) indefinitely.
+  const withTimeout = (promise, ms) =>
+    Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), ms)),
+    ]);
+
+  // runShiftlogStore fires the shiftlog store process without blocking the
+  // caller. A synchronous spawn here would stall OpenCode's own event loop
+  // (and therefore the whole run) for as long as the child process takes.
+  const runShiftlogStore = (hookData, cwd) => {
+    import("child_process")
+      .then(({ spawn }) => {
+        try {
+          const child = spawn("shiftlog", ["store", "--agent=opencode"], {
+            cwd,
+            stdio: ["pipe", "ignore", "ignore"],
+            detached: true,
+          });
+          child.on("error", () => {});
+          child.stdin.on("error", () => {});
+          child.stdin.end(hookData);
+          child.unref();
+        } catch (e) {
+          // Silently ignore errors to not disrupt workflow
+        }
+      })
+      .catch(() => {});
+  };
+
   return {
     "tool.execute.before": async (input, output) => {
       const command = output?.args?.command || output?.args?.cmd || "";
@@ -43,8 +75,17 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
       let transcriptData = "";
       if (client && pending.sessionID) {
         try {
-          const msgs = await client.session.messages({ path: { id: pending.sessionID } });
-          if (msgs && Array.isArray(msgs)) {
+          const result = await withTimeout(
+            client.session.messages({ path: { id: pending.sessionID } }),
+            5000
+          );
+          // Some SDK versions return the array directly, others wrap it as { data: [...] }.
+          const msgs = Array.isArray(result)
+            ? result
+            : Array.isArray(result?.data)
+              ? result.data
+              : null;
+          if (msgs) {
             transcriptData = JSON.stringify(msgs.map(m => ({
               role: m.role || "",
               id: m.id || "",
@@ -70,17 +111,7 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
         ...(transcriptData ? { transcript_data: transcriptData } : {}),
       });
 
-      try {
-        const { execSync } = await import("child_process");
-        execSync("shiftlog store --agent=opencode", {
-          input: hookData,
-          cwd: directory,
-          timeout: 30000,
-          stdio: ["pipe", "pipe", "pipe"],
-        });
-      } catch (e) {
-        // Silently ignore errors to not disrupt workflow
-      }
+      runShiftlogStore(hookData, directory);
     },
   };
 };
