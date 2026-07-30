@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -230,7 +231,12 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It tries flat file storage (pre-v1.2), then SQLite (v1.2+), and finally
+// falls back to a recency-based scan of the entire data directory. OpenCode
+// has changed its on-disk storage layout across releases (e.g. nesting
+// session/message storage under an internally-generated project directory
+// we cannot reliably reproduce), so the fallback tolerates layouts we don't
+// explicitly know about by trusting recency instead of a fixed path shape.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
@@ -248,7 +254,13 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 	}
 
 	projectID := GetProjectID(projectPath)
-	return discoverFromSQLite(dataDir, projectID, projectPath)
+	if session, _ := discoverFromSQLite(dataDir, projectID, projectPath); session != nil {
+		return session, nil
+	}
+
+	// Last resort: scan the whole data directory for the most recently
+	// touched session storage, without assuming a specific layout.
+	return discoverFromRecentFile(dataDir, projectPath)
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -379,6 +391,85 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	}, nil
 }
 
+// discoverFromRecentFile scans the entire OpenCode data directory for the
+// most recently modified session storage, without assuming a fixed layout.
+// This is a fallback for when OpenCode's storage has been reorganized (e.g.
+// nested under a per-project directory keyed by an internally-generated id)
+// in a way that the flat-file and SQLite discovery methods no longer match.
+// Directories holding multiple recent JSON files (likely per-message storage)
+// are preferred over directories with a single recent file (likely a
+// session-info file), since they are more likely to yield real transcript
+// content; both are bounded by RecentSessionTimeout so unrelated, stale
+// sessions elsewhere on disk are not picked up.
+func discoverFromRecentFile(dataDir, projectPath string) (*agent.SessionInfo, error) {
+	type dirStats struct {
+		count     int
+		latestMod time.Time
+	}
+
+	now := time.Now()
+	stats := make(map[string]*dirStats)
+
+	_ = filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d == nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return nil
+		}
+
+		dir := filepath.Dir(path)
+		s, ok := stats[dir]
+		if !ok {
+			s = &dirStats{}
+			stats[dir] = s
+		}
+		s.count++
+		if modTime.After(s.latestMod) {
+			s.latestMod = modTime
+		}
+		return nil
+	})
+
+	if len(stats) == 0 {
+		return nil, nil
+	}
+
+	var bestDir string
+	var best *dirStats
+	for dir, s := range stats {
+		if best == nil {
+			bestDir, best = dir, s
+			continue
+		}
+		betterGroup := (s.count > 1) && !(best.count > 1)
+		samePriority := (s.count > 1) == (best.count > 1)
+		if betterGroup || (samePriority && s.latestMod.After(best.latestMod)) {
+			bestDir, best = dir, s
+		}
+	}
+
+	if bestDir == "" {
+		return nil, nil
+	}
+
+	sessionID := filepath.Base(bestDir)
+
+	return &agent.SessionInfo{
+		SessionID:      sessionID,
+		TranscriptPath: bestDir,
+		StartedAt:      best.latestMod.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
+}
+
 // RestoreSession writes a session to OpenCode's storage location.
 func (a *Agent) RestoreSession(projectPath, sessionID, gitBranch string,
 	transcriptData []byte, messageCount int, summary string) error {
@@ -497,4 +588,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
