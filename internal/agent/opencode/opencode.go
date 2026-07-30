@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -186,45 +187,53 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 }
 
 // parseMessageDir reads all message files from an OpenCode message directory.
+//
+// OpenCode has, across versions, stored message files directly under this
+// directory as well as nested one or more levels deeper (e.g. per-message or
+// per-part subfolders). We walk the whole tree instead of assuming a fixed
+// depth so message files are found regardless of nesting.
 func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
-	dirEntries, err := os.ReadDir(dir)
-	if err != nil {
+	if _, err := os.Stat(dir); err != nil {
 		return nil, err
 	}
 
 	var entries []agent.TranscriptEntry
-	for _, de := range dirEntries {
-		if de.IsDir() || !strings.HasSuffix(de.Name(), ".json") {
-			// Handle .jsonl files too
-			if strings.HasSuffix(de.Name(), ".jsonl") {
-				f, err := os.Open(filepath.Join(dir, de.Name()))
-				if err != nil {
-					continue
-				}
-				transcript, err := a.ParseTranscript(f)
-				_ = f.Close()
-				if err == nil {
-					entries = append(entries, transcript.Entries...)
-				}
+
+	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() {
+			return nil
+		}
+
+		name := d.Name()
+		switch {
+		case strings.HasSuffix(name, ".jsonl"):
+			f, err := os.Open(path)
+			if err != nil {
+				return nil
 			}
-			continue
-		}
+			transcript, err := a.ParseTranscript(f)
+			_ = f.Close()
+			if err == nil {
+				entries = append(entries, transcript.Entries...)
+			}
+		case strings.HasSuffix(name, ".json"):
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return nil
+			}
 
-		data, err := os.ReadFile(filepath.Join(dir, de.Name()))
-		if err != nil {
-			continue
-		}
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal(data, &raw); err != nil {
+				return nil
+			}
 
-		var raw map[string]json.RawMessage
-		if err := json.Unmarshal(data, &raw); err != nil {
-			continue
+			entry := parseOpenCodeEntry(raw, data)
+			if entry.Type != "" {
+				entries = append(entries, entry)
+			}
 		}
-
-		entry := parseOpenCodeEntry(raw, data)
-		if entry.Type != "" {
-			entries = append(entries, entry)
-		}
-	}
+		return nil
+	})
 
 	return &agent.Transcript{Entries: entries}, nil
 }
@@ -251,43 +260,73 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 	return discoverFromSQLite(dataDir, projectID, projectPath)
 }
 
-// discoverFromFlatFiles tries the legacy flat file session discovery.
+// discoverFromFlatFiles tries the flat file session discovery.
+//
+// OpenCode's on-disk session layout has shifted across releases (a flat
+// "<projectID>/<sessionID>.json" file, a nested "<projectID>/<sessionID>/info.json"
+// folder, etc), so rather than assuming a fixed directory depth we walk the
+// whole storage tree and match session metadata by content: either the
+// session's own projectID/directory field, or the project ID appearing
+// somewhere in the file's path.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
-	if err != nil {
+	storageDir := filepath.Join(dataDir, "storage")
+	if _, err := os.Stat(storageDir); err != nil {
 		return nil, nil
 	}
 
+	projectID := GetProjectID(projectPath)
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
 	var bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
+	_ = filepath.WalkDir(storageDir, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
 		}
 
-		info, err := entry.Info()
+		info, err := d.Info()
 		if err != nil {
-			continue
+			return nil
 		}
 
 		modTime := info.ModTime()
 		if now.Sub(modTime) > recentTimeout {
-			continue
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		var session struct {
+			ID        string `json:"id"`
+			ProjectID string `json:"projectID"`
+			Directory string `json:"directory"`
+		}
+		if err := json.Unmarshal(data, &session); err != nil || session.ID == "" {
+			return nil
+		}
+
+		matches := session.ProjectID == projectID ||
+			session.Directory == projectPath ||
+			(projectID != "global" && strings.Contains(filepath.ToSlash(path), projectID))
+		if !matches {
+			return nil
 		}
 
 		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			bestSessionID = session.ID
 			bestModTime = modTime
 		}
-	}
+		return nil
+	})
 
 	if bestSessionID == "" {
 		return nil, nil
@@ -497,4 +536,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
