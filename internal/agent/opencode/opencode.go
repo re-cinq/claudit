@@ -1,9 +1,11 @@
+```go
 package opencode
 
 import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -229,10 +231,17 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 	return &agent.Transcript{Entries: entries}, nil
 }
 
-// DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// DiscoverSession finds an active or recent OpenCode session belonging to
+// projectPath.
+//
+// OpenCode has changed its on-disk session storage layout across releases
+// (flat per-project directories, nested "info" buckets, etc.), so rather
+// than assuming one fixed directory shape, the primary strategy walks
+// everything under storage/session and matches sessions by the project
+// directory recorded inside each session file, not by where the file lives
+// on disk. A SQLite-backed fallback is kept for OpenCode versions that
+// store sessions in opencode.db instead of flat files.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
 		return nil, err
@@ -241,7 +250,7 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
+	// Fall back to SQLite-backed storage used by some OpenCode versions.
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
@@ -251,43 +260,130 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 	return discoverFromSQLite(dataDir, projectID, projectPath)
 }
 
-// discoverFromFlatFiles tries the legacy flat file session discovery.
+// sessionFileHeader captures the subset of an OpenCode session JSON file
+// used to identify which project a session belongs to. OpenCode has used
+// different field names and nesting for this across releases (top-level
+// fields vs. a nested "info" object), so several are checked.
+type sessionFileHeader struct {
+	ID          string                 `json:"id"`
+	Directory   string                 `json:"directory"`
+	Worktree    string                 `json:"worktree"`
+	Cwd         string                 `json:"cwd"`
+	ProjectPath string                 `json:"projectPath"`
+	Info        *sessionFileHeaderInfo `json:"info"`
+}
+
+// sessionFileHeaderInfo mirrors sessionFileHeader for the nested "info"
+// shape some OpenCode versions use.
+type sessionFileHeaderInfo struct {
+	ID          string `json:"id"`
+	Directory   string `json:"directory"`
+	Worktree    string `json:"worktree"`
+	Cwd         string `json:"cwd"`
+	ProjectPath string `json:"projectPath"`
+}
+
+// directory returns the project directory recorded in the session file,
+// checking top-level fields first and then the nested "info" object.
+func (h sessionFileHeader) directory() string {
+	candidates := []string{h.Directory, h.Worktree, h.Cwd, h.ProjectPath}
+	if h.Info != nil {
+		candidates = append(candidates, h.Info.Directory, h.Info.Worktree, h.Info.Cwd, h.Info.ProjectPath)
+	}
+	for _, c := range candidates {
+		if c != "" {
+			return c
+		}
+	}
+	return ""
+}
+
+// sessionID returns the session's identifier, falling back to the filename
+// (without extension) if the file doesn't carry an explicit id.
+func (h sessionFileHeader) sessionID(filename string) string {
+	if h.ID != "" {
+		return h.ID
+	}
+	if h.Info != nil && h.Info.ID != "" {
+		return h.Info.ID
+	}
+	return strings.TrimSuffix(filename, ".json")
+}
+
+// resolvePath normalizes a filesystem path for comparison, resolving
+// symlinks where possible (e.g. macOS's /tmp -> /private/tmp) and falling
+// back to a cleaned path if the target doesn't exist or can't be resolved.
+func resolvePath(p string) string {
+	if p == "" {
+		return p
+	}
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return resolved
+	}
+	return filepath.Clean(p)
+}
+
+// discoverFromFlatFiles walks OpenCode's session storage directory and
+// finds the most recently updated session whose recorded project directory
+// matches projectPath. Sessions may live directly under storage/session,
+// nested under a project-specific subdirectory, or under further
+// subdirectories depending on the OpenCode version, so the whole tree is
+// walked and sessions are matched by content rather than by a fixed path.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
-	if err != nil {
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	if _, err := os.Stat(sessionRoot); err != nil {
 		return nil, nil
 	}
 
 	now := time.Now()
-	recentTimeout := agent.RecentSessionTimeout
+	resolvedProject := resolvePath(projectPath)
+
 	var bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
+	_ = filepath.WalkDir(sessionRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
 		}
 
-		info, err := entry.Info()
+		info, err := d.Info()
 		if err != nil {
-			continue
+			return nil
 		}
 
 		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return nil
+		}
+		if bestSessionID != "" && !modTime.After(bestModTime) {
+			// Can't improve on the current best; skip reading the file.
+			return nil
 		}
 
-		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
-			bestModTime = modTime
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
 		}
-	}
+
+		var header sessionFileHeader
+		if err := json.Unmarshal(data, &header); err != nil {
+			return nil
+		}
+
+		dir := header.directory()
+		if dir == "" || resolvePath(dir) != resolvedProject {
+			return nil
+		}
+
+		bestSessionID = header.sessionID(d.Name())
+		bestModTime = modTime
+		return nil
+	})
 
 	if bestSessionID == "" {
 		return nil, nil
@@ -454,7 +550,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +592,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
