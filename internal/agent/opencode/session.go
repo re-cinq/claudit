@@ -81,6 +81,60 @@ type sessionInfo struct {
 	Title     string `json:"title,omitempty"`
 }
 
+// tableColumns returns the column names of the given SQLite table via
+// PRAGMA table_info. OpenCode's schema has changed column names/layout
+// across releases, so callers should not assume a fixed set of names.
+func tableColumns(dbPath, table string) ([]string, error) {
+	cmd := exec.Command("sqlite3", dbPath, fmt.Sprintf("PRAGMA table_info(%s);", table))
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	var cols []string
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.Split(line, "|")
+		if len(fields) >= 2 {
+			cols = append(cols, fields[1])
+		}
+	}
+	return cols, nil
+}
+
+// pickColumn returns the first candidate (case-insensitive) present in cols,
+// or "" if none match.
+func pickColumn(cols []string, candidates ...string) string {
+	byLower := make(map[string]string, len(cols))
+	for _, c := range cols {
+		byLower[strings.ToLower(c)] = c
+	}
+	for _, cand := range candidates {
+		if actual, ok := byLower[strings.ToLower(cand)]; ok {
+			return actual
+		}
+	}
+	return ""
+}
+
+// messageSelectExpr builds a SQL expression producing one JSON object per
+// message row. Older OpenCode releases store the full message as a single
+// JSON blob column ("data"); newer releases may normalize the message into
+// individual typed columns instead. This adapts to either shape.
+func messageSelectExpr(cols []string) string {
+	if pickColumn(cols, "data") != "" && pickColumn(cols, "id") != "" {
+		return "json_patch(data, json_object('id', id))"
+	}
+
+	parts := make([]string, 0, len(cols)*2)
+	for _, c := range cols {
+		parts = append(parts, fmt.Sprintf("'%s'", c), c)
+	}
+	return fmt.Sprintf("json_object(%s)", strings.Join(parts, ", "))
+}
+
 // WriteSessionFile writes a session and its messages to OpenCode's storage.
 func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (string, error) {
 	sessionDir, err := GetSessionDir(projectPath)
