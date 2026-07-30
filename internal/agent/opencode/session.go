@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -52,7 +53,9 @@ func GetProjectID(projectPath string) string {
 	return "global"
 }
 
-// GetSessionDir returns the session storage directory for a project.
+// GetSessionDir returns the session storage directory for a project
+// (older OpenCode versions, which nest sessions under a per-project
+// directory keyed by a computed project ID).
 func GetSessionDir(projectPath string) (string, error) {
 	dataDir, err := GetDataDir()
 	if err != nil {
@@ -63,7 +66,9 @@ func GetSessionDir(projectPath string) (string, error) {
 	return filepath.Join(dataDir, "storage", "session", projectID), nil
 }
 
-// GetMessageDir returns the message storage directory for a session.
+// GetMessageDir returns the message storage directory for a session
+// (older OpenCode versions, which store messages at the top level of the
+// storage tree rather than nested under "session").
 func GetMessageDir(sessionID string) (string, error) {
 	dataDir, err := GetDataDir()
 	if err != nil {
@@ -71,6 +76,61 @@ func GetMessageDir(sessionID string) (string, error) {
 	}
 
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
+}
+
+// GetGlobalSessionInfoDir returns the directory containing all session info
+// files. Newer OpenCode versions store session metadata globally (keyed by
+// session ID, with a "directory" field for project association) rather than
+// nesting sessions under a per-project directory keyed by project ID.
+func GetGlobalSessionInfoDir() (string, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(dataDir, "storage", "session", "info"), nil
+}
+
+// GetSessionMessageDir returns the message storage directory for a session,
+// nested under the session storage tree (newer OpenCode versions).
+func GetSessionMessageDir(sessionID string) (string, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(dataDir, "storage", "session", "message", sessionID), nil
+}
+
+// resolveMessageDir finds the message storage directory for a session,
+// checking both the newer nested layout (storage/session/message/<id>) and
+// the older top-level layout (storage/message/<id>). This keeps session
+// discovery working across the OpenCode storage-layout change without
+// needing to know in advance which layout is in use.
+func resolveMessageDir(sessionID string) string {
+	if dir, err := GetSessionMessageDir(sessionID); err == nil {
+		if info, statErr := os.Stat(dir); statErr == nil && info.IsDir() {
+			return dir
+		}
+	}
+	if dir, err := GetMessageDir(sessionID); err == nil {
+		return dir
+	}
+	return ""
+}
+
+// normalizeProjectDir cleans and (where possible) resolves symlinks in a
+// project directory path so paths recorded by OpenCode can be compared
+// reliably against the project path shiftlog is operating on.
+func normalizeProjectDir(p string) string {
+	if p == "" {
+		return ""
+	}
+	clean := filepath.Clean(p)
+	if resolved, err := filepath.EvalSymlinks(clean); err == nil {
+		return resolved
+	}
+	return clean
 }
 
 // sessionInfo represents an OpenCode session JSON file.
@@ -127,3 +187,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
