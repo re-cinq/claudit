@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -8,6 +9,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -127,3 +131,140 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+
+// discoverFromDataDirScan scans the whole OpenCode data directory for the most
+// recently modified session file belonging to projectPath.
+//
+// Newer OpenCode releases have changed their on-disk storage layout multiple
+// times (e.g. dropping the project-scoped session subdirectory, or nesting
+// session metadata under storage/session/info instead of storage/session/<id>).
+// Rather than hard-coding one exact shape, this walks storage/ looking at every
+// *.json file's mtime and, when present, a directory/path/cwd/worktree field to
+// match it to the current project. If nothing declares its project explicitly,
+// it falls back to the single most recently modified session-like file overall,
+// which is still correct in the common case of one active OpenCode session.
+func discoverFromDataDirScan(dataDir, projectPath string) (*agent.SessionInfo, error) {
+	storageDir := filepath.Join(dataDir, "storage")
+	if _, err := os.Stat(storageDir); err != nil {
+		return nil, nil
+	}
+
+	now := time.Now()
+	var bestPath string
+	var bestID string
+	var bestModTime time.Time
+	var bestData []byte
+	var haveProjectMatch bool
+
+	_ = filepath.WalkDir(storageDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		var meta struct {
+			ID        string `json:"id"`
+			Directory string `json:"directory"`
+			Path      string `json:"path"`
+			Cwd       string `json:"cwd"`
+			Worktree  string `json:"worktree"`
+		}
+		if err := json.Unmarshal(data, &meta); err != nil {
+			return nil
+		}
+
+		id := meta.ID
+		if id == "" {
+			id = strings.TrimSuffix(d.Name(), ".json")
+		}
+
+		dir := firstNonEmpty(meta.Directory, meta.Path, meta.Cwd, meta.Worktree)
+		matchesProject := dir != "" && agent.PathsEqual(dir, projectPath)
+
+		if matchesProject {
+			if !haveProjectMatch || modTime.After(bestModTime) {
+				bestPath, bestID, bestModTime, bestData = path, id, modTime, data
+				haveProjectMatch = true
+			}
+			return nil
+		}
+
+		if !haveProjectMatch && (bestPath == "" || modTime.After(bestModTime)) {
+			bestPath, bestID, bestModTime, bestData = path, id, modTime, data
+		}
+
+		return nil
+	})
+
+	if bestID == "" {
+		return nil, nil
+	}
+
+	info := &agent.SessionInfo{
+		SessionID:   bestID,
+		StartedAt:   bestModTime.Format(time.RFC3339),
+		ProjectPath: projectPath,
+	}
+
+	if msgDir := findMessageSource(dataDir, bestPath, bestID); msgDir != "" {
+		info.TranscriptPath = msgDir
+	} else {
+		// No standalone message store found for this session; fall back to
+		// the session file's own content so store still has something to
+		// parse rather than failing outright.
+		info.TranscriptData = bestData
+	}
+
+	return info, nil
+}
+
+// findMessageSource tries several message-storage conventions used across
+// OpenCode releases to locate the message data for a given session.
+func findMessageSource(dataDir, sessionInfoPath, sessionID string) string {
+	candidates := []string{
+		filepath.Join(dataDir, "storage", "message", sessionID),
+		filepath.Join(dataDir, "storage", "session", "message", sessionID),
+		filepath.Join(filepath.Dir(sessionInfoPath), "message", sessionID),
+		filepath.Join(filepath.Dir(filepath.Dir(sessionInfoPath)), "message", sessionID),
+		filepath.Join(filepath.Dir(sessionInfoPath), sessionID),
+	}
+
+	for _, c := range candidates {
+		info, err := os.Stat(c)
+		if err != nil {
+			continue
+		}
+		if !info.IsDir() {
+			return c
+		}
+		if entries, err := os.ReadDir(c); err == nil && len(entries) > 0 {
+			return c
+		}
+	}
+	return ""
+}
+
+// firstNonEmpty returns the first non-empty string among values.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+```
