@@ -230,7 +230,12 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first tries flat file storage (pre-v1.2), then falls back to SQLite
+// (v1.2+), and finally does a broad scan of all session storage. The broad
+// scan tolerates project-scoping schemes that GetProjectID/GetSessionDir no
+// longer predict correctly — OpenCode has changed how sessions are tied to
+// a project directory (and how the session table is laid out) across
+// releases, which can otherwise make discovery silently find nothing.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
@@ -241,14 +246,24 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
+	// Fall back to SQLite (OpenCode v1.2+)
 	projectID := GetProjectID(projectPath)
-	return discoverFromSQLite(dataDir, projectID, projectPath)
+	session, err = discoverFromSQLite(dataDir, projectID, projectPath)
+	if err != nil {
+		return nil, err
+	}
+	if session != nil {
+		return session, nil
+	}
+
+	// Final fallback: broad scan of session storage, matching by embedded
+	// project directory where possible.
+	return scanAllSessionDirs(dataDir, projectPath)
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -316,24 +331,17 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
-	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+	sessionID := findSessionID(dbPath, projectID, projectPath)
+	if sessionID == "" {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
 		`SELECT time_updated FROM session WHERE id='%s';`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
+	cmd := exec.Command("sqlite3", dbPath, timeQuery)
 	timeOutput, err := cmd.Output()
 	if err == nil {
 		timeStr := strings.TrimSpace(string(timeOutput))
@@ -377,6 +385,95 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// findSessionID resolves the most recent OpenCode session ID scoped to
+// projectPath. OpenCode's session table schema — which column ties a
+// session to its project, and what that column is named — has changed
+// across releases, so the schema is introspected via PRAGMA table_info
+// rather than assumed. If no project-scoping column can be identified, or
+// no row matches, this falls back to the single most recently updated
+// session in the database, which is safe for the common single-project
+// case and strictly better than discovering nothing.
+func findSessionID(dbPath, projectID, projectPath string) string {
+	scopeCol, timeCol := sessionTableColumns(dbPath)
+
+	if scopeCol != "" {
+		for _, scopeVal := range []string{projectID, projectPath} {
+			if scopeVal == "" {
+				continue
+			}
+			if id := querySessionID(dbPath, scopeCol, scopeVal, timeCol); id != "" {
+				return id
+			}
+		}
+	}
+
+	return querySessionID(dbPath, "", "", timeCol)
+}
+
+// sessionTableColumns introspects the "session" table's columns to find a
+// project-scoping column and a recency column, tolerating renames across
+// OpenCode versions. Returns "" for scopeCol if none is recognized; timeCol
+// always falls back to "rowid" if no timestamp-like column is found.
+func sessionTableColumns(dbPath string) (scopeCol, timeCol string) {
+	cmd := exec.Command("sqlite3", dbPath, "PRAGMA table_info(session);")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", "time_updated"
+	}
+
+	scopeCandidates := []string{"project_id", "projectid", "directory", "cwd", "path", "worktree"}
+	timeCandidates := []string{"time_updated", "updated", "modified", "time_created", "created"}
+
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		fields := strings.Split(line, "|")
+		if len(fields) < 2 {
+			continue
+		}
+		name := fields[1]
+		lower := strings.ToLower(name)
+		if scopeCol == "" {
+			for _, c := range scopeCandidates {
+				if lower == c {
+					scopeCol = name
+					break
+				}
+			}
+		}
+		if timeCol == "" {
+			for _, c := range timeCandidates {
+				if lower == c {
+					timeCol = name
+					break
+				}
+			}
+		}
+	}
+
+	if timeCol == "" {
+		timeCol = "rowid"
+	}
+	return scopeCol, timeCol
+}
+
+// querySessionID runs a single-column, single-row session ID query. When
+// scopeCol/scopeVal are empty, it returns the most recent session with no
+// project filter.
+func querySessionID(dbPath, scopeCol, scopeVal, timeCol string) string {
+	var query string
+	if scopeCol != "" && scopeVal != "" {
+		escaped := strings.ReplaceAll(scopeVal, "'", "''")
+		query = fmt.Sprintf(`SELECT id FROM session WHERE %s='%s' ORDER BY %s DESC LIMIT 1;`, scopeCol, escaped, timeCol)
+	} else {
+		query = fmt.Sprintf(`SELECT id FROM session ORDER BY %s DESC LIMIT 1;`, timeCol)
+	}
+	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, query)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -497,4 +594,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-

@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +129,102 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// scanAllSessionDirs performs a broad, best-effort scan of OpenCode's session
+// storage directory (storage/session) for the most recently modified session
+// belonging to projectPath.
+//
+// GetSessionDir/GetProjectID assume sessions are nested as
+// storage/session/<projectID>/<sessionID>.json, where <projectID> is derived
+// from the git root commit hash. OpenCode has changed its project scoping
+// scheme across releases, so a projectID-based lookup can silently return
+// nothing even though a matching session exists on disk. This scan tolerates
+// both a flat layout (storage/session/<sessionID>.json) and a nested one, and
+// prefers a session whose embedded "directory" field matches projectPath. If
+// no session carries that field (or none matches), it falls back to the most
+// recently modified session overall — safe for the common case of a single
+// active project, and strictly better than discovering nothing.
+func scanAllSessionDirs(dataDir, projectPath string) (*agent.SessionInfo, error) {
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	entries, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		return nil, nil
+	}
+
+	now := time.Now()
+	var bestSessionID string
+	var bestModTime time.Time
+	var bestMatched bool
+
+	consider := func(path string, name string, modTime time.Time) {
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return
+		}
+
+		sessionID := strings.TrimSuffix(name, ".json")
+		matched := false
+
+		if data, err := os.ReadFile(path); err == nil {
+			var header sessionInfo
+			if json.Unmarshal(data, &header) == nil {
+				if header.ID != "" {
+					sessionID = header.ID
+				}
+				if header.Directory != "" {
+					matched = agent.PathsEqual(header.Directory, projectPath)
+				}
+			}
+		}
+
+		if matched && (!bestMatched || modTime.After(bestModTime)) {
+			bestSessionID, bestModTime, bestMatched = sessionID, modTime, true
+			return
+		}
+		if !bestMatched && (bestSessionID == "" || modTime.After(bestModTime)) {
+			bestSessionID, bestModTime = sessionID, modTime
+		}
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			if !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			consider(filepath.Join(sessionRoot, entry.Name()), entry.Name(), info.ModTime())
+			continue
+		}
+
+		nestedDir := filepath.Join(sessionRoot, entry.Name())
+		nested, err := os.ReadDir(nestedDir)
+		if err != nil {
+			continue
+		}
+		for _, file := range nested {
+			if file.IsDir() || !strings.HasSuffix(file.Name(), ".json") {
+				continue
+			}
+			info, err := file.Info()
+			if err != nil {
+				continue
+			}
+			consider(filepath.Join(nestedDir, file.Name()), file.Name(), info.ModTime())
+		}
+	}
+
+	if bestSessionID == "" {
+		return nil, nil
+	}
+
+	msgDir, _ := GetMessageDir(bestSessionID)
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: msgDir,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
 }
