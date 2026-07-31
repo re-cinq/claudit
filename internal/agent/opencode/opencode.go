@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -7,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -304,6 +306,56 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
+// sqliteTableColumns returns the set of column names for a table in the
+// given SQLite database, using PRAGMA table_info. Returns an empty (non-nil)
+// map if the table doesn't exist or sqlite3 fails.
+func sqliteTableColumns(dbPath, table string) map[string]bool {
+	cmd := exec.Command("sqlite3", dbPath, fmt.Sprintf("PRAGMA table_info(%s);", table))
+	output, err := cmd.Output()
+	cols := map[string]bool{}
+	if err != nil {
+		return cols
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		fields := strings.Split(line, "|")
+		if len(fields) > 1 {
+			cols[fields[1]] = true
+		}
+	}
+	return cols
+}
+
+// sqliteRecencyExpr picks a SQL expression usable for ordering/reading a
+// timestamp, without referencing columns that may not exist in the actual
+// schema (referencing an unknown column errors out the whole query and was
+// silently breaking session discovery). Prefers a flat column if present,
+// falls back to extracting from a nested "data" JSON blob (as used by newer
+// OpenCode storage layouts), and finally falls back to rowid (insertion
+// order) if neither is available.
+func sqliteRecencyExpr(cols map[string]bool, flatCol, jsonTimeKey string) string {
+	if cols[flatCol] {
+		return flatCol
+	}
+	if cols["data"] {
+		return fmt.Sprintf("json_extract(data, '$.time.%s')", jsonTimeKey)
+	}
+	return "rowid"
+}
+
+// sqliteForeignKeyColumn finds the column in cols that references a session
+// (e.g. "session_id", "sessionID"), falling back to the given default.
+func sqliteForeignKeyColumn(cols map[string]bool, fallback string) string {
+	if cols[fallback] {
+		return fallback
+	}
+	for col := range cols {
+		if strings.Contains(strings.ToLower(col), "session") {
+			return col
+		}
+	}
+	return fallback
+}
+
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
@@ -316,10 +368,17 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
+	// The exact column names used for timestamps and foreign keys vary across
+	// OpenCode versions/storage layouts, so they're discovered at runtime
+	// instead of hardcoded — referencing a nonexistent column fails the
+	// entire query and made discovery silently return nil.
+	sessionCols := sqliteTableColumns(dbPath, "session")
+	sessionRecencyExpr := sqliteRecencyExpr(sessionCols, "time_updated", "updated")
+
 	// Find most recent session for this project
 	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
+		`SELECT id FROM session WHERE project_id='%s' ORDER BY %s DESC LIMIT 1;`,
+		projectID, sessionRecencyExpr,
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
@@ -330,8 +389,8 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
-		`SELECT time_updated FROM session WHERE id='%s';`,
-		sessionID,
+		`SELECT %s FROM session WHERE id='%s';`,
+		sessionRecencyExpr, sessionID,
 	)
 	cmd = exec.Command("sqlite3", dbPath, timeQuery)
 	timeOutput, err := cmd.Output()
@@ -349,14 +408,32 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 			if time.Since(t) > agent.RecentSessionTimeout {
 				return nil, nil
 			}
+		} else if ms, err := strconv.ParseInt(timeStr, 10, 64); err == nil {
+			// Unix epoch, in seconds or milliseconds.
+			t := time.Unix(ms, 0)
+			if ms >= 1e12 {
+				t = time.Unix(0, ms*int64(time.Millisecond))
+			}
+			if time.Since(t) > agent.RecentSessionTimeout {
+				return nil, nil
+			}
 		}
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
 
 	// Get messages for this session as a JSON array
+	messageCols := sqliteTableColumns(dbPath, "message")
+	sessionIDCol := sqliteForeignKeyColumn(messageCols, "session_id")
+	messageRecencyExpr := sqliteRecencyExpr(messageCols, "time_created", "created")
+
+	dataExpr := "data"
+	if messageCols["id"] {
+		dataExpr = "json_patch(data, json_object('id', id))"
+	}
+
 	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
+		`SELECT json_group_array(%s) FROM message WHERE %s='%s' ORDER BY %s;`,
+		dataExpr, sessionIDCol, sessionID, messageRecencyExpr,
 	)
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
@@ -497,4 +574,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
