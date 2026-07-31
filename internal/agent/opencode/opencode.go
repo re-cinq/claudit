@@ -353,11 +353,31 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
 
-	// Get messages for this session as a JSON array
-	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
-	)
+	// Get messages for this session as a JSON array. The column that links a
+	// message to its session, and the column used to order messages, have
+	// changed names across OpenCode releases (e.g. "session_id" vs
+	// "sessionID", "time_created" vs "created_at"). Resolve them from the
+	// actual table schema instead of assuming fixed names, so newer
+	// OpenCode releases that rename these columns keep working.
+	sessionCol := findColumn(dbPath, "message", []string{"session_id", "sessionID", "sessionid"})
+	if sessionCol == "" {
+		sessionCol = "session_id"
+	}
+	orderCol := findColumn(dbPath, "message", []string{"time_created", "created_at", "createdAt", "time"})
+
+	var msgQuery string
+	if orderCol != "" {
+		msgQuery = fmt.Sprintf(
+			`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE %s='%s' ORDER BY %s;`,
+			sessionCol, sessionID, orderCol,
+		)
+	} else {
+		// No known timestamp column - fall back to insertion order via rowid.
+		msgQuery = fmt.Sprintf(
+			`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE %s='%s' ORDER BY rowid;`,
+			sessionCol, sessionID,
+		)
+	}
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
 	if err != nil {
@@ -377,6 +397,36 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// findColumn returns the actual column name in table that matches one of the
+// given candidates (case-insensitive), or "" if none is found or the schema
+// cannot be inspected. Used to tolerate OpenCode SQLite schema changes
+// across versions without hardcoding a single column name.
+func findColumn(dbPath, table string, candidates []string) string {
+	cmd := exec.Command("sqlite3", dbPath, fmt.Sprintf("PRAGMA table_info(%s);", table))
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	var columns []string
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		fields := strings.Split(line, "|")
+		if len(fields) >= 2 {
+			columns = append(columns, fields[1])
+		}
+	}
+
+	for _, cand := range candidates {
+		for _, col := range columns {
+			if strings.EqualFold(col, cand) {
+				return col
+			}
+		}
+	}
+
+	return ""
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -497,4 +547,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
