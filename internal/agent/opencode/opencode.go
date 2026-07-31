@@ -229,9 +229,44 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 	return &agent.Transcript{Entries: entries}, nil
 }
 
+// discoverSessionAttemptTimeout and discoverSessionPollInterval bound how long
+// DiscoverSession waits for OpenCode to persist a session after its CLI process
+// exits. Newer OpenCode versions persist session/message data through an
+// internal server component that can still be flushing to disk or SQLite for a
+// short window after "opencode run" returns. That races with the git
+// post-commit hook, which invokes manual session discovery immediately after
+// the commit completes. Polling briefly avoids losing the note to that race
+// without slowing down the common case where the session is already visible.
+const (
+	discoverSessionAttemptTimeout = 3 * time.Second
+	discoverSessionPollInterval   = 300 * time.Millisecond
+)
+
 // DiscoverSession finds an active or recent OpenCode session.
 // It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// Discovery is retried for a short window since session persistence can lag
+// slightly behind the OpenCode CLI process exiting.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	deadline := time.Now().Add(discoverSessionAttemptTimeout)
+
+	for {
+		session, err := a.discoverSessionOnce(projectPath)
+		if err != nil {
+			return nil, err
+		}
+		if session != nil {
+			return session, nil
+		}
+
+		if time.Now().After(deadline) {
+			return nil, nil
+		}
+		time.Sleep(discoverSessionPollInterval)
+	}
+}
+
+// discoverSessionOnce performs a single, non-retrying session discovery pass.
+func (a *Agent) discoverSessionOnce(projectPath string) (*agent.SessionInfo, error) {
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
@@ -497,4 +532,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
