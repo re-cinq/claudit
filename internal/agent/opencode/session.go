@@ -73,6 +73,32 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// GetSessionInfoDir returns the flat session-info directory used by newer
+// OpenCode releases, which dropped the per-project directory nesting under
+// storage/session/<projectID>/ in favor of a single storage/session/info/
+// directory. Sessions are matched to a project via their "directory" field
+// instead of by path.
+func GetSessionInfoDir() (string, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(dataDir, "storage", "session", "info"), nil
+}
+
+// GetSessionMessageDir returns the message directory for a session under the
+// newer storage/session/message/<sessionID>/ layout (messages nested under
+// "session" rather than living at the top level).
+func GetSessionMessageDir(sessionID string) (string, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(dataDir, "storage", "session", "message", sessionID), nil
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
