@@ -283,10 +283,22 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 			continue
 		}
 
-		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
-			bestModTime = modTime
+		if bestSessionID != "" && !modTime.After(bestModTime) {
+			continue
 		}
+
+		// OpenCode's session filenames are not guaranteed to encode the
+		// session ID (e.g. some versions prefix them with a sortable
+		// timestamp), so the "id" field inside the file is the
+		// authoritative source; fall back to the filename for older
+		// versions that do use <sessionID>.json.
+		sessionID := sessionIDFromFile(filepath.Join(sessionDir, entry.Name()), entry.Name())
+		if sessionID == "" {
+			continue
+		}
+
+		bestSessionID = sessionID
+		bestModTime = modTime
 	}
 
 	if bestSessionID == "" {
@@ -302,6 +314,21 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// sessionIDFromFile extracts the session ID from a session JSON file's "id"
+// field, falling back to the filename (without its .json extension) if the
+// field is absent or the file can't be parsed.
+func sessionIDFromFile(path, name string) string {
+	if data, err := os.ReadFile(path); err == nil {
+		var session struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(data, &session); err == nil && session.ID != "" {
+			return session.ID
+		}
+	}
+	return strings.TrimSuffix(name, ".json")
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +524,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
