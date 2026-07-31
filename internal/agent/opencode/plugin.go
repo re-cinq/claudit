@@ -39,13 +39,19 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
       if (!pending) return;
       pendingCommits.delete(input.callID);
 
-      // Try to fetch messages via the SDK client API
+      // Try to fetch messages via the SDK client API. Some client versions
+      // return the array directly, others wrap it as { data: [...] }.
       let transcriptData = "";
       if (client && pending.sessionID) {
         try {
           const msgs = await client.session.messages({ path: { id: pending.sessionID } });
-          if (msgs && Array.isArray(msgs)) {
-            transcriptData = JSON.stringify(msgs.map(m => ({
+          const list = Array.isArray(msgs)
+            ? msgs
+            : Array.isArray(msgs?.data)
+              ? msgs.data
+              : null;
+          if (list) {
+            transcriptData = JSON.stringify(list.map(m => ({
               role: m.role || "",
               id: m.id || "",
               content: m.content || "",
@@ -70,13 +76,36 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
         ...(transcriptData ? { transcript_data: transcriptData } : {}),
       });
 
+      // Use a non-blocking spawn rather than execSync: execSync blocks
+      // OpenCode's Node.js event loop for the full duration of the call,
+      // which can stall unrelated concurrent work (e.g. in-flight model
+      // streaming) happening in the same process and cause the CLI to hang.
       try {
-        const { execSync } = await import("child_process");
-        execSync("shiftlog store --agent=opencode", {
-          input: hookData,
-          cwd: directory,
-          timeout: 30000,
-          stdio: ["pipe", "pipe", "pipe"],
+        const { spawn } = await import("child_process");
+        await new Promise((resolve) => {
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve();
+          };
+
+          const child = spawn("shiftlog", ["store", "--agent=opencode"], {
+            cwd: directory,
+            stdio: ["pipe", "ignore", "ignore"],
+          });
+
+          const timer = setTimeout(() => {
+            child.kill();
+            finish();
+          }, 30000);
+
+          child.on("error", finish);
+          child.on("exit", finish);
+
+          child.stdin.write(hookData);
+          child.stdin.end();
         });
       } catch (e) {
         // Silently ignore errors to not disrupt workflow
