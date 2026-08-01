@@ -22,6 +22,50 @@ const pluginTemplate = `// shiftlog plugin for OpenCode CLI
 export const ShiftlogPlugin = async ({ directory, client }) => {
   const pendingCommits = new Map();
 
+  // Persists a version-agnostic pointer to the current session (session ID +
+  // a snapshot of its transcript) to .shiftlog/. OpenCode's own on-disk
+  // session storage (flat files vs. SQLite, schema, paths) has changed
+  // across releases, so 'shiftlog store --manual' (used for commits made
+  // outside of OpenCode's tool calls, e.g. in a separate terminal after the
+  // session ends) reads this self-written pointer instead of trying to
+  // reverse-engineer OpenCode's internal storage.
+  const trackActiveSession = async (sessionID) => {
+    if (!sessionID || !client) return;
+    try {
+      const msgs = await client.session.messages({ path: { id: sessionID } });
+      if (!msgs || !Array.isArray(msgs)) return;
+
+      const transcriptData = JSON.stringify(msgs.map(m => ({
+        role: m.role || "",
+        id: m.id || "",
+        content: m.content || "",
+        time: m.time || {},
+      })));
+
+      const fs = await import("fs");
+      const path = await import("path");
+
+      const shiftlogDir = path.join(directory, ".shiftlog");
+      fs.mkdirSync(shiftlogDir, { recursive: true });
+
+      const transcriptPath = path.join(shiftlogDir, "opencode-session.json");
+      fs.writeFileSync(transcriptPath, transcriptData);
+
+      const activeSession = {
+        session_id: sessionID,
+        transcript_path: transcriptPath,
+        started_at: new Date().toISOString(),
+        project_path: directory,
+      };
+      fs.writeFileSync(
+        path.join(shiftlogDir, "active-session.json"),
+        JSON.stringify(activeSession, null, 2)
+      );
+    } catch (e) {
+      // Silently ignore errors to not disrupt workflow
+    }
+  };
+
   return {
     "tool.execute.before": async (input, output) => {
       const command = output?.args?.command || output?.args?.cmd || "";
@@ -35,6 +79,8 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
     },
 
     "tool.execute.after": async (input, output) => {
+      await trackActiveSession(input.sessionID);
+
       const pending = pendingCommits.get(input.callID);
       if (!pending) return;
       pendingCommits.delete(input.callID);
