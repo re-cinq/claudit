@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -70,16 +71,47 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
         ...(transcriptData ? { transcript_data: transcriptData } : {}),
       });
 
+      // Hand the payload to shiftlog via a temp file read as a real file
+      // descriptor rather than execSync's "input" option. Node's
+      // synchronous child_process implementation buffers stdin/stdout/stderr
+      // in a single blocking pass; once transcript_data grows large (long
+      // sessions), piping it through that internal pipe can stall the child
+      // indefinitely instead of completing or hitting the timeout. Reading
+      // from a file descriptor avoids that pipe entirely.
+      let tmpFile;
       try {
+        const fs = await import("fs");
+        const os = await import("os");
+        const path = await import("path");
         const { execSync } = await import("child_process");
-        execSync("shiftlog store --agent=opencode", {
-          input: hookData,
-          cwd: directory,
-          timeout: 30000,
-          stdio: ["pipe", "pipe", "pipe"],
-        });
+
+        tmpFile = path.join(
+          os.tmpdir(),
+          "shiftlog-hook-" + process.pid + "-" + Date.now() + "-" + Math.random().toString(36).slice(2) + ".json"
+        );
+        fs.writeFileSync(tmpFile, hookData);
+
+        const fd = fs.openSync(tmpFile, "r");
+        try {
+          execSync("shiftlog store --agent=opencode", {
+            cwd: directory,
+            timeout: 30000,
+            stdio: [fd, "pipe", "pipe"],
+          });
+        } finally {
+          fs.closeSync(fd);
+        }
       } catch (e) {
         // Silently ignore errors to not disrupt workflow
+      } finally {
+        if (tmpFile) {
+          try {
+            const fs = await import("fs");
+            fs.unlinkSync(tmpFile);
+          } catch (e) {
+            // ignore cleanup errors
+          }
+        }
       }
     },
   };
@@ -125,3 +157,4 @@ func HasPlugin(repoRoot string) bool {
 	_, err := os.Stat(pluginPath)
 	return err == nil
 }
+```
