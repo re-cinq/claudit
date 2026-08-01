@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -127,3 +130,146 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+
+// FindRecentSession scans the OpenCode data directory for the most recently
+// modified session that belongs to projectPath. OpenCode's on-disk storage
+// layout (how deeply session/message files are nested under the data dir)
+// has changed across releases, so this walks the whole storage tree rather
+// than assuming a fixed directory depth. Sessions are identified by content
+// (a JSON object without a "role" field, optionally with an "id" field)
+// rather than by a predicted path, and matched to projectPath via any of
+// the directory-like field names OpenCode has used across versions.
+//
+// It prefers the most recently modified session whose content matches
+// projectPath; if none match by content, it falls back to the most
+// recently modified session file overall (within the recency window).
+func FindRecentSession(dataDir, projectPath string) (sessionID, sessionDir string, found bool) {
+	storageDir := filepath.Join(dataDir, "storage")
+	if _, err := os.Stat(storageDir); err != nil {
+		return "", "", false
+	}
+
+	now := time.Now()
+	var bestModTime time.Time
+	var bestID, bestDir string
+	var bestMatches bool
+
+	_ = filepath.WalkDir(storageDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		base := strings.TrimSuffix(d.Name(), ".json")
+		// Message/part records use distinct ID prefixes in OpenCode; skip
+		// them so we don't mistake them for session records.
+		if strings.HasPrefix(base, "msg_") || strings.HasPrefix(base, "prt_") || strings.HasPrefix(base, "part_") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil
+		}
+		// Message records have a "role" field; session records don't.
+		if _, isMessage := raw["role"]; isMessage {
+			return nil
+		}
+
+		id := base
+		if idRaw, ok := raw["id"]; ok {
+			var idStr string
+			if json.Unmarshal(idRaw, &idStr) == nil && idStr != "" {
+				id = idStr
+			}
+		}
+
+		matches := sessionMatchesProject(raw, projectPath)
+
+		better := bestID == "" ||
+			(matches && !bestMatches) ||
+			(matches == bestMatches && modTime.After(bestModTime))
+		if better {
+			bestID = id
+			bestDir = filepath.Dir(path)
+			bestModTime = modTime
+			bestMatches = matches
+		}
+		return nil
+	})
+
+	if bestID == "" {
+		return "", "", false
+	}
+	return bestID, bestDir, true
+}
+
+// sessionMatchesProject checks whether a session's JSON record references
+// projectPath via any of the field names OpenCode has used across versions
+// for the working directory a session was created in.
+func sessionMatchesProject(raw map[string]json.RawMessage, projectPath string) bool {
+	for _, key := range []string{"directory", "cwd", "path", "worktree", "projectPath", "root"} {
+		v, ok := raw[key]
+		if !ok {
+			continue
+		}
+		var s string
+		if json.Unmarshal(v, &s) != nil || s == "" {
+			continue
+		}
+		if agent.PathsEqual(s, projectPath) {
+			return true
+		}
+	}
+	return false
+}
+
+// FindMessageDir locates the directory holding a session's messages. It
+// tries known layouts first, then falls back to a recursive search for a
+// directory literally named after the session ID, and finally falls back
+// to the session's own directory (which is guaranteed to exist) so callers
+// always get a valid, readable path.
+func FindMessageDir(dataDir, sessionID, sessionDir string) string {
+	storageDir := filepath.Join(dataDir, "storage")
+	candidates := []string{
+		filepath.Join(storageDir, "message", sessionID),
+		filepath.Join(storageDir, "session", "message", sessionID),
+		filepath.Join(sessionDir, sessionID),
+		filepath.Join(sessionDir, "message", sessionID),
+	}
+	for _, c := range candidates {
+		if info, err := os.Stat(c); err == nil && info.IsDir() {
+			return c
+		}
+	}
+
+	var found string
+	_ = filepath.WalkDir(storageDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || found != "" {
+			return nil
+		}
+		if d.IsDir() && d.Name() == sessionID {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if found != "" {
+		return found
+	}
+
+	return sessionDir
+}
+</parameter>{"agents":{"claude-code":{"package":"@anthropic-ai/claude-code","constraint":"~2.1","last-known-good":"2.1.138"},"copilot":{"package":"@github/copilot","constraint":null,"last-known-good":"1.0.44"},"gemini-cli":{"package":"@google/gemini-cli","constraint":"~0.29","last-known-good":"0.29.7"},"opencode-ai":{"package":"opencode-ai","constraint":null,"last-known-good":"1.14.41"},"codex":{"package":"@openai/codex","constraint":null,"last-known-good":"0.130.0"}}}
