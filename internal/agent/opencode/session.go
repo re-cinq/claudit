@@ -1,13 +1,18 @@
+```go
 package opencode
 
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -127,3 +132,109 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+
+// discoverByContentScan performs a resilient, layout-agnostic scan of OpenCode's
+// data directory for the most recent session belonging to this project. OpenCode
+// has changed its on-disk storage layout across versions (e.g. moving between
+// storage/session/<projectID>/<id>.json and other project-scoped arrangements),
+// so instead of assuming one fixed directory structure, this walks the whole
+// data directory and matches session files by their recorded project path
+// rather than by directory location.
+func discoverByContentScan(dataDir, projectPath string) (*agent.SessionInfo, error) {
+	if _, err := os.Stat(dataDir); err != nil {
+		return nil, nil
+	}
+
+	absProjectPath, err := filepath.Abs(projectPath)
+	if err != nil {
+		absProjectPath = projectPath
+	}
+
+	now := time.Now()
+	var bestSessionPath string
+	var bestSessionID string
+	var bestModTime time.Time
+
+	_ = filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+		// Only consider files that live under a "session" directory component,
+		// regardless of how deeply it's nested (project.json, storage.json,
+		// message files, etc. are not session records).
+		if !strings.Contains(filepath.ToSlash(path), "/session") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil || now.Sub(info.ModTime()) > agent.RecentSessionTimeout {
+			return nil
+		}
+		if bestSessionID != "" && !info.ModTime().After(bestModTime) {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil || !strings.Contains(string(data), absProjectPath) {
+			return nil
+		}
+
+		id := strings.TrimSuffix(d.Name(), ".json")
+		var parsed struct {
+			ID string `json:"id"`
+		}
+		if json.Unmarshal(data, &parsed) == nil && parsed.ID != "" {
+			id = parsed.ID
+		}
+
+		bestSessionPath = path
+		bestSessionID = id
+		bestModTime = info.ModTime()
+		return nil
+	})
+
+	if bestSessionID == "" {
+		return nil, nil
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: findMessageDir(dataDir, bestSessionID, filepath.Dir(bestSessionPath)),
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
+}
+
+// findMessageDir locates the directory containing a session's messages,
+// trying several plausible layouts relative to where the session file itself
+// was found so that discoverByContentScan works across OpenCode storage
+// layout changes without hardcoding a single directory structure.
+func findMessageDir(dataDir, sessionID, sessionFileDir string) string {
+	candidates := []string{
+		filepath.Join(dataDir, "storage", "message", sessionID),
+	}
+
+	// If the session file lives directly under a "session" directory, its
+	// sibling "message" directory is one level up.
+	if filepath.Base(sessionFileDir) == "session" {
+		candidates = append(candidates, filepath.Join(filepath.Dir(sessionFileDir), "message", sessionID))
+	} else {
+		// Otherwise assume it's nested one level deeper, e.g.
+		// storage/session/<projectID>/<id>.json -> storage/message/<id>/
+		candidates = append(candidates, filepath.Join(filepath.Dir(filepath.Dir(sessionFileDir)), "message", sessionID))
+	}
+
+	for _, c := range candidates {
+		if info, err := os.Stat(c); err == nil && info.IsDir() {
+			return c
+		}
+	}
+
+	// Fall back to the first candidate even if it doesn't exist yet; the
+	// caller will surface a read error rather than silently finding nothing.
+	return candidates[0]
+}
+```
