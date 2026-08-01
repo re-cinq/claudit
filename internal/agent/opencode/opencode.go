@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/re-cinq/shift-log/internal/agent"
+	"github.com/re-cinq/shift-log/internal/session"
 )
 
 func init() {
@@ -20,7 +21,7 @@ func init() {
 // Agent implements the agent.Agent interface for OpenCode CLI.
 type Agent struct{}
 
-func (a *Agent) Name() agent.Name   { return agent.OpenCode }
+func (a *Agent) Name() agent.Name    { return agent.OpenCode }
 func (a *Agent) DisplayName() string { return "OpenCode CLI" }
 
 // ConfigureHooks installs the shiftlog plugin for OpenCode.
@@ -96,12 +97,12 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 func (a *Agent) IsCommitCommand(toolName, command string) bool {
 	// OpenCode tool names for shell execution
 	shellTools := map[string]bool{
-		"bash":               true,
-		"shell":              true,
-		"terminal":           true,
-		"execute":            true,
-		"run":                true,
-		"command":            true,
+		"bash":     true,
+		"shell":    true,
+		"terminal": true,
+		"execute":  true,
+		"run":      true,
+		"command":  true,
 	}
 
 	if !shellTools[toolName] {
@@ -230,15 +231,26 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first checks the active-session marker written by the shiftlog plugin
+// (updated on every tool call, so it survives OpenCode storage format
+// changes across versions), then falls back to on-disk scanning: flat file
+// storage (pre-v1.2 OpenCode), then SQLite (v1.2+).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	// Try the active-session marker first (written by the shiftlog plugin's
+	// tool.execute.after hook via `shiftlog session-start`). This is the
+	// most reliable source because it doesn't depend on knowing OpenCode's
+	// internal storage layout, which has changed across versions.
+	if info, err := discoverFromActiveSession(projectPath); err == nil && info != nil {
+		return info, nil
+	}
+
 	// Try flat file storage first (pre-v1.2 OpenCode)
-	session, err := a.discoverFromFlatFiles(projectPath)
+	sessionInfo, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
 		return nil, err
 	}
-	if session != nil {
-		return session, nil
+	if sessionInfo != nil {
+		return sessionInfo, nil
 	}
 
 	// Fall back to SQLite (OpenCode v1.2+)
@@ -249,6 +261,33 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 
 	projectID := GetProjectID(projectPath)
 	return discoverFromSQLite(dataDir, projectID, projectPath)
+}
+
+// discoverFromActiveSession checks the .shiftlog/active-session.json file
+// written by the OpenCode plugin (via `shiftlog session-start`) for a
+// direct pointer to the active session and its transcript.
+func discoverFromActiveSession(projectPath string) (*agent.SessionInfo, error) {
+	active, err := session.ReadActiveSession()
+	if err != nil || active == nil {
+		return nil, nil
+	}
+
+	// Validate project path matches
+	if !agent.PathsEqual(active.ProjectPath, projectPath) {
+		return nil, nil
+	}
+
+	// Validate session is still active (transcript modified recently)
+	if !session.IsSessionActive(active) {
+		return nil, nil
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      active.SessionID,
+		TranscriptPath: active.TranscriptPath,
+		StartedAt:      active.StartedAt,
+		ProjectPath:    active.ProjectPath,
+	}, nil
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -454,7 +493,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +535,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
