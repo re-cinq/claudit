@@ -230,9 +230,24 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+//
+// OpenCode's internal on-disk storage format is not a stable interface - it
+// has already changed once (flat JSON files pre-v1.2, then SQLite from
+// v1.2+) and cannot be relied on to stay put across releases. To stay
+// resilient to further changes, discovery prefers a small cache that the
+// shiftlog plugin maintains itself via OpenCode's stable SDK client API
+// (refreshed on every tool call - see .opencode/plugins/shiftlog.js), and
+// only falls back to reverse engineering OpenCode's storage layout when
+// that cache is unavailable (e.g. plugin not yet run, or cache expired).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
+	// Prefer the plugin-maintained cache.
+	if session, err := a.discoverFromCache(projectPath); err != nil {
+		return nil, err
+	} else if session != nil {
+		return session, nil
+	}
+
+	// Try flat file storage (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
 		return nil, err
@@ -249,6 +264,43 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 
 	projectID := GetProjectID(projectPath)
 	return discoverFromSQLite(dataDir, projectID, projectPath)
+}
+
+// discoverFromCache reads the session cache maintained by the shiftlog
+// OpenCode plugin at .git/shiftlog/opencode-session.json. The plugin
+// refreshes this file on every tool call using OpenCode's SDK client
+// (client.session.messages), which is a stable interface unlike OpenCode's
+// internal storage layout.
+func (a *Agent) discoverFromCache(projectPath string) (*agent.SessionInfo, error) {
+	cachePath := filepath.Join(projectPath, ".git", "shiftlog", "opencode-session.json")
+
+	info, err := os.Stat(cachePath)
+	if err != nil {
+		return nil, nil
+	}
+	if time.Since(info.ModTime()) > agent.RecentSessionTimeout {
+		return nil, nil
+	}
+
+	data, err := os.ReadFile(cachePath)
+	if err != nil {
+		return nil, nil
+	}
+
+	var cache struct {
+		SessionID  string          `json:"session_id"`
+		Transcript json.RawMessage `json:"transcript"`
+	}
+	if err := json.Unmarshal(data, &cache); err != nil || cache.SessionID == "" || len(cache.Transcript) == 0 {
+		return nil, nil
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      cache.SessionID,
+		StartedAt:      info.ModTime().Format(time.RFC3339),
+		ProjectPath:    projectPath,
+		TranscriptData: cache.Transcript,
+	}, nil
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -497,4 +549,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-

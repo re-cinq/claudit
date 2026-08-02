@@ -22,6 +22,50 @@ const pluginTemplate = `// shiftlog plugin for OpenCode CLI
 export const ShiftlogPlugin = async ({ directory, client }) => {
   const pendingCommits = new Map();
 
+  // Fetch a session's messages via the SDK client API. This is OpenCode's
+  // stable, documented interface for reading session data - unlike its
+  // internal on-disk storage layout, which has changed across releases
+  // (flat JSON files, then SQLite, ...) and cannot be relied on directly.
+  const fetchMessages = async (sessionID) => {
+    if (!client || !sessionID) return null;
+    try {
+      const msgs = await client.session.messages({ path: { id: sessionID } });
+      if (msgs && Array.isArray(msgs)) {
+        return msgs.map(m => ({
+          role: m.role || "",
+          id: m.id || "",
+          content: m.content || "",
+          time: m.time || {},
+        }));
+      }
+    } catch (e) {
+      // Ignore; caller treats null as "unavailable"
+    }
+    return null;
+  };
+
+  // Keep an on-disk cache of the active session's transcript, refreshed on
+  // every tool call, so a later *manual* commit (made outside of a shiftlog
+  // git-commit tool call) can still be annotated by 'shiftlog store --manual'
+  // without needing to know where/how OpenCode stores sessions internally.
+  const cacheSession = async (sessionID) => {
+    if (!sessionID) return;
+    try {
+      const messages = await fetchMessages(sessionID);
+      if (!messages) return;
+      const fs = await import("fs");
+      const path = await import("path");
+      const cacheDir = path.join(directory, ".git", "shiftlog");
+      fs.mkdirSync(cacheDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(cacheDir, "opencode-session.json"),
+        JSON.stringify({ session_id: sessionID, transcript: messages })
+      );
+    } catch (e) {
+      // Silently ignore - cache is best-effort
+    }
+  };
+
   return {
     "tool.execute.before": async (input, output) => {
       const command = output?.args?.command || output?.args?.cmd || "";
@@ -35,27 +79,16 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
     },
 
     "tool.execute.after": async (input, output) => {
+      // Keep the session cache fresh on every tool call, not just commits,
+      // so it's available for a subsequent manual commit.
+      await cacheSession(input.sessionID);
+
       const pending = pendingCommits.get(input.callID);
       if (!pending) return;
       pendingCommits.delete(input.callID);
 
-      // Try to fetch messages via the SDK client API
-      let transcriptData = "";
-      if (client && pending.sessionID) {
-        try {
-          const msgs = await client.session.messages({ path: { id: pending.sessionID } });
-          if (msgs && Array.isArray(msgs)) {
-            transcriptData = JSON.stringify(msgs.map(m => ({
-              role: m.role || "",
-              id: m.id || "",
-              content: m.content || "",
-              time: m.time || {},
-            })));
-          }
-        } catch (e) {
-          // Fall back to data_dir approach below
-        }
-      }
+      const messages = await fetchMessages(pending.sessionID);
+      const transcriptData = messages ? JSON.stringify(messages) : "";
 
       const dataDir = process.platform === "darwin"
           ? process.env.HOME + "/Library/Application Support/opencode"
