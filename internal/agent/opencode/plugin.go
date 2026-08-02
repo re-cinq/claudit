@@ -48,7 +48,7 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
             transcriptData = JSON.stringify(msgs.map(m => ({
               role: m.role || "",
               id: m.id || "",
-              content: m.content || "",
+              parts: m.parts || m.content || [],
               time: m.time || {},
             })));
           }
