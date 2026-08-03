@@ -1,13 +1,16 @@
+```go
 package opencode
 
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -32,6 +35,21 @@ func GetDataDir() (string, error) {
 		return "", fmt.Errorf("could not determine home directory: %w", err)
 	}
 	return filepath.Join(home, ".local", "share", "opencode"), nil
+}
+
+// dataDirCandidates returns the locations OpenCode may store project data in,
+// most-preferred first: the global XDG/Application Support directory, and a
+// project-local .opencode directory. Recent OpenCode releases have shifted
+// where session data lives, so both are checked during session discovery.
+func dataDirCandidates(projectPath string) []string {
+	var dirs []string
+	if global, err := GetDataDir(); err == nil {
+		dirs = append(dirs, global)
+	}
+	if projectPath != "" {
+		dirs = append(dirs, filepath.Join(projectPath, ".opencode"))
+	}
+	return dirs
 }
 
 // GetProjectID returns the project identifier for OpenCode.
@@ -127,3 +145,74 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+
+// sessionFileCandidate is a session JSON file discovered during a recursive
+// storage search, along with its modification time.
+type sessionFileCandidate struct {
+	SessionID string
+	Path      string
+	ModTime   time.Time
+}
+
+// findSessionFiles recursively walks dataDir/storage for *.json files that
+// live under a directory named "session", returning candidates modified
+// within recentTimeout. OpenCode has changed the nesting depth of session
+// storage across releases (e.g. adding a "project/" prefix or an "info"
+// subdirectory), so this does not assume the fixed depth that GetSessionDir
+// does — it's a fallback for when the fixed-path lookup finds nothing.
+func findSessionFiles(dataDir string, recentTimeout time.Duration) []sessionFileCandidate {
+	storageDir := filepath.Join(dataDir, "storage")
+
+	var candidates []sessionFileCandidate
+	now := time.Now()
+
+	_ = filepath.WalkDir(storageDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+		if !strings.Contains(filepath.ToSlash(filepath.Dir(path)), "session") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > recentTimeout {
+			return nil
+		}
+
+		candidates = append(candidates, sessionFileCandidate{
+			SessionID: strings.TrimSuffix(d.Name(), ".json"),
+			Path:      path,
+			ModTime:   modTime,
+		})
+		return nil
+	})
+
+	return candidates
+}
+
+// findMessageDir recursively searches dataDir/storage for a directory
+// belonging to the given session, tolerating layout changes that the fixed
+// storage/message/<sessionID> path assumed by GetMessageDir doesn't cover.
+func findMessageDir(dataDir, sessionID string) string {
+	storageDir := filepath.Join(dataDir, "storage")
+
+	var found string
+	_ = filepath.WalkDir(storageDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() && d.Name() == sessionID {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+
+	return found
+}
+```
