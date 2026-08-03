@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +129,123 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// sessionTreeRecord captures the fields we care about from an OpenCode
+// session info JSON file, regardless of where under storage/session it lives.
+type sessionTreeRecord struct {
+	ID        string `json:"id"`
+	ProjectID string `json:"projectID"`
+	Directory string `json:"directory"`
+	Time      struct {
+		Created float64 `json:"created"`
+		Updated float64 `json:"updated"`
+	} `json:"time"`
+}
+
+// recordModTime returns the best-effort timestamp for a session record,
+// preferring the record's own "updated"/"created" fields (epoch millis)
+// over the file's mtime.
+func recordModTime(rec sessionTreeRecord) time.Time {
+	ms := rec.Time.Updated
+	if ms == 0 {
+		ms = rec.Time.Created
+	}
+	if ms == 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(int64(ms))
+}
+
+// findMessageDir locates the directory containing message files for a
+// session, trying known OpenCode storage layouts in order. Falls back to
+// the legacy path if none of the candidates exist yet.
+func findMessageDir(dataDir, sessionID string) string {
+	candidates := []string{
+		filepath.Join(dataDir, "storage", "message", sessionID),
+		filepath.Join(dataDir, "storage", "session", "message", sessionID),
+		filepath.Join(dataDir, "storage", "session", sessionID, "message"),
+	}
+	for _, c := range candidates {
+		if info, err := os.Stat(c); err == nil && info.IsDir() {
+			return c
+		}
+	}
+	return candidates[0]
+}
+
+// discoverFromSessionTree walks the OpenCode storage/session directory
+// looking for a session info file belonging to projectPath. Newer OpenCode
+// releases have moved session info files around (e.g. under
+// storage/session/info/<id>.json rather than storage/session/<projectID>/<id>.json
+// used by pre-v1.2 releases), so this scans recursively and matches sessions
+// by their recorded "directory"/"projectID" fields instead of assuming a
+// fixed directory layout.
+func discoverFromSessionTree(dataDir, projectPath string) (*agent.SessionInfo, error) {
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	if info, err := os.Stat(sessionRoot); err != nil || !info.IsDir() {
+		return nil, nil
+	}
+
+	projectID := GetProjectID(projectPath)
+	now := time.Now()
+
+	var bestID string
+	var bestModTime time.Time
+
+	_ = filepath.WalkDir(sessionRoot, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return nil
+		}
+
+		var rec sessionTreeRecord
+		if jsonErr := json.Unmarshal(data, &rec); jsonErr != nil || rec.ID == "" {
+			return nil
+		}
+
+		// Scope to this project using whatever identifying field is present.
+		if rec.Directory != "" {
+			if !agent.PathsEqual(rec.Directory, projectPath) {
+				return nil
+			}
+		} else if rec.ProjectID != "" {
+			if rec.ProjectID != projectID {
+				return nil
+			}
+		}
+
+		modTime := recordModTime(rec)
+		if modTime.IsZero() {
+			if fi, statErr := d.Info(); statErr == nil {
+				modTime = fi.ModTime()
+			}
+		}
+
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return nil
+		}
+
+		if bestID == "" || modTime.After(bestModTime) {
+			bestID = rec.ID
+			bestModTime = modTime
+		}
+
+		return nil
+	})
+
+	if bestID == "" {
+		return nil, nil
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      bestID,
+		TranscriptPath: findMessageDir(dataDir, bestID),
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
 }
