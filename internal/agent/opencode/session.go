@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +129,109 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// foundSession is a session located by walking OpenCode's storage tree.
+type foundSession struct {
+	SessionID string
+	ModTime   time.Time
+}
+
+// findRecentProjectSession locates the most recently modified session
+// belonging to projectID/projectPath within dataDir/storage.
+//
+// OpenCode has changed how it nests session files on disk across releases
+// (flat per-project directories, then SQLite, and layouts in between), so
+// rather than assuming one fixed directory depth we walk the whole storage
+// tree and match on the session file's own identifying fields (or, for the
+// legacy layout, on the projectID appearing as a path segment). This keeps
+// discovery working across those on-disk layout changes.
+func findRecentProjectSession(dataDir, projectID, projectPath string) *foundSession {
+	storageRoot := filepath.Join(dataDir, "storage")
+	now := time.Now()
+
+	var best *foundSession
+
+	_ = filepath.WalkDir(storageRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		rel, err := filepath.Rel(storageRoot, path)
+		if err != nil {
+			return nil
+		}
+		if hasPathSegment(rel, "message") || hasPathSegment(rel, "messages") {
+			return nil // session messages live here, not session info
+		}
+
+		info, err := d.Info()
+		if err != nil || now.Sub(info.ModTime()) > agent.RecentSessionTimeout {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		var fields struct {
+			ID        string `json:"id"`
+			ProjectID string `json:"projectID"`
+			Directory string `json:"directory"`
+			CWD       string `json:"cwd"`
+		}
+		if err := json.Unmarshal(data, &fields); err != nil || fields.ID == "" {
+			return nil
+		}
+
+		matches := fields.ProjectID == projectID ||
+			fields.Directory == projectPath ||
+			fields.CWD == projectPath ||
+			hasPathSegment(rel, projectID)
+		if !matches {
+			return nil
+		}
+
+		if best == nil || info.ModTime().After(best.ModTime) {
+			best = &foundSession{SessionID: fields.ID, ModTime: info.ModTime()}
+		}
+		return nil
+	})
+
+	return best
+}
+
+// findMessageDir locates the message directory for sessionID under
+// dataDir/storage, preferring the known storage/message/<sessionID> path but
+// falling back to a tree search since newer OpenCode versions nest it
+// differently.
+func findMessageDir(dataDir, sessionID string) string {
+	direct := filepath.Join(dataDir, "storage", "message", sessionID)
+	if info, err := os.Stat(direct); err == nil && info.IsDir() {
+		return direct
+	}
+
+	storageRoot := filepath.Join(dataDir, "storage")
+	var found string
+	_ = filepath.WalkDir(storageRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil || found != "" {
+			return nil
+		}
+		if d.IsDir() && d.Name() == sessionID {
+			found = path
+		}
+		return nil
+	})
+	return found
+}
+
+// hasPathSegment reports whether rel contains seg as a whole path segment.
+func hasPathSegment(rel, seg string) bool {
+	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
+		if part == seg {
+			return true
+		}
+	}
+	return false
 }
