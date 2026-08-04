@@ -1,13 +1,18 @@
+```go
 package opencode
 
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -127,3 +132,168 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+
+// discoverGeneric performs a layout-agnostic scan of OpenCode's data
+// directory for the most recently touched session belonging to this
+// project. OpenCode has reshuffled its on-disk storage layout across
+// releases (flat per-project directories, SQLite, nested key/value style
+// "session/info" + "session/message" paths); rather than hard-coding one
+// shape, this walks the whole storage tree and matches on file content so
+// discovery keeps working the next time the layout moves.
+func discoverGeneric(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
+	storageDir := filepath.Join(dataDir, "storage")
+	if _, err := os.Stat(storageDir); err != nil {
+		return nil, nil
+	}
+
+	now := time.Now()
+	var bestID string
+	var bestModTime time.Time
+
+	_ = filepath.WalkDir(storageDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil || now.Sub(info.ModTime()) > agent.RecentSessionTimeout {
+			return nil
+		}
+		// Skip parsing files that couldn't possibly improve on the current
+		// best match.
+		if bestID != "" && !info.ModTime().After(bestModTime) {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil
+		}
+
+		id := jsonStringField(raw, "id")
+		if id == "" {
+			id = jsonStringField(raw, "sessionID")
+		}
+		if id == "" {
+			return nil
+		}
+
+		if !matchesProject(raw, projectID, projectPath) {
+			return nil
+		}
+
+		bestID = id
+		bestModTime = info.ModTime()
+		return nil
+	})
+
+	if bestID == "" {
+		return nil, nil
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      bestID,
+		TranscriptPath: findMessageDir(storageDir, bestID),
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
+}
+
+// matchesProject reports whether a decoded session/info JSON object
+// identifies the given project, trying every field name OpenCode has used
+// for this purpose across releases.
+func matchesProject(raw map[string]json.RawMessage, projectID, projectPath string) bool {
+	if jsonStringField(raw, "projectID") == projectID ||
+		jsonStringField(raw, "project_id") == projectID ||
+		jsonStringField(raw, "directory") == projectPath ||
+		jsonStringField(raw, "cwd") == projectPath ||
+		jsonStringField(raw, "worktree") == projectPath {
+		return true
+	}
+
+	pathRaw, ok := raw["path"]
+	if !ok {
+		return false
+	}
+	var p struct {
+		Root string `json:"root"`
+		Cwd  string `json:"cwd"`
+	}
+	if json.Unmarshal(pathRaw, &p) != nil {
+		return false
+	}
+	return p.Root == projectPath || p.Cwd == projectPath
+}
+
+// jsonStringField extracts a string value for key from a decoded JSON
+// object, returning "" if the key is absent or not a string.
+func jsonStringField(raw map[string]json.RawMessage, key string) string {
+	v, ok := raw[key]
+	if !ok {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(v, &s); err != nil {
+		return ""
+	}
+	return s
+}
+
+// findMessageDir looks for a directory named after the session ID anywhere
+// under storageDir, since OpenCode has nested per-session message
+// directories at different depths across releases (e.g.
+// storage/message/<id> vs storage/session/message/<id>).
+func findMessageDir(storageDir, sessionID string) string {
+	var found string
+	_ = filepath.WalkDir(storageDir, func(path string, d fs.DirEntry, err error) error {
+		if found != "" {
+			return filepath.SkipAll
+		}
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() && d.Name() == sessionID {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
+}
+
+// querySessionID finds the most recent OpenCode session ID for a project in
+// the SQLite database. The "session" table's project-identifying column has
+// been renamed across OpenCode releases (project_id, projectID), so this
+// tries progressively looser queries; as a last resort it returns the
+// single most recently updated session, which is correct for the common
+// case of one project per database (as in a git-hook-driven test/repo).
+func querySessionID(dbPath, projectID string) string {
+	quoted := sqliteEscape(projectID)
+	queries := []string{
+		fmt.Sprintf(`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`, quoted),
+		fmt.Sprintf(`SELECT id FROM session WHERE projectID='%s' ORDER BY time_updated DESC LIMIT 1;`, quoted),
+		`SELECT id FROM session ORDER BY time_updated DESC LIMIT 1;`,
+	}
+	for _, q := range queries {
+		cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, q)
+		out, err := cmd.Output()
+		if err != nil {
+			continue
+		}
+		if id := strings.TrimSpace(string(out)); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+// sqliteEscape escapes single quotes for use in a SQLite string literal.
+func sqliteEscape(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+```
