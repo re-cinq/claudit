@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -230,9 +231,12 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// OpenCode has changed its on-disk storage layout across versions, so this
+// tries several strategies in order: a known flat-file layout, a bounded
+// recursive search that tolerates layout changes (nested session/message
+// directories, project-scoped subtrees, etc.), and finally SQLite storage.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
+	// Try the known flat file storage layout first.
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
 		return nil, err
@@ -241,7 +245,18 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
+	// Fall back to a resilient recursive search of the data directory. This
+	// tolerates storage layout changes between OpenCode versions instead of
+	// depending on one hard-coded directory shape.
+	session, err = a.discoverFromDataDir(projectPath)
+	if err != nil {
+		return nil, err
+	}
+	if session != nil {
+		return session, nil
+	}
+
+	// Fall back to SQLite, used by some OpenCode variants/versions.
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
@@ -302,6 +317,132 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// discoverFromDataDir performs a bounded recursive search of OpenCode's data
+// directory for the most recently modified session file. OpenCode has
+// changed its on-disk storage layout across versions (flat per-project
+// directories, nested "session/info" directories, project-scoped subtrees,
+// etc.), so this walk locates sessions by content rather than depending on
+// one fixed directory shape.
+func (a *Agent) discoverFromDataDir(projectPath string) (*agent.SessionInfo, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return nil, nil
+	}
+	if info, err := os.Stat(dataDir); err != nil || !info.IsDir() {
+		return nil, nil
+	}
+
+	projectID := GetProjectID(projectPath)
+	now := time.Now()
+
+	type candidate struct {
+		sessionID string
+		modTime   time.Time
+	}
+	var best *candidate
+
+	baseDepth := strings.Count(filepath.Clean(dataDir), string(filepath.Separator))
+	const maxDepth = 8
+
+	_ = filepath.WalkDir(dataDir, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if strings.Count(path, string(filepath.Separator))-baseDepth > maxDepth {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		slashPath := filepath.ToSlash(path)
+		if !strings.HasSuffix(d.Name(), ".json") || !strings.Contains(slashPath, "session") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return nil
+		}
+		if best != nil && !modTime.After(best.modTime) {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		var sess struct {
+			ID        string `json:"id"`
+			ProjectID string `json:"projectID"`
+			Directory string `json:"directory"`
+		}
+		if err := json.Unmarshal(data, &sess); err != nil || sess.ID == "" {
+			return nil
+		}
+
+		// Scope to this project when the session (via its path or its own
+		// content) records a project identifier; if no such information is
+		// available anywhere, fall back to recency alone.
+		belongsToProject := strings.Contains(slashPath, projectID) ||
+			(sess.ProjectID != "" && sess.ProjectID == projectID) ||
+			(sess.Directory != "" && sess.Directory == projectPath)
+		hasProjectInfo := sess.ProjectID != "" || sess.Directory != "" || strings.Contains(slashPath, "/project/")
+		if hasProjectInfo && !belongsToProject {
+			return nil
+		}
+
+		best = &candidate{sessionID: sess.ID, modTime: modTime}
+		return nil
+	})
+
+	if best == nil {
+		return nil, nil
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      best.sessionID,
+		TranscriptPath: a.findMessageDir(dataDir, best.sessionID),
+		StartedAt:      best.modTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
+}
+
+// findMessageDir searches the data directory for a directory holding message
+// files for the given session, tolerating different storage layouts. It
+// prefers a directory whose path mentions "message" (the conventional
+// location) but falls back to any directory named after the session ID.
+func (a *Agent) findMessageDir(dataDir, sessionID string) string {
+	if msgDir, err := GetMessageDir(sessionID); err == nil {
+		if info, err := os.Stat(msgDir); err == nil && info.IsDir() {
+			return msgDir
+		}
+	}
+
+	var found string
+	_ = filepath.WalkDir(dataDir, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if !d.IsDir() || d.Name() != sessionID {
+			return nil
+		}
+		if strings.Contains(filepath.ToSlash(path), "message") {
+			found = path
+			return filepath.SkipAll
+		}
+		if found == "" {
+			found = path
+		}
+		return nil
+	})
+	return found
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +638,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
