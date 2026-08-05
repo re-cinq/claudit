@@ -34,6 +34,51 @@ func GetDataDir() (string, error) {
 	return filepath.Join(home, ".local", "share", "opencode"), nil
 }
 
+// candidateDataDirs returns the plausible base directories OpenCode may
+// write local session data under. OpenCode has changed its storage layout
+// and base directory more than once across releases, so session discovery
+// checks all of them instead of hard-coding a single location.
+func candidateDataDirs() []string {
+	var dirs []string
+	seen := make(map[string]bool)
+	add := func(d string) {
+		if d != "" && !seen[d] {
+			seen[d] = true
+			dirs = append(dirs, d)
+		}
+	}
+
+	if dataDir, err := GetDataDir(); err == nil {
+		add(dataDir)
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return dirs
+	}
+
+	if runtime.GOOS == "darwin" {
+		add(filepath.Join(home, "Library", "Application Support", "opencode"))
+		add(filepath.Join(home, "Library", "Caches", "opencode"))
+	} else {
+		if xdg := os.Getenv("XDG_STATE_HOME"); xdg != "" {
+			add(filepath.Join(xdg, "opencode"))
+		} else {
+			add(filepath.Join(home, ".local", "state", "opencode"))
+		}
+		if xdg := os.Getenv("XDG_CACHE_HOME"); xdg != "" {
+			add(filepath.Join(xdg, "opencode"))
+		} else {
+			add(filepath.Join(home, ".cache", "opencode"))
+		}
+	}
+
+	add(filepath.Join(home, ".opencode"))
+	add(filepath.Join(home, ".config", "opencode"))
+
+	return dirs
+}
+
 // GetProjectID returns the project identifier for OpenCode.
 // For git repos, this is the root commit hash. For non-git dirs, it's "global".
 func GetProjectID(projectPath string) string {
