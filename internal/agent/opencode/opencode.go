@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -230,9 +231,25 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// OpenCode's on-disk session layout has changed across releases: current
+// releases keep all sessions in a flat directory and record the owning
+// project inside each session file, older releases (pre-v1.2) nested
+// sessions under a project-ID directory, and some builds use a SQLite
+// database instead of JSON files. Each layout is tried in turn so shiftlog
+// keeps working across OpenCode upgrades.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return nil, nil
+	}
+
+	// Current OpenCode releases: flat session directory, project recorded
+	// inside each session file rather than via directory nesting.
+	if session := discoverFromSessionInfo(dataDir, projectPath); session != nil {
+		return session, nil
+	}
+
+	// Pre-v1.2 OpenCode: sessions nested under a project-ID directory.
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
 		return nil, err
@@ -241,14 +258,97 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
-	dataDir, err := GetDataDir()
-	if err != nil {
-		return nil, nil
-	}
-
+	// Some OpenCode builds use a SQLite database instead of JSON files.
 	projectID := GetProjectID(projectPath)
 	return discoverFromSQLite(dataDir, projectID, projectPath)
+}
+
+// discoverFromSessionInfo scans OpenCode's flat session-info storage for the
+// most recently modified session belonging to projectPath. Sessions are
+// matched by the "directory" or "projectID" field recorded inside each
+// session file (see sessionInfo in session.go), not by directory nesting,
+// since current OpenCode releases keep all sessions in one place regardless
+// of which project they belong to.
+func discoverFromSessionInfo(dataDir, projectPath string) *agent.SessionInfo {
+	projectID := GetProjectID(projectPath)
+
+	dirs := []string{
+		filepath.Join(dataDir, "storage", "session", "info"),
+		filepath.Join(dataDir, "storage", "session"),
+	}
+
+	now := time.Now()
+	var best *agent.SessionInfo
+	var bestModTime time.Time
+
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+
+			data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+			if err != nil {
+				continue
+			}
+
+			var info sessionInfo
+			if err := json.Unmarshal(data, &info); err != nil {
+				continue
+			}
+
+			matches := (info.Directory != "" && agent.PathsEqual(info.Directory, projectPath)) ||
+				(info.ProjectID != "" && info.ProjectID == projectID)
+			if !matches {
+				continue
+			}
+
+			fileInfo, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			modTime := fileInfo.ModTime()
+			if now.Sub(modTime) > agent.RecentSessionTimeout {
+				continue
+			}
+
+			if best != nil && !modTime.After(bestModTime) {
+				continue
+			}
+
+			sessionID := info.ID
+			if sessionID == "" {
+				sessionID = strings.TrimSuffix(entry.Name(), ".json")
+			}
+
+			best = &agent.SessionInfo{
+				SessionID:      sessionID,
+				TranscriptPath: resolveMessageDir(dataDir, sessionID),
+				StartedAt:      modTime.Format(time.RFC3339),
+				ProjectPath:    projectPath,
+			}
+			bestModTime = modTime
+		}
+	}
+
+	return best
+}
+
+// resolveMessageDir returns the message directory for a session, checking
+// both the layout used by current OpenCode releases
+// (storage/session/message/<id>) and the older layout
+// (storage/message/<id>) used by discoverFromFlatFiles/GetMessageDir.
+func resolveMessageDir(dataDir, sessionID string) string {
+	nested := filepath.Join(dataDir, "storage", "session", "message", sessionID)
+	if fi, err := os.Stat(nested); err == nil && fi.IsDir() {
+		return nested
+	}
+	return filepath.Join(dataDir, "storage", "message", sessionID)
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -497,4 +597,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
