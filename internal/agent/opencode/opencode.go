@@ -230,9 +230,11 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first tries flat file storage (covering both the legacy per-project
+// directory layout and the newer storage/session/info layout), then falls
+// back to SQLite for OpenCode releases that migrated session storage to a
+// database.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
 		return nil, err
@@ -241,7 +243,7 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
+	// Fall back to SQLite
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
@@ -251,21 +253,76 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 	return discoverFromSQLite(dataDir, projectID, projectPath)
 }
 
-// discoverFromFlatFiles tries the legacy flat file session discovery.
+// discoverFromFlatFiles tries flat file session discovery.
+//
+// OpenCode's on-disk session layout has changed across releases:
+//   - Older releases nest session files under a per-project directory keyed
+//     by project ID: storage/session/<projectID>/<sessionID>.json
+//   - Newer releases store all sessions together under
+//     storage/session/info/<sessionID>.json regardless of project, and
+//     record the originating working directory inside each session's JSON
+//     (a "directory" field) instead of partitioning by directory on disk.
+//     Messages for those sessions live under
+//     storage/session/message/<sessionID>/ rather than storage/message/<sessionID>/.
+//
+// We check the legacy per-project directory first, then fall back to
+// scanning the flat "info" directory and matching sessions by their
+// recorded "directory" field.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
-	if err != nil {
-		return nil, nil
+	projectID := GetProjectID(projectPath)
+	matchAny := func([]byte) bool { return true }
+	matchDirectory := func(data []byte) bool {
+		var s struct {
+			Directory string `json:"directory"`
+		}
+		if err := json.Unmarshal(data, &s); err != nil || s.Directory == "" {
+			return false
+		}
+		return samePath(s.Directory, projectPath)
+	}
+
+	candidates := []struct {
+		dir   string
+		match func([]byte) bool
+	}{
+		{filepath.Join(dataDir, "storage", "session", projectID), matchAny},
+		{filepath.Join(dataDir, "storage", "session", "info"), matchDirectory},
 	}
 
 	now := time.Now()
-	recentTimeout := agent.RecentSessionTimeout
-	var bestSessionID string
+	for _, c := range candidates {
+		sessionID, modTime := newestSessionFile(c.dir, now, c.match)
+		if sessionID == "" {
+			continue
+		}
+
+		return &agent.SessionInfo{
+			SessionID:      sessionID,
+			TranscriptPath: resolveMessageDir(dataDir, sessionID),
+			StartedAt:      modTime.Format(time.RFC3339),
+			ProjectPath:    projectPath,
+		}, nil
+	}
+
+	return nil, nil
+}
+
+// newestSessionFile returns the session ID (filename without ".json") and
+// mod time of the most recently modified, recently-active ".json" file in
+// dir for which match(fileContent) returns true. Returns ("", zero time) if
+// dir doesn't exist or no file qualifies.
+func newestSessionFile(dir string, now time.Time, match func([]byte) bool) (string, time.Time) {
+	dirEntries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", time.Time{}
+	}
+
+	var bestID string
 	var bestModTime time.Time
 
 	for _, entry := range dirEntries {
@@ -279,29 +336,48 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		}
 
 		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			continue
+		}
+		if bestID != "" && !modTime.After(bestModTime) {
 			continue
 		}
 
-		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
-			bestModTime = modTime
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil || !match(data) {
+			continue
 		}
+
+		bestID = strings.TrimSuffix(entry.Name(), ".json")
+		bestModTime = modTime
 	}
 
-	if bestSessionID == "" {
-		return nil, nil
+	return bestID, bestModTime
+}
+
+// resolveMessageDir returns the message storage directory for a session,
+// checking both the current (storage/session/message/<id>) and legacy
+// (storage/message/<id>) OpenCode layouts and preferring whichever exists.
+func resolveMessageDir(dataDir, sessionID string) string {
+	current := filepath.Join(dataDir, "storage", "session", "message", sessionID)
+	legacy := filepath.Join(dataDir, "storage", "message", sessionID)
+
+	if info, err := os.Stat(current); err == nil && info.IsDir() {
+		return current
 	}
+	return legacy
+}
 
-	// The transcript path for OpenCode is the message directory
-	msgDir, _ := GetMessageDir(bestSessionID)
-
-	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: msgDir,
-		StartedAt:      bestModTime.Format(time.RFC3339),
-		ProjectPath:    projectPath,
-	}, nil
+// samePath reports whether two paths refer to the same location on disk,
+// resolving symlinks so a canonicalized path recorded by OpenCode still
+// matches a caller-supplied path that hasn't been resolved.
+func samePath(a, b string) bool {
+	if a == b {
+		return true
+	}
+	ra, errA := filepath.EvalSymlinks(a)
+	rb, errB := filepath.EvalSymlinks(b)
+	return errA == nil && errB == nil && ra == rb
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +573,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
