@@ -35,8 +35,18 @@ func GetDataDir() (string, error) {
 }
 
 // GetProjectID returns the project identifier for OpenCode.
-// For git repos, this is the root commit hash. For non-git dirs, it's "global".
+//
+// OpenCode generates this ID once and caches it in the repo's git directory
+// (<gitdir>/opencode) so it stays stable across history rewrites (rebases,
+// squashes) that would otherwise change the root commit hash. We read that
+// cache when present so our lookups line up with OpenCode's own project
+// keying. If no cache exists yet, fall back to the root commit hash. Non-git
+// dirs use "global".
 func GetProjectID(projectPath string) string {
+	if cached := readCachedProjectID(projectPath); cached != "" {
+		return cached
+	}
+
 	cmd := exec.Command("git", "rev-list", "--max-parents=0", "--all")
 	cmd.Dir = projectPath
 	output, err := cmd.Output()
@@ -50,6 +60,50 @@ func GetProjectID(projectPath string) string {
 		return strings.TrimSpace(lines[0])
 	}
 	return "global"
+}
+
+// readCachedProjectID reads OpenCode's own cached project ID from
+// <gitdir>/opencode, returning "" if it doesn't exist or can't be resolved.
+func readCachedProjectID(projectPath string) string {
+	gitDir := resolveGitDir(projectPath)
+	if gitDir == "" {
+		return ""
+	}
+
+	data, err := os.ReadFile(filepath.Join(gitDir, "opencode"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// resolveGitDir returns the .git directory for projectPath, following the
+// "gitdir: ..." pointer file used by worktrees and submodules.
+func resolveGitDir(projectPath string) string {
+	gitDir := filepath.Join(projectPath, ".git")
+	info, err := os.Stat(gitDir)
+	if err != nil {
+		return ""
+	}
+
+	if info.IsDir() {
+		return gitDir
+	}
+
+	// .git is a file: worktree/submodule pointer ("gitdir: /path/to/.git/...")
+	content, err := os.ReadFile(gitDir)
+	if err != nil {
+		return ""
+	}
+	parts := strings.SplitN(strings.TrimSpace(string(content)), ": ", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	resolved := parts[1]
+	if !filepath.IsAbs(resolved) {
+		resolved = filepath.Join(projectPath, resolved)
+	}
+	return resolved
 }
 
 // GetSessionDir returns the session storage directory for a project.
