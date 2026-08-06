@@ -34,6 +34,43 @@ func GetDataDir() (string, error) {
 	return filepath.Join(home, ".local", "share", "opencode"), nil
 }
 
+// stateDataDir returns the OpenCode state directory (XDG_STATE_HOME/opencode).
+// Recent OpenCode releases store session/message state here rather than
+// under XDG_DATA_HOME. On macOS there is no separate state directory
+// convention, so this matches GetDataDir.
+func stateDataDir() (string, error) {
+	if runtime.GOOS == "darwin" {
+		return GetDataDir()
+	}
+
+	if xdg := os.Getenv("XDG_STATE_HOME"); xdg != "" {
+		return filepath.Join(xdg, "opencode"), nil
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("could not determine home directory: %w", err)
+	}
+	return filepath.Join(home, ".local", "state", "opencode"), nil
+}
+
+// CandidateDataDirs returns the OpenCode data directories to search for
+// session/message storage, in priority order. OpenCode has relocated
+// session state between XDG_DATA_HOME and XDG_STATE_HOME across versions,
+// so both are checked to keep session discovery working across versions.
+func CandidateDataDirs() ([]string, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return nil, err
+	}
+
+	sDir, sErr := stateDataDir()
+	if sErr != nil || sDir == dataDir {
+		return []string{dataDir}, nil
+	}
+	return []string{sDir, dataDir}, nil
+}
+
 // GetProjectID returns the project identifier for OpenCode.
 // For git repos, this is the root commit hash. For non-git dirs, it's "global".
 func GetProjectID(projectPath string) string {
@@ -71,6 +108,18 @@ func GetMessageDir(sessionID string) (string, error) {
 	}
 
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
+}
+
+// sessionDirIn returns the session storage directory for a project under a
+// specific OpenCode data directory.
+func sessionDirIn(dataDir, projectID string) string {
+	return filepath.Join(dataDir, "storage", "session", projectID)
+}
+
+// messageDirIn returns the message storage directory for a session under a
+// specific OpenCode data directory.
+func messageDirIn(dataDir, sessionID string) string {
+	return filepath.Join(dataDir, "storage", "message", sessionID)
 }
 
 // sessionInfo represents an OpenCode session JSON file.
