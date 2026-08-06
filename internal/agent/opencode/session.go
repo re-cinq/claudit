@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -37,6 +38,16 @@ func GetDataDir() (string, error) {
 // GetProjectID returns the project identifier for OpenCode.
 // For git repos, this is the root commit hash. For non-git dirs, it's "global".
 func GetProjectID(projectPath string) string {
+	// Modern OpenCode CLI (v1.x+) persists its own stable project identifier
+	// at .git/opencode the first time it runs in a repo, and keys its
+	// session/message storage by that value instead of the root commit hash
+	// (which changes across rebases/squashes). Prefer it when present.
+	if data, err := os.ReadFile(filepath.Join(projectPath, ".git", "opencode")); err == nil {
+		if id := strings.TrimSpace(string(data)); id != "" {
+			return id
+		}
+	}
+
 	cmd := exec.Command("git", "rev-list", "--max-parents=0", "--all")
 	cmd.Dir = projectPath
 	output, err := cmd.Output()
@@ -111,6 +122,10 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 		return "", fmt.Errorf("could not write session file: %w", err)
 	}
 
+	if err := os.WriteFile(sessionPath, data, 0600); err != nil {
+		return "", fmt.Errorf("could not write session file: %w", err)
+	}
+
 	// Write messages from transcript data
 	msgDir, err := GetMessageDir(sessionID)
 	if err != nil {
@@ -127,3 +142,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
