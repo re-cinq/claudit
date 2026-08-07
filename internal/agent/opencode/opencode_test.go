@@ -49,8 +49,9 @@ func TestParseHookInput(t *testing.T) {
 	if hook.Command != "git commit -m test" {
 		t.Errorf("Command = %q, want %q", hook.Command, "git commit -m test")
 	}
-	// TranscriptPath should be constructed from data_dir + session_id
-	expectedPath := filepath.Join("/home/user/.local/share/opencode", "storage", "message", "sess-1")
+	// TranscriptPath should be constructed from data_dir + session_id, under
+	// OpenCode's storage/session/message namespace.
+	expectedPath := filepath.Join("/home/user/.local/share/opencode", "storage", "session", "message", "sess-1")
 	if hook.TranscriptPath != expectedPath {
 		t.Errorf("TranscriptPath = %q, want %q", hook.TranscriptPath, expectedPath)
 	}
