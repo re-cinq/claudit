@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -230,7 +231,12 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first tries flat file storage (pre-v1.2), then falls back to SQLite
+// (v1.2+), and finally falls back to a version-agnostic scan of the data
+// directory. OpenCode's on-disk storage layout and project identification
+// scheme have changed across releases, so the scan-based fallback exists to
+// keep discovery working even when neither known layout matches the
+// installed OpenCode version.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
@@ -241,14 +247,21 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
+	// Fall back to SQLite (OpenCode v1.2+)
 	projectID := GetProjectID(projectPath)
-	return discoverFromSQLite(dataDir, projectID, projectPath)
+	if session, _ := discoverFromSQLite(dataDir, projectID, projectPath); session != nil {
+		return session, nil
+	}
+
+	// Last resort: scan the data directory for the most recently written
+	// session/message file, regardless of the directory layout or project
+	// identification scheme used by the installed OpenCode version.
+	return discoverFromRecentFiles(dataDir, projectPath)
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -379,6 +392,101 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	}, nil
 }
 
+// maxDiscoveryFilesScanned bounds the recency scan so a large, long-lived
+// OpenCode data directory can't make every commit's post-commit hook slow.
+const maxDiscoveryFilesScanned = 5000
+
+// discoverFromRecentFiles is a version-agnostic fallback that scans the
+// OpenCode data directory for the most recently written session or message
+// file, without assuming any particular directory layout. OpenCode has
+// changed its on-disk storage format (and project identification scheme)
+// across releases; this fallback keeps session discovery working even when
+// neither discoverFromFlatFiles nor discoverFromSQLite matches the
+// installed version's layout.
+func discoverFromRecentFiles(dataDir, projectPath string) (*agent.SessionInfo, error) {
+	info, err := os.Stat(dataDir)
+	if err != nil || !info.IsDir() {
+		return nil, nil
+	}
+
+	now := time.Now()
+	var bestPath string
+	var bestModTime time.Time
+	scanned := 0
+
+	_ = filepath.WalkDir(dataDir, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil // skip unreadable entries rather than aborting the scan
+		}
+		if d.IsDir() {
+			return nil
+		}
+
+		name := strings.ToLower(d.Name())
+		if !strings.HasSuffix(name, ".json") && !strings.HasSuffix(name, ".jsonl") {
+			return nil
+		}
+
+		lowerPath := strings.ToLower(path)
+		if !strings.Contains(lowerPath, "session") && !strings.Contains(lowerPath, "message") {
+			return nil
+		}
+
+		scanned++
+		if scanned > maxDiscoveryFilesScanned {
+			return filepath.SkipAll
+		}
+
+		fi, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		modTime := fi.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return nil
+		}
+
+		if bestPath == "" || modTime.After(bestModTime) {
+			bestPath = path
+			bestModTime = modTime
+		}
+		return nil
+	})
+
+	if bestPath == "" {
+		return nil, nil
+	}
+
+	// OpenCode typically stores one file per message under a per-session
+	// directory. If the most recent file has siblings, treat the parent
+	// directory as the transcript bundle; otherwise treat the file itself
+	// as the transcript source.
+	parent := filepath.Dir(bestPath)
+	sessionID := strings.TrimSuffix(filepath.Base(bestPath), filepath.Ext(bestPath))
+	transcriptPath := bestPath
+
+	if siblings, err := os.ReadDir(parent); err == nil {
+		fileCount := 0
+		for _, s := range siblings {
+			if !s.IsDir() {
+				fileCount++
+			}
+		}
+		if fileCount > 1 {
+			transcriptPath = parent
+			sessionID = filepath.Base(parent)
+		}
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      sessionID,
+		TranscriptPath: transcriptPath,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
+}
+
 // RestoreSession writes a session to OpenCode's storage location.
 func (a *Agent) RestoreSession(projectPath, sessionID, gitBranch string,
 	transcriptData []byte, messageCount int, summary string) error {
@@ -497,4 +605,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
