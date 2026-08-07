@@ -316,9 +316,19 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
+	// Find most recent session for this project.
+	//
+	// We deliberately order by rowid rather than a timestamp column such as
+	// time_updated: OpenCode's SQLite schema has renamed/dropped timestamp
+	// columns across releases, and unlike the freshness check below, a
+	// failed ORDER BY here would abort the whole query (sqlite3 exits
+	// non-zero on an unknown column) and silently make DiscoverSession
+	// return nothing even though a valid session exists. rowid is an
+	// implicit column present on every ordinary SQLite table and reliably
+	// reflects insertion order, so it survives schema changes to the
+	// explicit columns.
 	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
+		`SELECT id FROM session WHERE project_id='%s' ORDER BY rowid DESC LIMIT 1;`,
 		projectID,
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
@@ -328,7 +338,10 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	}
 	sessionID := strings.TrimSpace(string(sessionOutput))
 
-	// Check if this session was recent (within timeout)
+	// Check if this session was recent (within timeout). This check is
+	// best-effort: if the time_updated column doesn't exist in the
+	// installed OpenCode version's schema, the query errors and we simply
+	// skip the freshness check rather than failing discovery outright.
 	timeQuery := fmt.Sprintf(
 		`SELECT time_updated FROM session WHERE id='%s';`,
 		sessionID,
@@ -353,9 +366,11 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
 
-	// Get messages for this session as a JSON array
+	// Get messages for this session as a JSON array, in insertion order.
+	// As above, rowid is used instead of a timestamp column so a renamed or
+	// missing time_created column can't make this query fail outright.
 	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
+		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY rowid;`,
 		sessionID,
 	)
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
@@ -497,4 +512,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
