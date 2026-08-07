@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -73,6 +74,36 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// GetSessionMessageDirs returns candidate directories that may hold message
+// files for a session, covering both the legacy ("storage/message/<id>")
+// and nested ("storage/session/message/<id>") OpenCode storage layouts.
+func GetSessionMessageDirs(sessionID string) ([]string, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return nil, err
+	}
+
+	return []string{
+		filepath.Join(dataDir, "storage", "session", "message", sessionID),
+		filepath.Join(dataDir, "storage", "message", sessionID),
+	}, nil
+}
+
+// GetSessionPartDirs returns candidate directories that may hold message
+// "part" files (streamed content chunks used by newer OpenCode versions
+// that split message content out of the message metadata file).
+func GetSessionPartDirs(sessionID string) ([]string, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return nil, err
+	}
+
+	return []string{
+		filepath.Join(dataDir, "storage", "session", "part", sessionID),
+		filepath.Join(dataDir, "storage", "part", sessionID),
+	}, nil
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
@@ -127,3 +158,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
