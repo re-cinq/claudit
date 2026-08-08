@@ -35,8 +35,16 @@ func GetDataDir() (string, error) {
 }
 
 // GetProjectID returns the project identifier for OpenCode.
-// For git repos, this is the root commit hash. For non-git dirs, it's "global".
+// OpenCode (v1.15+) caches its own project identifier in <gitDir>/opencode so
+// that its storage keys stay stable across history rewrites. When that cache
+// file is present, its value is authoritative and must be used to match
+// OpenCode's own session storage. Otherwise, for git repos, the root commit
+// hash is used. For non-git dirs, it's "global".
 func GetProjectID(projectPath string) string {
+	if id := readCachedProjectID(projectPath); id != "" {
+		return id
+	}
+
 	cmd := exec.Command("git", "rev-list", "--max-parents=0", "--all")
 	cmd.Dir = projectPath
 	output, err := cmd.Output()
@@ -50,6 +58,51 @@ func GetProjectID(projectPath string) string {
 		return strings.TrimSpace(lines[0])
 	}
 	return "global"
+}
+
+// readCachedProjectID reads OpenCode's own cached project identifier from
+// <gitDir>/opencode, if present. Returns "" if no cache file exists (e.g.
+// pre-v1.15 OpenCode, or OpenCode hasn't run in this repo yet).
+func readCachedProjectID(projectPath string) string {
+	gitDir, err := resolveGitDir(projectPath)
+	if err != nil {
+		return ""
+	}
+
+	data, err := os.ReadFile(filepath.Join(gitDir, "opencode"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// resolveGitDir returns the .git directory for projectPath, following the
+// gitdir pointer file used by worktrees and submodules.
+func resolveGitDir(projectPath string) (string, error) {
+	gitPath := filepath.Join(projectPath, ".git")
+	info, err := os.Stat(gitPath)
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() {
+		return gitPath, nil
+	}
+
+	// Worktrees/submodules: .git is a file containing "gitdir: <path>"
+	data, err := os.ReadFile(gitPath)
+	if err != nil {
+		return "", err
+	}
+	const prefix = "gitdir:"
+	line := strings.TrimSpace(string(data))
+	if !strings.HasPrefix(line, prefix) {
+		return "", fmt.Errorf("unrecognized .git file format")
+	}
+	dir := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(projectPath, dir)
+	}
+	return dir, nil
 }
 
 // GetSessionDir returns the session storage directory for a project.
