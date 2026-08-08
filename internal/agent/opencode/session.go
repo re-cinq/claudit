@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -35,8 +36,18 @@ func GetDataDir() (string, error) {
 }
 
 // GetProjectID returns the project identifier for OpenCode.
-// For git repos, this is the root commit hash. For non-git dirs, it's "global".
+// Recent OpenCode versions generate a stable per-repo ID the first time they
+// run in a repository and cache it at <repoRoot>/.git/opencode, reusing it on
+// subsequent runs instead of recomputing it from the commit graph. Shiftlog
+// must read that same cached ID so its session lookups land in the directory
+// OpenCode actually wrote to. If OpenCode hasn't run in this repo yet (no
+// cache file), fall back to the legacy root-commit-hash scheme; for non-git
+// dirs, it's "global".
 func GetProjectID(projectPath string) string {
+	if id, ok := readCachedProjectID(projectPath); ok {
+		return id
+	}
+
 	cmd := exec.Command("git", "rev-list", "--max-parents=0", "--all")
 	cmd.Dir = projectPath
 	output, err := cmd.Output()
@@ -50,6 +61,20 @@ func GetProjectID(projectPath string) string {
 		return strings.TrimSpace(lines[0])
 	}
 	return "global"
+}
+
+// readCachedProjectID reads OpenCode's cached project ID from
+// <projectPath>/.git/opencode, if present.
+func readCachedProjectID(projectPath string) (string, bool) {
+	data, err := os.ReadFile(filepath.Join(projectPath, ".git", "opencode"))
+	if err != nil {
+		return "", false
+	}
+	id := strings.TrimSpace(string(data))
+	if id == "" {
+		return "", false
+	}
+	return id, true
 }
 
 // GetSessionDir returns the session storage directory for a project.
@@ -127,3 +152,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
