@@ -1,9 +1,11 @@
 package opencode
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -230,7 +232,12 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It tries flat file storage (pre-v1.2), then SQLite (an intermediate
+// storage format used by some v1.x releases), and finally falls back to a
+// schema-agnostic directory walk. OpenCode's on-disk storage layout has
+// changed across versions, so the walk-based fallback doesn't assume any
+// particular file layout: it just finds the most recently touched
+// session/message data under the data directory.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
@@ -241,14 +248,20 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
+	// Fall back to SQLite (some OpenCode v1.x releases)
 	projectID := GetProjectID(projectPath)
-	return discoverFromSQLite(dataDir, projectID, projectPath)
+	if session, _ := discoverFromSQLite(dataDir, projectID, projectPath); session != nil {
+		return session, nil
+	}
+
+	// Last resort: walk the data directory for the most recently touched
+	// session, independent of the exact on-disk schema in use.
+	return discoverFromWalk(dataDir, projectPath), nil
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -379,6 +392,201 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	}, nil
 }
 
+// walkCategoryWords are path segments that name a bucket of records rather
+// than identify a specific session (e.g. "session/info/<id>.json" or
+// "session/message/<id>/<msgID>.json"). They're skipped when looking for the
+// session identifier that follows a "session" path segment.
+var walkCategoryWords = map[string]bool{
+	"info":     true,
+	"message":  true,
+	"messages": true,
+	"part":     true,
+	"parts":    true,
+	"data":     true,
+	"meta":     true,
+	"metadata": true,
+}
+
+// sessionKeyForPath derives a session grouping key from a file's path
+// relative to the OpenCode data directory root. OpenCode's on-disk layout
+// has changed across versions (flat files, SQLite, and others), so rather
+// than assuming an exact schema this looks for a "session" path segment and
+// uses the next non-category segment as the session identifier (handling
+// layouts like session/<id>.json, session/info/<id>.json, and
+// session/message/<id>/<msgID>.json alike). If no "session" segment is
+// found, it falls back to a "message"/"messages" segment, and finally to the
+// file's own base name.
+func sessionKeyForPath(root, path string) string {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return ""
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+
+	for i, part := range parts {
+		if strings.ToLower(part) != "session" {
+			continue
+		}
+		for j := i + 1; j < len(parts); j++ {
+			base := stripJSONExt(parts[j])
+			if walkCategoryWords[strings.ToLower(base)] {
+				continue
+			}
+			return base
+		}
+	}
+
+	for i, part := range parts {
+		lower := strings.ToLower(part)
+		if lower != "message" && lower != "messages" {
+			continue
+		}
+		if i+1 < len(parts) {
+			return stripJSONExt(parts[i+1])
+		}
+	}
+
+	if len(parts) == 0 {
+		return ""
+	}
+	return stripJSONExt(parts[len(parts)-1])
+}
+
+func stripJSONExt(name string) string {
+	name = strings.TrimSuffix(name, ".jsonl")
+	name = strings.TrimSuffix(name, ".json")
+	return name
+}
+
+// discoverFromWalk is a schema-agnostic fallback used when OpenCode's
+// storage layout doesn't match the known flat-file or SQLite formats. It
+// walks the data directory (pruning subtrees that haven't been touched
+// recently, to bound the cost on long-lived data directories) for JSON/JSONL
+// files modified within RecentSessionTimeout, groups them by inferred
+// session, and reconstructs a transcript from whichever session group was
+// touched most recently.
+func discoverFromWalk(dataDir, projectPath string) *agent.SessionInfo {
+	root := filepath.Join(dataDir, "storage")
+	if _, err := os.Stat(root); err != nil {
+		root = dataDir
+	}
+	if _, err := os.Stat(root); err != nil {
+		return nil
+	}
+
+	now := time.Now()
+	recentTimeout := agent.RecentSessionTimeout
+
+	type group struct {
+		modTime time.Time
+		files   []string
+	}
+	groups := make(map[string]*group)
+
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if path == root {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		if d.IsDir() {
+			// Prune subtrees that haven't been touched recently; directory
+			// mtimes update when entries within them are created/removed.
+			if now.Sub(info.ModTime()) > recentTimeout {
+				return fs.SkipDir
+			}
+			return nil
+		}
+
+		if now.Sub(info.ModTime()) > recentTimeout {
+			return nil
+		}
+
+		name := d.Name()
+		if !strings.HasSuffix(name, ".json") && !strings.HasSuffix(name, ".jsonl") {
+			return nil
+		}
+
+		key := sessionKeyForPath(root, path)
+		if key == "" {
+			return nil
+		}
+
+		g := groups[key]
+		if g == nil {
+			g = &group{}
+			groups[key] = g
+		}
+		g.files = append(g.files, path)
+		if info.ModTime().After(g.modTime) {
+			g.modTime = info.ModTime()
+		}
+		return nil
+	})
+
+	var bestKey string
+	var best *group
+	for key, g := range groups {
+		if best == nil || g.modTime.After(best.modTime) {
+			best = g
+			bestKey = key
+		}
+	}
+	if best == nil {
+		return nil
+	}
+
+	var messages []json.RawMessage
+	for _, f := range best.files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		trimmed := bytes.TrimSpace(data)
+		if len(trimmed) == 0 {
+			continue
+		}
+		if trimmed[0] == '[' {
+			var arr []json.RawMessage
+			if err := json.Unmarshal(trimmed, &arr); err == nil {
+				messages = append(messages, arr...)
+				continue
+			}
+		}
+		for _, line := range bytes.Split(trimmed, []byte("\n")) {
+			line = bytes.TrimSpace(line)
+			if len(line) == 0 {
+				continue
+			}
+			messages = append(messages, json.RawMessage(append([]byte{}, line...)))
+		}
+	}
+
+	if len(messages) == 0 {
+		return nil
+	}
+
+	transcriptData, err := json.Marshal(messages)
+	if err != nil {
+		return nil
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      bestKey,
+		TranscriptPath: "",
+		StartedAt:      best.modTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+		TranscriptData: transcriptData,
+	}
+}
+
 // RestoreSession writes a session to OpenCode's storage location.
 func (a *Agent) RestoreSession(projectPath, sessionID, gitBranch string,
 	transcriptData []byte, messageCount int, summary string) error {
@@ -497,4 +705,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
