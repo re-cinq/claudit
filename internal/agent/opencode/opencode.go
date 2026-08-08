@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -230,9 +231,12 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first tries flat file storage, then falls back to SQLite (used by some
+// OpenCode releases). OpenCode's on-disk session layout has shifted across
+// versions (e.g. between opencode-ai 1.14.x and 1.18.x), so the flat file
+// search walks the whole session storage tree instead of assuming sessions
+// live directly under a project-ID-named subdirectory.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
 		return nil, err
@@ -241,7 +245,7 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
+	// Fall back to SQLite (used by some OpenCode releases)
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
@@ -251,57 +255,125 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 	return discoverFromSQLite(dataDir, projectID, projectPath)
 }
 
-// discoverFromFlatFiles tries the legacy flat file session discovery.
+// sessionFileFields is the subset of an OpenCode session JSON file relevant
+// to discovery. Different OpenCode versions have exposed different subsets
+// of these fields (and different directory layouts), so discovery treats
+// all of them as optional hints rather than a fixed schema.
+type sessionFileFields struct {
+	ID        string `json:"id"`
+	ProjectID string `json:"projectID"`
+	Directory string `json:"directory"`
+}
+
+// discoverFromFlatFiles searches OpenCode's session storage for the most
+// recent session belonging to projectPath. It walks the entire
+// storage/session tree rather than assuming sessions live directly under a
+// project-ID-named subdirectory, since that layout has changed across
+// OpenCode releases. When a session file embeds enough information to
+// confirm it belongs to projectPath (via a "directory" or "projectID"
+// field), that match is preferred; otherwise the most recently modified
+// session file within the recent-session window is used as a best effort,
+// since in practice only one OpenCode session is active per machine at a
+// time.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
-	if err != nil {
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	if _, err := os.Stat(sessionRoot); err != nil {
 		return nil, nil
 	}
 
+	projectID := GetProjectID(projectPath)
 	now := time.Now()
-	recentTimeout := agent.RecentSessionTimeout
-	var bestSessionID string
-	var bestModTime time.Time
 
-	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
+	var bestID string
+	var bestModTime time.Time
+	var bestMatches bool
+
+	_ = filepath.WalkDir(sessionRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
 		}
 
-		info, err := entry.Info()
+		info, err := d.Info()
 		if err != nil {
-			continue
+			return nil
 		}
 
 		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return nil
 		}
 
-		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+		id := strings.TrimSuffix(d.Name(), ".json")
+		matches := strings.Contains(filepath.ToSlash(path), "/"+projectID+"/")
+
+		if data, readErr := os.ReadFile(path); readErr == nil {
+			var fields sessionFileFields
+			if json.Unmarshal(data, &fields) == nil {
+				if fields.ID != "" {
+					id = fields.ID
+				}
+				switch {
+				case fields.Directory != "":
+					matches = agent.PathsEqual(fields.Directory, projectPath)
+				case fields.ProjectID != "":
+					matches = fields.ProjectID == projectID
+				}
+			}
+		}
+
+		if bestID == "" ||
+			(matches && !bestMatches) ||
+			(matches == bestMatches && modTime.After(bestModTime)) {
+			bestID = id
 			bestModTime = modTime
+			bestMatches = matches
 		}
-	}
+		return nil
+	})
 
-	if bestSessionID == "" {
+	if bestID == "" {
 		return nil, nil
 	}
 
-	// The transcript path for OpenCode is the message directory
-	msgDir, _ := GetMessageDir(bestSessionID)
-
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: msgDir,
+		SessionID:      bestID,
+		TranscriptPath: findMessagePath(dataDir, bestID),
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// findMessagePath locates the message storage location for a session. It
+// tries OpenCode's conventional storage/message/<sessionID> path first, then
+// falls back to a recursive search under the data directory in case a
+// different OpenCode release nests messages another way.
+func findMessagePath(dataDir, sessionID string) string {
+	conventional := filepath.Join(dataDir, "storage", "message", sessionID)
+	if _, err := os.Stat(conventional); err == nil {
+		return conventional
+	}
+
+	var found string
+	_ = filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || found != "" {
+			return nil
+		}
+		if d.Name() == sessionID {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if found != "" {
+		return found
+	}
+
+	return conventional
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +569,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
