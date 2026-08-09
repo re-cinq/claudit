@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +127,81 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// sessionEntryID resolves the session ID and most relevant modification
+// time for an entry inside a session storage directory. OpenCode has stored
+// each session both as a flat "<id>.json" file and, in newer releases, as an
+// "<id>/" directory (mirroring how messages are already stored), so both
+// shapes are recognised here.
+func sessionEntryID(dir string, entry os.DirEntry) (id string, modTime time.Time, ok bool) {
+	if entry.IsDir() {
+		info, err := entry.Info()
+		if err != nil {
+			return "", time.Time{}, false
+		}
+		modTime = info.ModTime()
+		if latest, found := latestModTimeInDir(filepath.Join(dir, entry.Name())); found && latest.After(modTime) {
+			modTime = latest
+		}
+		return entry.Name(), modTime, true
+	}
+
+	if !strings.HasSuffix(entry.Name(), ".json") {
+		return "", time.Time{}, false
+	}
+
+	info, err := entry.Info()
+	if err != nil {
+		return "", time.Time{}, false
+	}
+	return strings.TrimSuffix(entry.Name(), ".json"), info.ModTime(), true
+}
+
+// latestModTimeInDir returns the most recent modification time among the
+// files directly inside dir (non-recursive). Used to gauge session recency
+// when a session is stored as a directory rather than a single file.
+func latestModTimeInDir(dir string) (time.Time, bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return time.Time{}, false
+	}
+
+	var latest time.Time
+	found := false
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if !found || info.ModTime().After(latest) {
+			latest = info.ModTime()
+			found = true
+		}
+	}
+	return latest, found
+}
+
+// readSessionRecord returns the raw JSON content describing a session,
+// regardless of whether it's stored as a flat file or a directory.
+func readSessionRecord(dir string, entry os.DirEntry) ([]byte, bool) {
+	if !entry.IsDir() {
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			return nil, false
+		}
+		return data, true
+	}
+
+	sessionSubDir := filepath.Join(dir, entry.Name())
+	for _, name := range []string{"info.json", "session.json", entry.Name() + ".json"} {
+		data, err := os.ReadFile(filepath.Join(sessionSubDir, name))
+		if err == nil {
+			return data, true
+		}
+	}
+	return nil, false
 }
