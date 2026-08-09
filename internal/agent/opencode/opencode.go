@@ -252,15 +252,68 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
+// OpenCode's on-disk layout has changed across releases (session files
+// nested under a per-project directory under "storage", nested under a
+// top-level "project/<id>/storage" tree, or stored flat with the project
+// identified only by a field inside the session JSON). Rather than betting
+// on a single fixed layout, we probe each known shape in turn and use the
+// first one that yields a recent session.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
+	projectID := GetProjectID(projectPath)
 
+	candidates := []struct {
+		sessionDir     string
+		msgDir         string
+		requireIDMatch bool
+	}{
+		// Pre-v1.2 layout: <dataDir>/storage/session/<projectID>/<sessionID>.json
+		{
+			sessionDir: filepath.Join(dataDir, "storage", "session", projectID),
+			msgDir:     filepath.Join(dataDir, "storage", "message"),
+		},
+		// Project-first layout: <dataDir>/project/<projectID>/storage/session/<sessionID>.json
+		{
+			sessionDir: filepath.Join(dataDir, "project", projectID, "storage", "session"),
+			msgDir:     filepath.Join(dataDir, "project", projectID, "storage", "message"),
+		},
+		// Flat layout shared across projects: <dataDir>/storage/session/<sessionID>.json,
+		// disambiguated by a projectID/directory field inside the session file.
+		{
+			sessionDir:     filepath.Join(dataDir, "storage", "session"),
+			msgDir:         filepath.Join(dataDir, "storage", "message"),
+			requireIDMatch: true,
+		},
+	}
+
+	for _, c := range candidates {
+		if info := findRecentSession(c.sessionDir, c.msgDir, projectPath, projectID, c.requireIDMatch); info != nil {
+			return info, nil
+		}
+	}
+
+	return nil, nil
+}
+
+// sessionFileFields captures the fields we look for when disambiguating a
+// session file against the project it belongs to.
+type sessionFileFields struct {
+	ProjectID string `json:"projectID"`
+	Directory string `json:"directory"`
+}
+
+// findRecentSession scans sessionDir for the most recently modified session
+// JSON file within the recent-session window. When requireIDMatch is set,
+// sessionDir may contain sessions from multiple projects, so each candidate
+// file's content is checked against projectID/projectPath before it is
+// considered.
+func findRecentSession(sessionDir, msgDir, projectPath, projectID string, requireIDMatch bool) *agent.SessionInfo {
 	dirEntries, err := os.ReadDir(sessionDir)
 	if err != nil {
-		return nil, nil
+		return nil
 	}
 
 	now := time.Now()
@@ -283,6 +336,20 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 			continue
 		}
 
+		if requireIDMatch {
+			data, err := os.ReadFile(filepath.Join(sessionDir, entry.Name()))
+			if err != nil {
+				continue
+			}
+			var fields sessionFileFields
+			if err := json.Unmarshal(data, &fields); err != nil {
+				continue
+			}
+			if fields.ProjectID != projectID && fields.Directory != projectPath {
+				continue
+			}
+		}
+
 		if bestSessionID == "" || modTime.After(bestModTime) {
 			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
 			bestModTime = modTime
@@ -290,18 +357,15 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}
 
 	if bestSessionID == "" {
-		return nil, nil
+		return nil
 	}
-
-	// The transcript path for OpenCode is the message directory
-	msgDir, _ := GetMessageDir(bestSessionID)
 
 	return &agent.SessionInfo{
 		SessionID:      bestSessionID,
-		TranscriptPath: msgDir,
+		TranscriptPath: filepath.Join(msgDir, bestSessionID),
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
-	}, nil
+	}
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +561,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
