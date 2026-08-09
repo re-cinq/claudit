@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -252,56 +253,111 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
+//
+// OpenCode's on-disk session layout (the directory nesting under the data
+// dir) has changed across versions, but the session JSON content itself
+// still records the owning project via "projectID"/"directory" fields.
+// Rather than assume a fixed directory shape (e.g. storage/session/<projectID>),
+// we walk the whole session storage tree and match sessions by their
+// recorded project, the same way the Codex and Claude integrations already
+// do via agent.PathsEqual.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
-	if err != nil {
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	if _, err := os.Stat(sessionRoot); err != nil {
 		return nil, nil
 	}
 
+	projectID := GetProjectID(projectPath)
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
 	var bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-
-		info, err := entry.Info()
-		if err != nil {
-			continue
+	_ = filepath.Walk(sessionRoot, func(p string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info.IsDir() || !strings.HasSuffix(info.Name(), ".json") {
+			return nil
 		}
 
 		modTime := info.ModTime()
 		if now.Sub(modTime) > recentTimeout {
-			continue
+			return nil
+		}
+
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+
+		var sess sessionInfo
+		if err := json.Unmarshal(data, &sess); err != nil {
+			return nil
+		}
+
+		matched := sess.Directory != "" && agent.PathsEqual(sess.Directory, projectPath)
+		if !matched && sess.ProjectID != "" {
+			matched = sess.ProjectID == projectID
+		}
+		if !matched {
+			return nil
+		}
+
+		sessID := sess.ID
+		if sessID == "" {
+			sessID = strings.TrimSuffix(info.Name(), ".json")
 		}
 
 		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			bestSessionID = sessID
 			bestModTime = modTime
 		}
-	}
+		return nil
+	})
 
 	if bestSessionID == "" {
 		return nil, nil
 	}
 
-	// The transcript path for OpenCode is the message directory
-	msgDir, _ := GetMessageDir(bestSessionID)
-
 	return &agent.SessionInfo{
 		SessionID:      bestSessionID,
-		TranscriptPath: msgDir,
+		TranscriptPath: findMessageDir(dataDir, bestSessionID),
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// findMessageDir locates the message directory for a session. It tries the
+// legacy flat layout first (storage/message/<sessionID>), then falls back
+// to searching the whole data directory for a directory named after the
+// session ID, since OpenCode has nested message storage differently across
+// versions.
+func findMessageDir(dataDir, sessionID string) string {
+	legacy := filepath.Join(dataDir, "storage", "message", sessionID)
+	if info, err := os.Stat(legacy); err == nil && info.IsDir() {
+		return legacy
+	}
+
+	var found string
+	var foundUnderMessage bool
+	_ = filepath.Walk(dataDir, func(p string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info == nil || !info.IsDir() || info.Name() != sessionID {
+			return nil
+		}
+		underMessage := strings.Contains(filepath.ToSlash(p), "/message/")
+		if found == "" || (underMessage && !foundUnderMessage) {
+			found = p
+			foundUnderMessage = underMessage
+		}
+		return nil
+	})
+	if found != "" {
+		return found
+	}
+	return legacy
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +553,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
