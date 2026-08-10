@@ -229,9 +229,35 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 	return &agent.Transcript{Entries: entries}, nil
 }
 
+// Recent OpenCode releases persist session/message storage through an async
+// write queue, so the files backing a session that just finished (e.g. right
+// after `opencode run` exits, as happens in the post-commit hook flow) may
+// not be on disk yet the instant discovery runs. Retry briefly before giving
+// up so we don't lose the session to a benign timing race.
+const (
+	discoverSessionRetryInterval = 200 * time.Millisecond
+	discoverSessionRetryTimeout  = 2 * time.Second
+)
+
 // DiscoverSession finds an active or recent OpenCode session.
 // It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	deadline := time.Now().Add(discoverSessionRetryTimeout)
+	for {
+		session, err := a.discoverSessionOnce(projectPath)
+		if err != nil || session != nil {
+			return session, err
+		}
+		if time.Now().After(deadline) {
+			return nil, nil
+		}
+		time.Sleep(discoverSessionRetryInterval)
+	}
+}
+
+// discoverSessionOnce performs a single discovery attempt across both
+// storage backends without retrying.
+func (a *Agent) discoverSessionOnce(projectPath string) (*agent.SessionInfo, error) {
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
@@ -497,4 +523,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
