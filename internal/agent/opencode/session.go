@@ -1,13 +1,16 @@
+```go
 package opencode
 
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -73,6 +76,127 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// resolveMessageDir returns the message directory for a session. Current
+// OpenCode releases nest message storage under storage/session/message/<id>;
+// older releases used storage/message/<id>. Since the on-disk layout has
+// changed across releases and can't be assumed, prefer whichever directory
+// actually exists, defaulting to the legacy layout when neither is present.
+func resolveMessageDir(dataDir, sessionID string) string {
+	nested := filepath.Join(dataDir, "storage", "session", "message", sessionID)
+	if info, err := os.Stat(nested); err == nil && info.IsDir() {
+		return nested
+	}
+	return filepath.Join(dataDir, "storage", "message", sessionID)
+}
+
+// sessionCandidate represents a parsed session info file discovered while
+// scanning OpenCode's session storage tree.
+type sessionCandidate struct {
+	id        string
+	modTime   time.Time
+	projectID string
+	fields    map[string]json.RawMessage
+}
+
+// sessionDirectoryKeys lists the field names OpenCode has used across
+// releases to record a session's working directory.
+var sessionDirectoryKeys = []string{"directory", "cwd", "worktree", "path", "root", "workingDirectory"}
+
+// matchesDirectory reports whether the candidate's recorded working directory
+// matches projectPath under any of the known field names.
+func (c *sessionCandidate) matchesDirectory(projectPath string) bool {
+	want := filepath.Clean(projectPath)
+	for _, key := range sessionDirectoryKeys {
+		raw, ok := c.fields[key]
+		if !ok {
+			continue
+		}
+		var dir string
+		if err := json.Unmarshal(raw, &dir); err != nil || dir == "" {
+			continue
+		}
+		if filepath.Clean(dir) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// collectSessionInfoFiles walks OpenCode's session storage tree and returns
+// every session JSON file found, skipping the message/part subtrees (which
+// hold per-message data rather than session metadata). This layout-agnostic
+// scan is used as a fallback when the assumed project-partitioned path
+// doesn't exist, since OpenCode's on-disk partitioning scheme isn't something
+// shift-log can reliably predict.
+func collectSessionInfoFiles(root string) ([]*sessionCandidate, error) {
+	if info, err := os.Stat(root); err != nil || !info.IsDir() {
+		return nil, nil
+	}
+
+	var candidates []*sessionCandidate
+
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if d.Name() == "message" || d.Name() == "part" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(data, &fields); err != nil {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		id := strings.TrimSuffix(d.Name(), ".json")
+		if idRaw, ok := fields["id"]; ok {
+			var parsedID string
+			if err := json.Unmarshal(idRaw, &parsedID); err == nil && parsedID != "" {
+				id = parsedID
+			}
+		}
+
+		var projectID string
+		for _, key := range []string{"projectID", "project_id", "project"} {
+			if raw, ok := fields[key]; ok {
+				var pid string
+				if err := json.Unmarshal(raw, &pid); err == nil && pid != "" {
+					projectID = pid
+					break
+				}
+			}
+		}
+
+		candidates = append(candidates, &sessionCandidate{
+			id:        id,
+			modTime:   info.ModTime(),
+			projectID: projectID,
+			fields:    fields,
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return candidates, nil
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
@@ -127,3 +251,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
