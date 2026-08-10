@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -35,8 +36,19 @@ func GetDataDir() (string, error) {
 }
 
 // GetProjectID returns the project identifier for OpenCode.
-// For git repos, this is the root commit hash. For non-git dirs, it's "global".
+//
+// Newer OpenCode releases no longer derive the project ID from the git root
+// commit hash; instead they generate an opaque ID on first run and cache it
+// in "<git-common-dir>/opencode" so it stays stable across shallow clones,
+// rebases, and worktrees. We must read that cache to match OpenCode's own
+// storage lookups. If the cache file is absent (older OpenCode, or OpenCode
+// has never run in this repo), we fall back to the legacy root-commit-hash
+// scheme. For non-git dirs, it's "global".
 func GetProjectID(projectPath string) string {
+	if id := readOpenCodeProjectIDCache(projectPath); id != "" {
+		return id
+	}
+
 	cmd := exec.Command("git", "rev-list", "--max-parents=0", "--all")
 	cmd.Dir = projectPath
 	output, err := cmd.Output()
@@ -50,6 +62,53 @@ func GetProjectID(projectPath string) string {
 		return strings.TrimSpace(lines[0])
 	}
 	return "global"
+}
+
+// readOpenCodeProjectIDCache reads the project ID OpenCode caches at
+// "<git-common-dir>/opencode". It returns "" if the repo has no such cache
+// (older OpenCode versions, or OpenCode has never run here) or if the cached
+// value doesn't look like a safe identifier.
+func readOpenCodeProjectIDCache(projectPath string) string {
+	cmd := exec.Command("git", "rev-parse", "--git-common-dir")
+	cmd.Dir = projectPath
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	gitDir := strings.TrimSpace(string(output))
+	if gitDir == "" {
+		return ""
+	}
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(projectPath, gitDir)
+	}
+
+	data, err := os.ReadFile(filepath.Join(gitDir, "opencode"))
+	if err != nil {
+		return ""
+	}
+
+	id := strings.TrimSpace(string(data))
+	if !isSafeProjectID(id) {
+		return ""
+	}
+	return id
+}
+
+// isSafeProjectID reports whether id is non-empty and safe to interpolate
+// into the SQLite queries used for OpenCode session discovery.
+func isSafeProjectID(id string) bool {
+	if id == "" {
+		return false
+	}
+	for _, r := range id {
+		isAlnum := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+		if !isAlnum && r != '-' && r != '_' {
+			return false
+		}
+	}
+	return true
 }
 
 // GetSessionDir returns the session storage directory for a project.
@@ -127,3 +186,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
