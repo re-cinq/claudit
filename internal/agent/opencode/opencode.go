@@ -252,6 +252,12 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
+// OpenCode has stored sessions on disk in two different shapes: older
+// versions write a flat "<sessionID>.json" file directly inside the
+// project's session directory, while newer versions (observed starting in
+// the 1.x series) write a "<sessionID>/" subdirectory containing the
+// session's data files instead. We accept either shape so discovery keeps
+// working across OpenCode versions.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionDir(projectPath)
 	if err != nil {
@@ -269,7 +275,13 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	var bestModTime time.Time
 
 	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		var sessionID string
+
+		if entry.IsDir() {
+			sessionID = entry.Name()
+		} else if strings.HasSuffix(entry.Name(), ".json") {
+			sessionID = strings.TrimSuffix(entry.Name(), ".json")
+		} else {
 			continue
 		}
 
@@ -279,12 +291,21 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		}
 
 		modTime := info.ModTime()
+		if entry.IsDir() {
+			// A directory's own mtime only reflects changes to its immediate
+			// contents; look inside for the most recently written file to
+			// get an accurate recency signal for the session.
+			if latest := latestModTime(filepath.Join(sessionDir, entry.Name())); latest.After(modTime) {
+				modTime = latest
+			}
+		}
+
 		if now.Sub(modTime) > recentTimeout {
 			continue
 		}
 
 		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
 	}
@@ -302,6 +323,30 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// latestModTime returns the most recent modification time among the files
+// directly inside dir. It does not recurse into subdirectories. If dir
+// cannot be read, it returns the zero time.
+func latestModTime(dir string) time.Time {
+	var latest time.Time
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return latest
+	}
+
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(latest) {
+			latest = info.ModTime()
+		}
+	}
+
+	return latest
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +542,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
