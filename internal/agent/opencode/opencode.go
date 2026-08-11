@@ -306,8 +306,8 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
-	dbPath := filepath.Join(dataDir, "opencode.db")
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+	dbPath, err := findSQLiteDB(dataDir)
+	if err != nil {
 		return nil, nil
 	}
 
@@ -316,24 +316,25 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
-	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+	// Find the most recent session for this project. Newer OpenCode releases
+	// have been observed to change how (or whether) sessions are keyed by
+	// project, so if the project-scoped lookup comes back empty (no matching
+	// rows, or the column itself no longer exists), fall back to simply the
+	// most recently updated session across the whole database.
+	sessionID := querySQLiteSessionID(dbPath, projectID)
+	if sessionID == "" {
+		sessionID = querySQLiteSessionID(dbPath, "")
+	}
+	if sessionID == "" {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
 		`SELECT time_updated FROM session WHERE id='%s';`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
+	cmd := exec.Command("sqlite3", dbPath, timeQuery)
 	timeOutput, err := cmd.Output()
 	if err == nil {
 		timeStr := strings.TrimSpace(string(timeOutput))
@@ -377,6 +378,59 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// querySQLiteSessionID returns the id of the most recently updated session.
+// When projectID is non-empty the lookup is scoped to that project; on any
+// failure (no matching rows, or a schema change that makes the query itself
+// error) it returns "" so the caller can retry unscoped.
+func querySQLiteSessionID(dbPath, projectID string) string {
+	where := ""
+	if projectID != "" {
+		where = fmt.Sprintf("WHERE project_id='%s' ", projectID)
+	}
+	sessionQuery := fmt.Sprintf(
+		`SELECT id FROM session %sORDER BY time_updated DESC LIMIT 1;`,
+		where,
+	)
+	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
+	sessionOutput, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(sessionOutput))
+}
+
+// findSQLiteDB locates OpenCode's SQLite database under the data directory.
+// Newer OpenCode releases have been observed to relocate or rename this
+// file, so beyond the canonical "opencode.db" path we also search for any
+// *.db file under the data directory and use the most recently modified one.
+func findSQLiteDB(dataDir string) (string, error) {
+	canonical := filepath.Join(dataDir, "opencode.db")
+	if _, err := os.Stat(canonical); err == nil {
+		return canonical, nil
+	}
+
+	var bestPath string
+	var bestModTime time.Time
+	_ = filepath.Walk(dataDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(info.Name(), ".db") {
+			return nil
+		}
+		if bestPath == "" || info.ModTime().After(bestModTime) {
+			bestPath = path
+			bestModTime = info.ModTime()
+		}
+		return nil
+	})
+
+	if bestPath == "" {
+		return "", os.ErrNotExist
+	}
+	return bestPath, nil
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -497,4 +551,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
