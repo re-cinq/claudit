@@ -22,6 +22,54 @@ const pluginTemplate = `// shiftlog plugin for OpenCode CLI
 export const ShiftlogPlugin = async ({ directory, client }) => {
   const pendingCommits = new Map();
 
+  const dataDir = process.platform === "darwin"
+      ? process.env.HOME + "/Library/Application Support/opencode"
+      : (process.env.XDG_DATA_HOME || process.env.HOME + "/.local/share") + "/opencode";
+
+  // Snapshots the current session (id + best-effort transcript fetched via the
+  // SDK client) to a local, deterministic path on every tool call. This lets
+  // "shiftlog store --manual" (run later by the post-commit hook, in a
+  // separate process with no access to this plugin's client/session state)
+  // find the session without having to guess OpenCode's internal on-disk
+  // storage layout, which has changed across OpenCode releases.
+  const syncSessionState = async (sessionID) => {
+    if (!sessionID) return;
+
+    let transcriptData = "";
+    if (client) {
+      try {
+        const msgs = await client.session.messages({ path: { id: sessionID } });
+        if (msgs && Array.isArray(msgs)) {
+          transcriptData = JSON.stringify(msgs.map(m => ({
+            role: m.role || "",
+            id: m.id || "",
+            content: m.content || "",
+            time: m.time || {},
+          })));
+        }
+      } catch (e) {
+        // Fall back to transcript_path-based discovery below
+      }
+    }
+
+    try {
+      const fs = await import("fs");
+      const path = await import("path");
+      const stateDir = path.join(directory, ".shiftlog");
+      fs.mkdirSync(stateDir, { recursive: true });
+      const statePath = path.join(stateDir, "opencode-session.json");
+      fs.writeFileSync(statePath, JSON.stringify({
+        session_id: sessionID,
+        transcript_path: path.join(dataDir, "storage", "message", sessionID),
+        project_path: directory,
+        started_at: new Date().toISOString(),
+        transcript_data: transcriptData,
+      }));
+    } catch (e) {
+      // Silently ignore - manual discovery falls back to storage scan
+    }
+  };
+
   return {
     "tool.execute.before": async (input, output) => {
       const command = output?.args?.command || output?.args?.cmd || "";
@@ -35,6 +83,11 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
     },
 
     "tool.execute.after": async (input, output) => {
+      // Keep the local session marker fresh for every tool call, not just
+      // commits, so a manual commit made shortly after the session ends can
+      // still be matched up.
+      await syncSessionState(input.sessionID);
+
       const pending = pendingCommits.get(input.callID);
       if (!pending) return;
       pendingCommits.delete(input.callID);
@@ -56,10 +109,6 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
           // Fall back to data_dir approach below
         }
       }
-
-      const dataDir = process.platform === "darwin"
-          ? process.env.HOME + "/Library/Application Support/opencode"
-          : (process.env.XDG_DATA_HOME || process.env.HOME + "/.local/share") + "/opencode";
 
       const hookData = JSON.stringify({
         session_id: pending.sessionID || "",

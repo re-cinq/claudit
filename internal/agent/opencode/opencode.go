@@ -229,9 +229,64 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 	return &agent.Transcript{Entries: entries}, nil
 }
 
+// activeSessionState is the session marker written by the OpenCode plugin
+// (see plugin.go) on every tool call. It lives at a fixed, deterministic
+// path inside the project (.shiftlog/opencode-session.json) so that manual
+// discovery does not need to know where OpenCode itself persists session
+// data - that internal storage layout (flat files vs SQLite, exact schema)
+// has changed across OpenCode releases and isn't a stable integration point.
+type activeSessionState struct {
+	SessionID      string `json:"session_id"`
+	TranscriptPath string `json:"transcript_path"`
+	ProjectPath    string `json:"project_path"`
+	StartedAt      string `json:"started_at"`
+	TranscriptData string `json:"transcript_data"`
+}
+
+// discoverFromActiveSessionFile reads the plugin-maintained session marker.
+// Returns nil if the marker is missing, stale, or for a different project.
+func discoverFromActiveSessionFile(projectPath string) *agent.SessionInfo {
+	statePath := filepath.Join(projectPath, ".shiftlog", "opencode-session.json")
+
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		return nil
+	}
+
+	var state activeSessionState
+	if err := json.Unmarshal(data, &state); err != nil || state.SessionID == "" {
+		return nil
+	}
+
+	if state.ProjectPath != "" && !agent.PathsEqual(state.ProjectPath, projectPath) {
+		return nil
+	}
+
+	startedAt, err := time.Parse(time.RFC3339, state.StartedAt)
+	if err != nil || time.Since(startedAt) > agent.RecentSessionTimeout {
+		return nil
+	}
+
+	info := &agent.SessionInfo{
+		SessionID:      state.SessionID,
+		TranscriptPath: state.TranscriptPath,
+		StartedAt:      state.StartedAt,
+		ProjectPath:    projectPath,
+	}
+	if state.TranscriptData != "" {
+		info.TranscriptData = []byte(state.TranscriptData)
+	}
+	return info
+}
+
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first checks the plugin-maintained session marker, then tries flat
+// file storage (pre-v1.2 OpenCode), then falls back to SQLite (v1.2+).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	if info := discoverFromActiveSessionFile(projectPath); info != nil {
+		return info, nil
+	}
+
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
@@ -497,4 +552,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
