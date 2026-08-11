@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -35,8 +36,23 @@ func GetDataDir() (string, error) {
 }
 
 // GetProjectID returns the project identifier for OpenCode.
-// For git repos, this is the root commit hash. For non-git dirs, it's "global".
+//
+// OpenCode v1.15+ generates a project ID the first time it runs in a repo
+// and caches it in <git-common-dir>/opencode, reusing that cached value on
+// every subsequent run rather than deriving it from git history. We must
+// read the same cache to discover sessions it has already recorded, so we
+// check for it first. Older OpenCode versions (and repos OpenCode has never
+// touched) have no such cache; for those we fall back to the legacy
+// behavior of using the root commit hash, or "global" for non-git dirs.
 func GetProjectID(projectPath string) string {
+	if gitDir, err := gitCommonDir(projectPath); err == nil {
+		if data, err := os.ReadFile(filepath.Join(gitDir, "opencode")); err == nil {
+			if id := strings.TrimSpace(string(data)); id != "" {
+				return id
+			}
+		}
+	}
+
 	cmd := exec.Command("git", "rev-list", "--max-parents=0", "--all")
 	cmd.Dir = projectPath
 	output, err := cmd.Output()
@@ -50,6 +66,26 @@ func GetProjectID(projectPath string) string {
 		return strings.TrimSpace(lines[0])
 	}
 	return "global"
+}
+
+// gitCommonDir returns the absolute path to the repo's common .git
+// directory (handles both plain repos and linked worktrees).
+func gitCommonDir(projectPath string) (string, error) {
+	cmd := exec.Command("git", "rev-parse", "--git-common-dir")
+	cmd.Dir = projectPath
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+
+	dir := strings.TrimSpace(string(output))
+	if dir == "" {
+		return "", fmt.Errorf("empty git common dir")
+	}
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(projectPath, dir)
+	}
+	return dir, nil
 }
 
 // GetSessionDir returns the session storage directory for a project.
@@ -127,3 +163,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
