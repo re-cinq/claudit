@@ -251,55 +251,67 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 	return discoverFromSQLite(dataDir, projectID, projectPath)
 }
 
-// discoverFromFlatFiles tries the legacy flat file session discovery.
+// discoverFromFlatFiles searches OpenCode's data directory for a recent
+// session belonging to this project.
+//
+// OpenCode's on-disk layout for session records has changed across
+// releases — older versions partitioned sessions under a fixed
+// storage/session/<projectID>/ directory keyed by the git root commit
+// hash, but newer releases may nest or flatten that differently. Rather
+// than assuming one fixed path, this scans the whole storage tree for
+// session-record JSON files and matches them to the project using
+// whatever identifying data each record carries, preferring a strong
+// match (an explicit project directory/ID field, or the legacy
+// partitioned directory name) and only falling back to "most recently
+// modified session file" when no record carries project information at
+// all.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
-	if err != nil {
+	candidates := findSessionCandidates(dataDir, agent.RecentSessionTimeout)
+	if len(candidates) == 0 {
 		return nil, nil
 	}
 
-	now := time.Now()
-	recentTimeout := agent.RecentSessionTimeout
-	var bestSessionID string
-	var bestModTime time.Time
+	projectID := GetProjectID(projectPath)
 
-	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+	var best *sessionCandidate
+	var bestWeak *sessionCandidate
+	for i := range candidates {
+		c := &candidates[i]
+
+		if c.hasProjectSignal(projectID) {
+			if !c.matchesProject(projectPath, projectID) {
+				continue
+			}
+			if best == nil || c.ModTime.After(best.ModTime) {
+				best = c
+			}
 			continue
 		}
 
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
-
-		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
-			bestModTime = modTime
+		if bestWeak == nil || c.ModTime.After(bestWeak.ModTime) {
+			bestWeak = c
 		}
 	}
 
-	if bestSessionID == "" {
+	if best == nil {
+		best = bestWeak
+	}
+	if best == nil {
 		return nil, nil
 	}
 
 	// The transcript path for OpenCode is the message directory
-	msgDir, _ := GetMessageDir(bestSessionID)
+	msgDir := findMessageDir(dataDir, best.SessionID)
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
+		SessionID:      best.SessionID,
 		TranscriptPath: msgDir,
-		StartedAt:      bestModTime.Format(time.RFC3339),
+		StartedAt:      best.ModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
@@ -454,7 +466,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +508,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-

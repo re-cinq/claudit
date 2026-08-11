@@ -3,11 +3,15 @@ package opencode
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +130,156 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// sessionCandidate is a session record file discovered by walking OpenCode's
+// storage directory, along with whatever project-identifying data it carries.
+type sessionCandidate struct {
+	SessionID string
+	Path      string
+	ModTime   time.Time
+	ProjectID string
+	Directory string
+	ParentDir string
+}
+
+// candidateProjectKeys are the JSON field names OpenCode has used across
+// releases to record which project directory a session belongs to.
+var candidateProjectKeys = []string{"directory", "cwd", "path", "worktree", "root"}
+
+// findSessionCandidates walks the OpenCode storage directory looking for
+// session record files within the recency window. OpenCode's on-disk layout
+// for session info has changed across releases (project-partitioned
+// directories in older versions, a flatter global namespace in newer ones),
+// so rather than assuming one fixed path this scans the whole storage tree
+// for anything that looks like a session record and lets the caller match
+// it to a project using whatever identifying fields are present.
+func findSessionCandidates(dataDir string, recentTimeout time.Duration) []sessionCandidate {
+	storageDir := filepath.Join(dataDir, "storage")
+	now := time.Now()
+
+	var candidates []sessionCandidate
+	_ = filepath.WalkDir(storageDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		rel, err := filepath.Rel(storageDir, path)
+		if err != nil {
+			return nil
+		}
+		relSlash := filepath.ToSlash(rel)
+
+		// Message records live under a "message" path segment; skip them
+		// so they aren't mistaken for session records.
+		if strings.Contains(relSlash, "/message/") || strings.HasPrefix(relSlash, "message/") {
+			return nil
+		}
+		if !strings.Contains(relSlash, "session") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		modTime := info.ModTime()
+		if now.Sub(modTime) > recentTimeout {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil
+		}
+
+		id := stringField(raw, "id")
+		if id == "" {
+			id = strings.TrimSuffix(d.Name(), ".json")
+		}
+
+		candidates = append(candidates, sessionCandidate{
+			SessionID: id,
+			Path:      path,
+			ModTime:   modTime,
+			ProjectID: stringField(raw, "projectID"),
+			Directory: firstStringField(raw, candidateProjectKeys),
+			ParentDir: filepath.Base(filepath.Dir(path)),
+		})
+		return nil
+	})
+
+	return candidates
+}
+
+func stringField(raw map[string]json.RawMessage, key string) string {
+	v, ok := raw[key]
+	if !ok {
+		return ""
+	}
+	var s string
+	_ = json.Unmarshal(v, &s)
+	return s
+}
+
+func firstStringField(raw map[string]json.RawMessage, keys []string) string {
+	for _, k := range keys {
+		if s := stringField(raw, k); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// matchesProject reports whether a session candidate belongs to the given
+// project, using whatever identifying information is available in the
+// record. Falls back to the legacy project-partitioned directory name.
+func (c sessionCandidate) matchesProject(projectPath, projectID string) bool {
+	if c.Directory != "" {
+		return agent.PathsEqual(c.Directory, projectPath)
+	}
+	if c.ProjectID != "" {
+		return c.ProjectID == projectID
+	}
+	return c.ParentDir == projectID
+}
+
+// hasProjectSignal reports whether the candidate carries any data that
+// could be used to match it to a specific project.
+func (c sessionCandidate) hasProjectSignal(projectID string) bool {
+	return c.Directory != "" || c.ProjectID != "" || c.ParentDir == projectID
+}
+
+// findMessageDir locates the directory holding message files for a session.
+// It first checks OpenCode's legacy fixed path (storage/message/<sessionID>),
+// then falls back to searching the storage tree for a directory named after
+// the session ID, since newer OpenCode releases may nest messages elsewhere.
+func findMessageDir(dataDir, sessionID string) string {
+	if legacy, err := GetMessageDir(sessionID); err == nil {
+		if info, statErr := os.Stat(legacy); statErr == nil && info.IsDir() {
+			return legacy
+		}
+	}
+
+	storageDir := filepath.Join(dataDir, "storage")
+	var found string
+	_ = filepath.WalkDir(storageDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || found != "" {
+			return nil
+		}
+		if d.IsDir() && d.Name() == sessionID {
+			found = path
+			return filepath.SkipDir
+		}
+		return nil
+	})
+
+	return found
 }
