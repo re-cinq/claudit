@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -252,42 +253,71 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
+//
+// OpenCode's on-disk project keying scheme (the directory name under
+// storage/session/) is an internal implementation detail that has changed
+// across versions, so rather than trusting our own recomputation of it
+// (GetProjectID), we walk the whole session tree and match sessions using
+// the "directory" field embedded in each session JSON file, comparing paths
+// with agent.PathsEqual the same way Codex/Copilot/Claude do. This is
+// resilient to OpenCode changing its project directory naming or nesting
+// sessions more deeply.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
-	if err != nil {
-		return nil, nil
-	}
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
 	var bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-
-		info, err := entry.Info()
-		if err != nil {
-			continue
+	_ = filepath.Walk(sessionRoot, func(p string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info == nil || info.IsDir() || !strings.HasSuffix(info.Name(), ".json") {
+			return nil
 		}
 
 		modTime := info.ModTime()
 		if now.Sub(modTime) > recentTimeout {
-			continue
+			return nil
+		}
+
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+
+		var si sessionInfo
+		if err := json.Unmarshal(data, &si); err != nil {
+			return nil
+		}
+
+		matches := false
+		if si.Directory != "" {
+			matches = agent.PathsEqual(si.Directory, projectPath)
+		} else {
+			// Fall back to the legacy project-id-keyed parent directory
+			// when the session file doesn't carry a directory field.
+			matches = filepath.Base(filepath.Dir(p)) == GetProjectID(projectPath)
+		}
+		if !matches {
+			return nil
+		}
+
+		sessionID := si.ID
+		if sessionID == "" {
+			sessionID = strings.TrimSuffix(filepath.Base(p), ".json")
 		}
 
 		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
-	}
+		return nil
+	})
 
 	if bestSessionID == "" {
 		return nil, nil
@@ -497,4 +527,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
