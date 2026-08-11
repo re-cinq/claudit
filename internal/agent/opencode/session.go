@@ -7,7 +7,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -71,6 +73,145 @@ func GetMessageDir(sessionID string) (string, error) {
 	}
 
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
+}
+
+// candidateSessionDirs returns the possible on-disk locations for a
+// project's session storage directory, across OpenCode's known storage
+// layouts. Newer OpenCode releases nest project storage under
+// "project/<id>/storage/..." instead of "storage/session/<id>", so we
+// probe multiple layouts rather than assuming one.
+func candidateSessionDirs(dataDir, projectID string) []string {
+	return []string{
+		filepath.Join(dataDir, "storage", "session", projectID),
+		filepath.Join(dataDir, "project", projectID, "storage", "session"),
+		filepath.Join(dataDir, "project", projectID, "storage", "session", "info"),
+	}
+}
+
+// candidateMessageDirs returns the possible on-disk locations for a
+// session's message storage, across OpenCode's known storage layouts.
+func candidateMessageDirs(dataDir, projectID, sessionID string) []string {
+	return []string{
+		filepath.Join(dataDir, "storage", "message", sessionID),
+		filepath.Join(dataDir, "project", projectID, "storage", "session", "message", sessionID),
+		filepath.Join(dataDir, "project", projectID, "storage", "message", sessionID),
+	}
+}
+
+// escapeSQLite escapes a value for embedding in a single-quoted SQLite
+// string literal.
+func escapeSQLite(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
+// sqliteTables lists all table names in the given SQLite database.
+func sqliteTables(dbPath string) []string {
+	cmd := exec.Command("sqlite3", dbPath, "SELECT name FROM sqlite_master WHERE type='table';")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	return splitNonEmpty(string(out))
+}
+
+// sqliteColumns lists column names for the given table via PRAGMA table_info.
+func sqliteColumns(dbPath, table string) []string {
+	cmd := exec.Command("sqlite3", dbPath, fmt.Sprintf("PRAGMA table_info(%s);", table))
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	var cols []string
+	for _, line := range splitNonEmpty(string(out)) {
+		parts := strings.Split(line, "|")
+		if len(parts) >= 2 {
+			cols = append(cols, parts[1])
+		}
+	}
+	return cols
+}
+
+// splitNonEmpty splits sqlite3 CLI output into non-empty trimmed lines.
+func splitNonEmpty(s string) []string {
+	var result []string
+	for _, line := range strings.Split(strings.TrimSpace(s), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			result = append(result, line)
+		}
+	}
+	return result
+}
+
+// findTable returns the first table name matching the given substring
+// (case-insensitive), preferring an exact match.
+func findTable(tables []string, contains string) string {
+	for _, t := range tables {
+		if strings.EqualFold(t, contains) {
+			return t
+		}
+	}
+	for _, t := range tables {
+		if strings.Contains(strings.ToLower(t), contains) {
+			return t
+		}
+	}
+	return ""
+}
+
+// findColumn returns the first column matching one of the candidate names
+// (case-insensitive; exact matches are preferred over substring matches).
+func findColumn(cols []string, candidates ...string) string {
+	for _, cand := range candidates {
+		for _, c := range cols {
+			if strings.EqualFold(c, cand) {
+				return c
+			}
+		}
+	}
+	for _, cand := range candidates {
+		for _, c := range cols {
+			if strings.Contains(strings.ToLower(c), strings.ToLower(cand)) {
+				return c
+			}
+		}
+	}
+	return ""
+}
+
+// parseSQLiteTime attempts to parse a timestamp value read from SQLite in
+// any of the formats OpenCode has used across releases: RFC3339 (with or
+// without nanoseconds), space-separated, or a Unix epoch in seconds,
+// milliseconds, or microseconds.
+func parseSQLiteTime(s string) (time.Time, bool) {
+	if s == "" {
+		return time.Time{}, false
+	}
+
+	formats := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02T15:04:05.000Z",
+		"2006-01-02 15:04:05",
+	}
+	for _, f := range formats {
+		if t, err := time.Parse(f, s); err == nil {
+			return t, true
+		}
+	}
+
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil && n > 0 {
+		switch {
+		case n > 1e15:
+			return time.UnixMicro(n), true
+		case n > 1e12:
+			return time.UnixMilli(n), true
+		default:
+			return time.Unix(n, 0), true
+		}
+	}
+
+	return time.Time{}, false
 }
 
 // sessionInfo represents an OpenCode session JSON file.
