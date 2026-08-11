@@ -365,9 +365,13 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	}
 
 	transcriptData := []byte(strings.TrimSpace(string(msgOutput)))
-	// sqlite3 returns "[null]" when no rows match
-	if string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
-		return nil, nil
+	// sqlite3 returns "[null]" (or an empty result) when the session has no
+	// messages yet, e.g. a very short-lived session whose message writes
+	// hadn't been flushed by the time we look it up. The session itself is
+	// still valid and recent, so treat this as an empty transcript rather
+	// than discarding the session entirely.
+	if string(transcriptData) == "[null]" || string(transcriptData) == "" {
+		transcriptData = []byte("[]")
 	}
 
 	return &agent.SessionInfo{
@@ -497,4 +501,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
