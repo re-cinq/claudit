@@ -206,6 +206,7 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 				if err == nil {
 					entries = append(entries, transcript.Entries...)
 				}
+				continue
 			}
 			continue
 		}
@@ -353,9 +354,13 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
 
-	// Get messages for this session as a JSON array
+	// Get messages for this session as a JSON array.
+	// Ordered by rowid (guaranteed insertion order) rather than a
+	// timestamp column: message timestamps live inside the nested
+	// "time.created" field of the JSON `data` blob, not as a separate
+	// SQL column, so a `time_created` column does not exist on this table.
 	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
+		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY rowid;`,
 		sessionID,
 	)
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
@@ -497,4 +502,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
