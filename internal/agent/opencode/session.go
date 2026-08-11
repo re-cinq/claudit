@@ -1,13 +1,18 @@
+```go
 package opencode
 
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -127,3 +132,127 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+
+// resolveMessageDir returns the directory containing sessionID's messages.
+// It tries the conventional storage/message/<sessionID> path first (fast
+// path for the common case), and falls back to scanning the data directory
+// if that path doesn't exist or is empty. OpenCode has changed its on-disk
+// storage layout across releases, so the conventional path is not guaranteed
+// to hold the messages even when the session itself was found.
+func resolveMessageDir(dataDir, sessionID string) string {
+	msgDir := filepath.Join(dataDir, "storage", "message", sessionID)
+	if entries, err := os.ReadDir(msgDir); err == nil && len(entries) > 0 {
+		return msgDir
+	}
+
+	if found := findMessageDirByScanning(dataDir, sessionID); found != "" {
+		return found
+	}
+
+	return msgDir
+}
+
+// findMessageDirByScanning searches the OpenCode data directory for a
+// directory holding sessionID's messages. Used as a fallback when the
+// conventional storage/message/<sessionID> path doesn't exist, since the
+// nesting of "message" storage relative to "session" storage has changed
+// across OpenCode releases.
+func findMessageDirByScanning(dataDir, sessionID string) string {
+	var found string
+	_ = filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || found != "" {
+			return nil
+		}
+		if d.IsDir() && d.Name() == sessionID {
+			entries, rerr := os.ReadDir(path)
+			if rerr == nil && len(entries) > 0 {
+				found = path
+				return filepath.SkipAll
+			}
+		}
+		return nil
+	})
+	return found
+}
+
+// findSessionByScanning performs a bounded, recency-pruned search under
+// dataDir for the most recently modified session file belonging to
+// projectPath. Used as a fallback when the conventional
+// storage/session/<projectID> path (keyed on the git root commit hash)
+// doesn't exist or has no recent sessions — OpenCode has changed how (and
+// where) it lays out per-project session directories across releases, so the
+// conventional path can no longer be assumed to exist.
+func findSessionByScanning(dataDir, projectPath, projectID string) *agent.SessionInfo {
+	now := time.Now()
+	recentTimeout := agent.RecentSessionTimeout
+
+	var bestSessionID string
+	var bestModTime time.Time
+
+	_ = filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if path == dataDir {
+				return nil
+			}
+			// Prune directories that haven't been touched recently — no file
+			// inside can be newer than its containing directory's mtime was
+			// last bumped by a write.
+			if info, ierr := d.Info(); ierr == nil && now.Sub(info.ModTime()) > recentTimeout {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		info, ierr := d.Info()
+		if ierr != nil {
+			return nil
+		}
+		modTime := info.ModTime()
+		if now.Sub(modTime) > recentTimeout {
+			return nil
+		}
+
+		data, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return nil
+		}
+		var s sessionInfo
+		if jerr := json.Unmarshal(data, &s); jerr != nil || s.ID == "" {
+			return nil
+		}
+
+		// Match on whichever identifying field is present. Prefer the
+		// directory (actual project path) since project ID derivation is
+		// what's most likely to have changed across OpenCode releases.
+		if s.Directory != "" {
+			if s.Directory != projectPath {
+				return nil
+			}
+		} else if s.ProjectID != "" && s.ProjectID != projectID {
+			return nil
+		}
+
+		if bestSessionID == "" || modTime.After(bestModTime) {
+			bestSessionID = s.ID
+			bestModTime = modTime
+		}
+		return nil
+	})
+
+	if bestSessionID == "" {
+		return nil
+	}
+
+	return &agent.SessionInfo{
+		SessionID:   bestSessionID,
+		StartedAt:   bestModTime.Format(time.RFC3339),
+		ProjectPath: projectPath,
+	}
+}
+```
