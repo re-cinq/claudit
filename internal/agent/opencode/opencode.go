@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -230,9 +231,11 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It tries, in order: legacy flat file storage, OpenCode 1.x's project-local
+// SQLite database (.opencode/opencode.db), and finally a legacy shared SQLite
+// database under the XDG data directory.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
+	// Try flat file storage first (legacy OpenCode versions).
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
 		return nil, err
@@ -241,7 +244,19 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
+	// OpenCode 1.x stores sessions/messages in a SQLite database local to the
+	// project (.opencode/opencode.db). The database is already scoped to the
+	// current project by its file location, so no project filter is needed.
+	session, err = discoverFromProjectSQLite(projectPath)
+	if err != nil {
+		return nil, err
+	}
+	if session != nil {
+		return session, nil
+	}
+
+	// Fall back to a legacy shared SQLite database under the XDG data
+	// directory, scoped by a project_id column.
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
@@ -304,7 +319,123 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
-// discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
+// discoverFromProjectSQLite queries OpenCode's project-local SQLite database
+// (.opencode/opencode.db) for the most recent session. OpenCode 1.x stores
+// sessions in a "sessions" table and messages in a "messages" table, with
+// message text stored as a JSON-encoded "parts" array (e.g.
+// [{"type":"text","data":{"text":"..."}}, {"type":"tool_call",...}]) rather
+// than a plain "content" field. The database itself lives inside the project
+// (not under the XDG data directory), so it is already scoped to the current
+// project and no project_id filter is needed.
+func discoverFromProjectSQLite(projectPath string) (*agent.SessionInfo, error) {
+	dbPath := filepath.Join(projectPath, ".opencode", "opencode.db")
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		return nil, nil
+	}
+
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		return nil, nil
+	}
+
+	cmd := exec.Command("sqlite3", "-json", dbPath,
+		"SELECT id, updated_at FROM sessions ORDER BY updated_at DESC LIMIT 1;")
+	sessionOutput, err := cmd.Output()
+	if err != nil {
+		return nil, nil
+	}
+
+	var sessions []struct {
+		ID        string `json:"id"`
+		UpdatedAt int64  `json:"updated_at"`
+	}
+	if err := json.Unmarshal(sessionOutput, &sessions); err != nil || len(sessions) == 0 {
+		return nil, nil
+	}
+
+	sessionID := sessions[0].ID
+	if sessionID == "" {
+		return nil, nil
+	}
+
+	if sessions[0].UpdatedAt > 0 {
+		updatedAt := time.UnixMilli(sessions[0].UpdatedAt)
+		if time.Since(updatedAt) > agent.RecentSessionTimeout {
+			return nil, nil
+		}
+	}
+
+	cmd = exec.Command("sqlite3", "-json", dbPath,
+		fmt.Sprintf(`SELECT id, role, parts, created_at FROM messages WHERE session_id='%s' ORDER BY created_at;`, sessionID))
+	msgOutput, err := cmd.Output()
+	if err != nil {
+		return nil, nil
+	}
+
+	var rows []struct {
+		ID        string `json:"id"`
+		Role      string `json:"role"`
+		Parts     string `json:"parts"`
+		CreatedAt int64  `json:"created_at"`
+	}
+	if err := json.Unmarshal(msgOutput, &rows); err != nil || len(rows) == 0 {
+		return nil, nil
+	}
+
+	messages := make([]map[string]interface{}, 0, len(rows))
+	for _, row := range rows {
+		messages = append(messages, map[string]interface{}{
+			"id":      row.ID,
+			"role":    row.Role,
+			"content": extractOpenCodePartsText(row.Parts),
+			"time":    map[string]interface{}{"created": time.UnixMilli(row.CreatedAt).UTC().Format(time.RFC3339)},
+		})
+	}
+
+	transcriptData, err := json.Marshal(messages)
+	if err != nil {
+		return nil, nil
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      sessionID,
+		TranscriptPath: "",
+		StartedAt:      time.Now().Format(time.RFC3339),
+		ProjectPath:    projectPath,
+		TranscriptData: transcriptData,
+	}, nil
+}
+
+// extractOpenCodePartsText converts OpenCode's typed "parts" array (stored as
+// a JSON string in the messages.parts column) into the content block format
+// understood by parseOpenCodeMessage.
+func extractOpenCodePartsText(partsJSON string) []map[string]interface{} {
+	var parts []struct {
+		Type string          `json:"type"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(partsJSON), &parts); err != nil {
+		return nil
+	}
+
+	var blocks []map[string]interface{}
+	for _, part := range parts {
+		if part.Type != "text" && part.Type != "reasoning" {
+			continue
+		}
+		var textData struct {
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(part.Data, &textData) == nil && textData.Text != "" {
+			blocks = append(blocks, map[string]interface{}{"type": "text", "text": textData.Text})
+		}
+	}
+	return blocks
+}
+
+// discoverFromSQLite queries a legacy shared OpenCode SQLite database for the
+// most recent session, scoped by a project_id column. This supports older
+// OpenCode versions that stored a single shared database under the XDG data
+// directory instead of a project-local database.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
@@ -497,4 +628,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
