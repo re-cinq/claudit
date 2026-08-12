@@ -1,13 +1,28 @@
+```go
 package opencode
 
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
+)
+
+// maxSessionScanDepth bounds how deep the fallback session/message directory
+// scans recurse below the data directory, and maxSessionScanNodes bounds the
+// total number of filesystem entries visited. OpenCode has changed how it
+// nests session/message storage on disk across releases, so discovery falls
+// back to a bounded recursive scan rather than assuming one fixed layout.
+const (
+	maxSessionScanDepth = 6
+	maxSessionScanNodes = 20000
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -127,3 +142,149 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+
+// depthBelow returns how many path segments path is below root.
+func depthBelow(root, path string) int {
+	rel, err := filepath.Rel(root, path)
+	if err != nil || rel == "." {
+		return 0
+	}
+	return len(strings.Split(rel, string(filepath.Separator)))
+}
+
+// FindRecentSession scans the OpenCode data directory for the most recently
+// modified session belonging to projectPath, within agent.RecentSessionTimeout.
+//
+// It first tries the historically-documented flat-file layout,
+// "storage/session/<projectID>/<sessionID>.json". If that yields nothing —
+// OpenCode has changed exactly how it nests session files on disk across
+// releases — it falls back to a bounded recursive scan of "storage/session"
+// and matches candidate session files by their own embedded
+// "projectID"/"directory" fields instead of relying on directory nesting.
+func FindRecentSession(dataDir, projectID, projectPath string) (sessionID string, modTime time.Time, found bool) {
+	now := time.Now()
+
+	fastPathDir := filepath.Join(dataDir, "storage", "session", projectID)
+	if entries, err := os.ReadDir(fastPathDir); err == nil {
+		var bestID string
+		var bestModTime time.Time
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			mt := info.ModTime()
+			if now.Sub(mt) > agent.RecentSessionTimeout {
+				continue
+			}
+			if bestID == "" || mt.After(bestModTime) {
+				bestID = strings.TrimSuffix(entry.Name(), ".json")
+				bestModTime = mt
+			}
+		}
+		if bestID != "" {
+			return bestID, bestModTime, true
+		}
+	}
+
+	root := filepath.Join(dataDir, "storage", "session")
+	var bestID string
+	var bestModTime time.Time
+	visited := 0
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		visited++
+		if visited > maxSessionScanNodes {
+			return filepath.SkipAll
+		}
+		if d.IsDir() {
+			if depthBelow(root, path) > maxSessionScanDepth {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		mt := info.ModTime()
+		if now.Sub(mt) > agent.RecentSessionTimeout {
+			return nil
+		}
+		if bestID != "" && !mt.After(bestModTime) {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		var parsed sessionInfo
+		if err := json.Unmarshal(data, &parsed); err != nil {
+			return nil
+		}
+		matches := (parsed.ProjectID != "" && parsed.ProjectID == projectID) ||
+			(parsed.Directory != "" && agent.PathsEqual(parsed.Directory, projectPath))
+		if !matches {
+			return nil
+		}
+
+		id := parsed.ID
+		if id == "" {
+			id = strings.TrimSuffix(d.Name(), ".json")
+		}
+		bestID = id
+		bestModTime = mt
+		return nil
+	})
+
+	return bestID, bestModTime, bestID != ""
+}
+
+// FindMessageDir locates the directory containing a session's message
+// files. It first tries the historically-documented flat-file layout,
+// "storage/message/<sessionID>". If that doesn't exist, it falls back to a
+// bounded recursive search for a directory literally named after the
+// session ID anywhere under the data directory's storage tree, since
+// OpenCode has changed how it nests message files on disk across releases.
+func FindMessageDir(dataDir, sessionID string) string {
+	direct := filepath.Join(dataDir, "storage", "message", sessionID)
+	if info, err := os.Stat(direct); err == nil && info.IsDir() {
+		return direct
+	}
+
+	root := filepath.Join(dataDir, "storage")
+	var found string
+	visited := 0
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || found != "" {
+			return nil
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		visited++
+		if visited > maxSessionScanNodes {
+			return filepath.SkipAll
+		}
+		if depthBelow(root, path) > maxSessionScanDepth {
+			return filepath.SkipDir
+		}
+		if d.Name() == sessionID {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+
+	return found
+}
+```
