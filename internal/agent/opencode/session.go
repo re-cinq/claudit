@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -50,6 +51,14 @@ func GetProjectID(projectPath string) string {
 		return strings.TrimSpace(lines[0])
 	}
 	return "global"
+}
+
+// GetProjectDBPath returns the path to OpenCode's project-local SQLite
+// database. Modern OpenCode (v1.x+) stores all session and message data
+// here — scoped to the project by its location on disk — rather than under
+// the global XDG data directory used by older versions.
+func GetProjectDBPath(projectPath string) string {
+	return filepath.Join(projectPath, ".opencode", "opencode.db")
 }
 
 // GetSessionDir returns the session storage directory for a project.
@@ -127,3 +136,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
