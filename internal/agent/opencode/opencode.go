@@ -284,7 +284,19 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		}
 
 		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			// OpenCode's on-disk session filename doesn't always match its
+			// canonical session id (e.g. sortable/prefixed filenames), so
+			// prefer the "id" field recorded inside the file itself over
+			// the filename when it's available.
+			sessionID := strings.TrimSuffix(entry.Name(), ".json")
+			if data, readErr := os.ReadFile(filepath.Join(sessionDir, entry.Name())); readErr == nil {
+				var si sessionInfo
+				if json.Unmarshal(data, &si) == nil && si.ID != "" {
+					sessionID = si.ID
+				}
+			}
+
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
 	}
@@ -497,4 +509,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
