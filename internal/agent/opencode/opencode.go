@@ -47,7 +47,7 @@ func (a *Agent) DiagnoseHooks(repoRoot string) []agent.DiagnosticCheck {
 		checks = append(checks, agent.DiagnosticCheck{
 			Name:    "OpenCode plugin",
 			OK:      false,
-			Message: "Missing .opencode/plugins/shiftlog.js. Run 'shiftlog init --agent=opencode' to install.",
+			Message: "Missing .opencode/plugins/shiftlog.js. Run 'shiftlog init --agent=opencode' to update.",
 		})
 	}
 
@@ -305,6 +305,12 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
+//
+// Column names for timestamps (time_updated/time_created) have shifted across
+// OpenCode releases and aren't guaranteed to exist. Queries that depend on them
+// are tried first, but fall back to `rowid`-based ordering (insertion order,
+// always present on ordinary SQLite tables) so discovery still works when those
+// columns are missing or renamed.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
@@ -316,19 +322,30 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
+	// Find most recent session for this project. Prefer time_updated ordering,
+	// but fall back to rowid (insertion order) if that column doesn't exist.
 	sessionQuery := fmt.Sprintf(
 		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
 		projectID,
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
+	if err != nil {
+		fallbackQuery := fmt.Sprintf(
+			`SELECT id FROM session WHERE project_id='%s' ORDER BY rowid DESC LIMIT 1;`,
+			projectID,
+		)
+		cmd = exec.Command("sqlite3", "-separator", "\t", dbPath, fallbackQuery)
+		sessionOutput, err = cmd.Output()
+	}
 	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
 		return nil, nil
 	}
 	sessionID := strings.TrimSpace(string(sessionOutput))
 
-	// Check if this session was recent (within timeout)
+	// Check if this session was recent (within timeout). If the time_updated
+	// column doesn't exist, we can't determine recency from SQL — proceed
+	// anyway since rowid ordering above already favored the newest session.
 	timeQuery := fmt.Sprintf(
 		`SELECT time_updated FROM session WHERE id='%s';`,
 		sessionID,
@@ -353,13 +370,23 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
 
-	// Get messages for this session as a JSON array
+	// Get messages for this session as a JSON array. Prefer time_created
+	// ordering, but fall back to rowid (insertion order) if that column
+	// doesn't exist.
 	msgQuery := fmt.Sprintf(
 		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
 		sessionID,
 	)
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
+	if err != nil {
+		fallbackMsgQuery := fmt.Sprintf(
+			`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY rowid;`,
+			sessionID,
+		)
+		cmd = exec.Command("sqlite3", dbPath, fallbackMsgQuery)
+		msgOutput, err = cmd.Output()
+	}
 	if err != nil {
 		return nil, nil
 	}
@@ -497,4 +524,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
