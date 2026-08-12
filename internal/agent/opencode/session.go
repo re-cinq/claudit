@@ -73,6 +73,36 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// resolveMessageDir finds the message directory for a session, tolerating
+// storage layouts where messages aren't nested directly under
+// storage/message/<sessionID> (observed across OpenCode releases). Falls
+// back to the conventional path if no directory named after the session ID
+// is found elsewhere under storage/.
+func resolveMessageDir(dataDir, sessionID string) string {
+	conventional := filepath.Join(dataDir, "storage", "message", sessionID)
+	if info, err := os.Stat(conventional); err == nil && info.IsDir() {
+		return conventional
+	}
+
+	storageRoot := filepath.Join(dataDir, "storage")
+	var found string
+	_ = filepath.Walk(storageRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil || found != "" {
+			return nil
+		}
+		if info != nil && info.IsDir() && info.Name() == sessionID {
+			found = path
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	if found != "" {
+		return found
+	}
+
+	return conventional
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
