@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +129,103 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// recentStorageKeywords identify path segments that indicate a file is part
+// of OpenCode's session/message storage, as opposed to unrelated config,
+// auth, or cache files that also live under the data directory.
+var recentStorageKeywords = []string{"session", "message", "storage", "project"}
+
+// looksLikeStorageFile reports whether path contains at least one segment
+// associated with OpenCode's session/message storage.
+func looksLikeStorageFile(path string) bool {
+	lower := strings.ToLower(path)
+	for _, kw := range recentStorageKeywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// discoverByRecentFile performs a storage-layout-agnostic scan of the
+// OpenCode data directory for the most recently modified session/message
+// file within RecentSessionTimeout. This is a last-resort fallback used
+// when neither the flat-file layout (storage/session/<projectID>/*.json)
+// nor the SQLite layout (opencode.db) match what's on disk — e.g. because
+// a newer OpenCode release reorganized its storage directories.
+func discoverByRecentFile(dataDir, projectPath string) (*agent.SessionInfo, error) {
+	if _, err := os.Stat(dataDir); err != nil {
+		return nil, nil
+	}
+
+	now := time.Now()
+	var bestPath string
+	var bestModTime time.Time
+
+	_ = filepath.WalkDir(dataDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if !strings.HasSuffix(name, ".json") && !strings.HasSuffix(name, ".jsonl") {
+			return nil
+		}
+		if !looksLikeStorageFile(path) {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return nil
+		}
+
+		if bestPath == "" || modTime.After(bestModTime) {
+			bestPath = path
+			bestModTime = modTime
+		}
+		return nil
+	})
+
+	if bestPath == "" {
+		return nil, nil
+	}
+
+	dir := filepath.Dir(bestPath)
+	sessionID := strings.TrimSuffix(filepath.Base(bestPath), filepath.Ext(bestPath))
+	transcriptPath := bestPath
+
+	// If the containing directory holds multiple message-like files, treat
+	// the whole directory as the transcript source and use its name as the
+	// session ID (mirrors the flat-file message-directory layout).
+	if entries, err := os.ReadDir(dir); err == nil {
+		jsonCount := 0
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			if strings.HasSuffix(e.Name(), ".json") || strings.HasSuffix(e.Name(), ".jsonl") {
+				jsonCount++
+			}
+		}
+		if jsonCount > 1 {
+			transcriptPath = dir
+			sessionID = filepath.Base(dir)
+		}
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      sessionID,
+		TranscriptPath: transcriptPath,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
 }
