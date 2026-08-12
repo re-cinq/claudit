@@ -74,7 +74,7 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 	// Instead, we reconstruct from the data directory and session ID.
 	transcriptPath := ""
 	if hook.DataDir != "" && hook.SessionID != "" {
-		transcriptPath = filepath.Join(hook.DataDir, "storage", "message", hook.SessionID)
+		transcriptPath = resolveMessageDir(hook.DataDir, hook.SessionID)
 	}
 
 	// Use inline transcript data from the plugin SDK client if available
@@ -230,8 +230,18 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first scans the modern session-info storage (OpenCode 1.x), which
+// records sessions as individual files under storage/session/info keyed
+// by session ID rather than partitioned by project on disk. If that
+// yields nothing (older releases, or a layout we don't recognize), it
+// falls back to legacy flat file storage, then to SQLite discovery.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	if dataDir, err := GetDataDir(); err == nil {
+		if session := discoverFromSessionInfo(dataDir, projectPath); session != nil {
+			return session, nil
+		}
+	}
+
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
@@ -249,6 +259,145 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 
 	projectID := GetProjectID(projectPath)
 	return discoverFromSQLite(dataDir, projectID, projectPath)
+}
+
+// discoverFromSessionInfo scans OpenCode's session info storage
+// (storage/session/info/<id>.json) for the most recently updated session
+// belonging to projectPath. Modern OpenCode releases store one JSON file
+// per session here (not partitioned by project on disk), with a
+// "directory" (or "cwd"/"path") field recording the project the session
+// was started in. Returns nil if the directory doesn't exist or no
+// matching, recent session is found — callers should fall back to other
+// discovery strategies in that case.
+func discoverFromSessionInfo(dataDir, projectPath string) *agent.SessionInfo {
+	infoDir := filepath.Join(dataDir, "storage", "session", "info")
+	entries, err := os.ReadDir(infoDir)
+	if err != nil {
+		return nil
+	}
+
+	now := time.Now()
+	var best *agent.SessionInfo
+	var bestTime time.Time
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+
+		data, err := os.ReadFile(filepath.Join(infoDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+
+		var rec struct {
+			ID        string `json:"id"`
+			Directory string `json:"directory"`
+			Cwd       string `json:"cwd"`
+			Path      string `json:"path"`
+			Time      struct {
+				Created json.RawMessage `json:"created"`
+				Updated json.RawMessage `json:"updated"`
+			} `json:"time"`
+			Created json.RawMessage `json:"created"`
+			Updated json.RawMessage `json:"updated"`
+		}
+		if err := json.Unmarshal(data, &rec); err != nil {
+			continue
+		}
+
+		dir := rec.Directory
+		if dir == "" {
+			dir = rec.Cwd
+		}
+		if dir == "" {
+			dir = rec.Path
+		}
+		if dir == "" || !agent.PathsEqual(dir, projectPath) {
+			continue
+		}
+
+		sessionID := rec.ID
+		if sessionID == "" {
+			sessionID = strings.TrimSuffix(entry.Name(), ".json")
+		}
+
+		updated, ok := parseOpenCodeTime(rec.Time.Updated)
+		if !ok {
+			updated, ok = parseOpenCodeTime(rec.Time.Created)
+		}
+		if !ok {
+			updated, ok = parseOpenCodeTime(rec.Updated)
+		}
+		if !ok {
+			updated, ok = parseOpenCodeTime(rec.Created)
+		}
+		if !ok {
+			if info, statErr := os.Stat(filepath.Join(infoDir, entry.Name())); statErr == nil {
+				updated = info.ModTime()
+				ok = true
+			}
+		}
+		if !ok || now.Sub(updated) > agent.RecentSessionTimeout {
+			continue
+		}
+
+		if best != nil && !updated.After(bestTime) {
+			continue
+		}
+
+		session := &agent.SessionInfo{
+			SessionID:   sessionID,
+			StartedAt:   updated.Format(time.RFC3339),
+			ProjectPath: projectPath,
+		}
+
+		// Prefer real transcript content when we can find the message
+		// directory, but don't fail discovery just because we can't --
+		// an empty-but-valid conversation record beats none at all.
+		if msgDir := resolveMessageDir(dataDir, sessionID); dirHasEntries(msgDir) {
+			session.TranscriptPath = msgDir
+		} else {
+			session.TranscriptData = []byte("[]")
+		}
+
+		best = session
+		bestTime = updated
+	}
+
+	return best
+}
+
+// dirHasEntries reports whether dir exists and contains at least one entry.
+func dirHasEntries(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	return err == nil && len(entries) > 0
+}
+
+// parseOpenCodeTime parses an OpenCode timestamp, which may be encoded as
+// milliseconds since the Unix epoch (modern releases) or as an
+// RFC3339-ish string (older releases).
+func parseOpenCodeTime(raw json.RawMessage) (time.Time, bool) {
+	if len(raw) == 0 {
+		return time.Time{}, false
+	}
+
+	var ms float64
+	if err := json.Unmarshal(raw, &ms); err == nil {
+		return time.UnixMilli(int64(ms)), true
+	}
+
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		layouts := []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05.000Z", "2006-01-02 15:04:05"}
+		for _, layout := range layouts {
+			if t, err := time.Parse(layout, s); err == nil {
+				return t, true
+			}
+		}
+	}
+
+	return time.Time{}, false
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -483,7 +632,6 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 		var blocks []agent.ContentBlock
 		if err := json.Unmarshal(contentRaw, &blocks); err == nil && len(blocks) > 0 {
 			msg.Content = blocks
-			return msg
 		}
 	}
 
@@ -497,4 +645,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
