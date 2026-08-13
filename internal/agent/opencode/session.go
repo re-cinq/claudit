@@ -34,6 +34,14 @@ func GetDataDir() (string, error) {
 	return filepath.Join(home, ".local", "share", "opencode"), nil
 }
 
+// GetLocalDBPath returns the path to OpenCode's project-local SQLite
+// database. Current OpenCode versions store each project's sessions and
+// messages in .opencode/opencode.db inside the project itself, rather than
+// under the global XDG data directory.
+func GetLocalDBPath(projectPath string) string {
+	return filepath.Join(projectPath, ".opencode", "opencode.db")
+}
+
 // GetProjectID returns the project identifier for OpenCode.
 // For git repos, this is the root commit hash. For non-git dirs, it's "global".
 func GetProjectID(projectPath string) string {
