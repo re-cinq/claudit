@@ -12,26 +12,44 @@ import (
 
 // GetDataDir returns the OpenCode data directory.
 // OpenCode follows XDG conventions: it uses $XDG_DATA_HOME/opencode on Linux
-// and ~/Library/Application Support/opencode on macOS.
+// and ~/Library/Application Support/opencode on macOS. Newer OpenCode releases
+// moved session/message storage to $XDG_STATE_HOME/opencode instead, since
+// that data is local application state rather than user data. On Linux we
+// prefer whichever of the two directories already has data on disk, and fall
+// back to the XDG_DATA_HOME location (the historical default) when neither
+// exists yet, so behaviour for fresh installs is unchanged.
 func GetDataDir() (string, error) {
-	if runtime.GOOS == "darwin" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", fmt.Errorf("could not determine home directory: %w", err)
-		}
-		return filepath.Join(home, "Library", "Application Support", "opencode"), nil
-	}
-
-	// Linux/other: respect XDG_DATA_HOME, default to ~/.local/share
-	if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
-		return filepath.Join(xdg, "opencode"), nil
-	}
-
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("could not determine home directory: %w", err)
 	}
-	return filepath.Join(home, ".local", "share", "opencode"), nil
+
+	if runtime.GOOS == "darwin" {
+		return filepath.Join(home, "Library", "Application Support", "opencode"), nil
+	}
+
+	// Linux/other: respect XDG_DATA_HOME, default to ~/.local/share
+	dataHome := os.Getenv("XDG_DATA_HOME")
+	if dataHome == "" {
+		dataHome = filepath.Join(home, ".local", "share")
+	}
+	dataCandidate := filepath.Join(dataHome, "opencode")
+
+	// Some newer OpenCode releases store session/message state under
+	// XDG_STATE_HOME instead. Prefer it if it already exists on disk.
+	stateHome := os.Getenv("XDG_STATE_HOME")
+	if stateHome == "" {
+		stateHome = filepath.Join(home, ".local", "state")
+	}
+	stateCandidate := filepath.Join(stateHome, "opencode")
+
+	for _, candidate := range []string{dataCandidate, stateCandidate} {
+		if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+			return candidate, nil
+		}
+	}
+
+	return dataCandidate, nil
 }
 
 // GetProjectID returns the project identifier for OpenCode.

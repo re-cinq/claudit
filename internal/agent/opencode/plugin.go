@@ -57,9 +57,25 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
         }
       }
 
-      const dataDir = process.platform === "darwin"
-          ? process.env.HOME + "/Library/Application Support/opencode"
-          : (process.env.XDG_DATA_HOME || process.env.HOME + "/.local/share") + "/opencode";
+      // Resolve the OpenCode data directory. Older releases store session
+      // data under XDG_DATA_HOME; newer releases moved it to XDG_STATE_HOME.
+      // Prefer whichever one already exists on disk.
+      const dataDir = await (async () => {
+        if (process.platform === "darwin") {
+          return process.env.HOME + "/Library/Application Support/opencode";
+        }
+        const dataCandidate = (process.env.XDG_DATA_HOME || process.env.HOME + "/.local/share") + "/opencode";
+        const stateCandidate = (process.env.XDG_STATE_HOME || process.env.HOME + "/.local/state") + "/opencode";
+        try {
+          const fs = await import("fs");
+          if (fs.existsSync(stateCandidate) && !fs.existsSync(dataCandidate)) {
+            return stateCandidate;
+          }
+        } catch (e) {
+          // Fall through to the historical default below
+        }
+        return dataCandidate;
+      })();
 
       const hookData = JSON.stringify({
         session_id: pending.sessionID || "",
