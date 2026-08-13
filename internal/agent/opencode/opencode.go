@@ -230,7 +230,9 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first tries flat file storage (pre-v1.2), then a broad content-based
+// scan of the storage tree (for releases that reorganized the layout), then
+// falls back to SQLite (v1.2+ migration mode).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
@@ -241,12 +243,23 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
+	// OpenCode has repeatedly reorganized its on-disk session layout across
+	// releases, so GetSessionDir's project-ID-folder scheme may no longer
+	// match. Scan the storage tree broadly by content instead of a fixed path.
+	session, err = DiscoverByScanning(dataDir, projectPath)
+	if err != nil {
+		return nil, err
+	}
+	if session != nil {
+		return session, nil
+	}
+
+	// Fall back to SQLite (OpenCode v1.2+ migration mode)
 	projectID := GetProjectID(projectPath)
 	return discoverFromSQLite(dataDir, projectID, projectPath)
 }
@@ -412,6 +425,24 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 		Raw: json.RawMessage(append([]byte{}, fullData...)),
 	}
 
+	// Newer OpenCode releases wrap role/id/time in a nested "info" object
+	// and keep content separately in a "parts" array, instead of a flat
+	// {role, id, time, content} shape. Fill in any fields missing at the
+	// top level from "info" so the parsing below works either way.
+	if infoRaw, ok := raw["info"]; ok {
+		var info map[string]json.RawMessage
+		if err := json.Unmarshal(infoRaw, &info); err == nil {
+			merged := make(map[string]json.RawMessage, len(raw)+len(info))
+			for k, v := range info {
+				merged[k] = v
+			}
+			for k, v := range raw {
+				merged[k] = v
+			}
+			raw = merged
+		}
+	}
+
 	// Parse role field
 	if roleRaw, ok := raw["role"]; ok {
 		var role string
@@ -487,6 +518,32 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 		}
 	}
 
+	// Try "parts" array (OpenCode's typed content format used when a
+	// message's content is split into separate text/reasoning/tool parts
+	// rather than a single "content" field)
+	if partsRaw, ok := raw["parts"]; ok {
+		var parts []json.RawMessage
+		if err := json.Unmarshal(partsRaw, &parts); err == nil && len(parts) > 0 {
+			var blocks []agent.ContentBlock
+			for _, p := range parts {
+				var part struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				}
+				if err := json.Unmarshal(p, &part); err != nil || part.Text == "" {
+					continue
+				}
+				if part.Type == "text" || part.Type == "reasoning" || part.Type == "" {
+					blocks = append(blocks, agent.ContentBlock{Type: "text", Text: part.Text})
+				}
+			}
+			if len(blocks) > 0 {
+				msg.Content = blocks
+				return msg
+			}
+		}
+	}
+
 	// Try "message" field
 	if msgRaw, ok := raw["message"]; ok {
 		var innerMsg agent.Message
@@ -497,4 +554,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
