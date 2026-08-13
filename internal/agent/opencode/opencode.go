@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -252,15 +253,28 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
+// It first checks the directory keyed by our own computed project ID (fast
+// path), then falls back to scanning every project directory under
+// storage/session/ and matching by each session file's own "directory"
+// field — OpenCode's project ID scheme may not match our git-root-commit-hash
+// computation for every version.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionDir(projectPath)
-	if err != nil {
-		return nil, nil
+	if err == nil {
+		if session := scanSessionDir(sessionDir, projectPath); session != nil {
+			return session, nil
+		}
 	}
 
+	return scanAllProjectSessionDirs(projectPath)
+}
+
+// scanSessionDir scans a single project's session directory for the most
+// recently modified session file within the recency window.
+func scanSessionDir(sessionDir, projectPath string) *agent.SessionInfo {
 	dirEntries, err := os.ReadDir(sessionDir)
 	if err != nil {
-		return nil, nil
+		return nil
 	}
 
 	now := time.Now()
@@ -290,10 +304,100 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}
 
 	if bestSessionID == "" {
-		return nil, nil
+		return nil
 	}
 
 	// The transcript path for OpenCode is the message directory
+	msgDir, _ := GetMessageDir(bestSessionID)
+
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: msgDir,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}
+}
+
+// scanAllProjectSessionDirs scans every project directory under
+// storage/session/ and matches sessions by their own "directory" field
+// instead of trusting our directory-name guess. This mirrors the fallback
+// scan already used by the Gemini and Codex agents for the same class of
+// problem (ScanAllProjectDirs / FindRecentRollout).
+func scanAllProjectSessionDirs(projectPath string) (*agent.SessionInfo, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return nil, nil
+	}
+
+	sessionsRoot := filepath.Join(dataDir, "storage", "session")
+	projectDirs, err := os.ReadDir(sessionsRoot)
+	if err != nil {
+		return nil, nil
+	}
+
+	now := time.Now()
+	recentTimeout := agent.RecentSessionTimeout
+	var bestSessionID string
+	var bestModTime time.Time
+
+	for _, projDir := range projectDirs {
+		if !projDir.IsDir() {
+			continue
+		}
+
+		dir := filepath.Join(sessionsRoot, projDir.Name())
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+
+			modTime := info.ModTime()
+			if now.Sub(modTime) > recentTimeout {
+				continue
+			}
+
+			data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+			if err != nil {
+				continue
+			}
+
+			var header struct {
+				ID        string `json:"id"`
+				Directory string `json:"directory"`
+			}
+			if json.Unmarshal(data, &header) != nil || header.Directory == "" {
+				continue
+			}
+			if !agent.PathsEqual(header.Directory, projectPath) {
+				continue
+			}
+
+			sessionID := header.ID
+			if sessionID == "" {
+				sessionID = strings.TrimSuffix(entry.Name(), ".json")
+			}
+
+			if bestSessionID == "" || modTime.After(bestModTime) {
+				bestSessionID = sessionID
+				bestModTime = modTime
+			}
+		}
+	}
+
+	if bestSessionID == "" {
+		return nil, nil
+	}
+
 	msgDir, _ := GetMessageDir(bestSessionID)
 
 	return &agent.SessionInfo{
@@ -497,4 +601,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
