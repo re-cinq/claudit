@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -230,9 +231,24 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+//
+// OpenCode's on-disk storage layout has changed across releases (flat
+// per-project files, nested project directories, SQLite), so discovery
+// first performs a layout-agnostic scan of the whole data directory for
+// the most recently touched session, then falls back to the fixed-path
+// flat file layout (pre-v1.2 OpenCode), then to SQLite storage (some
+// OpenCode versions store sessions in a database).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return nil, nil
+	}
+
+	if session, scanErr := discoverByScanningDataDir(dataDir, projectPath); scanErr == nil && session != nil {
+		return session, nil
+	}
+
+	// Try flat file storage next (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
 		return nil, err
@@ -241,14 +257,92 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
-	dataDir, err := GetDataDir()
-	if err != nil {
+	// Fall back to SQLite (some OpenCode versions store sessions in a database).
+	projectID := GetProjectID(projectPath)
+	return discoverFromSQLite(dataDir, projectID, projectPath)
+}
+
+// discoverByScanningDataDir performs a layout-agnostic scan of the OpenCode
+// data directory for the most recently touched session. Regardless of how
+// OpenCode nests its storage directories, session messages are grouped by
+// session ID under a directory literally named "message" somewhere in the
+// tree, so we walk the whole data directory looking for that pattern
+// instead of assuming one fixed path depth.
+func discoverByScanningDataDir(dataDir, projectPath string) (*agent.SessionInfo, error) {
+	if _, err := os.Stat(dataDir); err != nil {
 		return nil, nil
 	}
 
-	projectID := GetProjectID(projectPath)
-	return discoverFromSQLite(dataDir, projectID, projectPath)
+	type candidate struct {
+		dir     string
+		modTime time.Time
+	}
+
+	now := time.Now()
+	sessions := make(map[string]candidate)
+
+	_ = filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if !strings.HasSuffix(name, ".json") && !strings.HasSuffix(name, ".jsonl") {
+			return nil
+		}
+
+		rel, err := filepath.Rel(dataDir, path)
+		if err != nil {
+			return nil
+		}
+		parts := strings.Split(filepath.ToSlash(rel), "/")
+
+		sessionID := ""
+		msgDirDepth := 0
+		for i, p := range parts {
+			if p == "message" && i+1 < len(parts) {
+				sessionID = parts[i+1]
+				msgDirDepth = i + 2
+				break
+			}
+		}
+		if sessionID == "" {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return nil
+		}
+
+		msgDir := filepath.Join(dataDir, filepath.Join(parts[:msgDirDepth]...))
+		if c, ok := sessions[sessionID]; !ok || modTime.After(c.modTime) {
+			sessions[sessionID] = candidate{dir: msgDir, modTime: modTime}
+		}
+		return nil
+	})
+
+	var bestID string
+	var best candidate
+	for id, c := range sessions {
+		if bestID == "" || c.modTime.After(best.modTime) {
+			bestID = id
+			best = c
+		}
+	}
+	if bestID == "" {
+		return nil, nil
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      bestID,
+		TranscriptPath: best.dir,
+		StartedAt:      best.modTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -497,4 +591,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
