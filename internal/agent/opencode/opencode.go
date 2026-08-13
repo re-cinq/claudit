@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -186,53 +187,63 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 }
 
 // parseMessageDir reads all message files from an OpenCode message directory.
+// It recurses into subdirectories since newer OpenCode versions nest message
+// content under per-message (and per-part) subdirectories rather than storing
+// everything as flat files directly inside the session's message directory.
 func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
-	dirEntries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-
 	var entries []agent.TranscriptEntry
-	for _, de := range dirEntries {
-		if de.IsDir() || !strings.HasSuffix(de.Name(), ".json") {
-			// Handle .jsonl files too
-			if strings.HasSuffix(de.Name(), ".jsonl") {
-				f, err := os.Open(filepath.Join(dir, de.Name()))
-				if err != nil {
-					continue
-				}
-				transcript, err := a.ParseTranscript(f)
-				_ = f.Close()
-				if err == nil {
-					entries = append(entries, transcript.Entries...)
-				}
+
+	walkErr := filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+
+		name := info.Name()
+		switch {
+		case strings.HasSuffix(name, ".jsonl"):
+			f, openErr := os.Open(p)
+			if openErr != nil {
+				return nil
 			}
-			continue
+			transcript, parseErr := a.ParseTranscript(f)
+			_ = f.Close()
+			if parseErr == nil {
+				entries = append(entries, transcript.Entries...)
+			}
+		case strings.HasSuffix(name, ".json"):
+			data, readErr := os.ReadFile(p)
+			if readErr != nil {
+				return nil
+			}
+
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal(data, &raw); err != nil {
+				return nil
+			}
+
+			entry := parseOpenCodeEntry(raw, data)
+			if entry.Type != "" {
+				entries = append(entries, entry)
+			}
 		}
 
-		data, err := os.ReadFile(filepath.Join(dir, de.Name()))
-		if err != nil {
-			continue
-		}
-
-		var raw map[string]json.RawMessage
-		if err := json.Unmarshal(data, &raw); err != nil {
-			continue
-		}
-
-		entry := parseOpenCodeEntry(raw, data)
-		if entry.Type != "" {
-			entries = append(entries, entry)
-		}
+		return nil
+	})
+	if walkErr != nil {
+		return nil, walkErr
 	}
 
 	return &agent.Transcript{Entries: entries}, nil
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first tries flat file storage using the layout we ourselves write via
+// WriteSessionFile, then falls back to a broader, format-tolerant scan of the
+// OpenCode data directory (real OpenCode installs have changed their on-disk
+// session layout across versions), then finally SQLite for older releases
+// that used it.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
+	// Try flat file storage first (our own known layout)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
 		return nil, err
@@ -241,12 +252,20 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
+	// Fall back to a content-based scan that tolerates OpenCode storage
+	// layout changes (project-id-keyed subdirectories, nested info/message/
+	// part folders, etc.) by matching on the session's recorded project
+	// directory instead of a guessed path shape.
+	if session := a.discoverByScanning(dataDir, projectPath); session != nil {
+		return session, nil
+	}
+
+	// Fall back to SQLite (older OpenCode releases)
 	projectID := GetProjectID(projectPath)
 	return discoverFromSQLite(dataDir, projectID, projectPath)
 }
@@ -302,6 +321,30 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// discoverByScanning performs a format-tolerant scan of the OpenCode data
+// directory for a recent session belonging to projectPath. See
+// scanRecentSessions/pickRecentSession/collectSessionMessages in session.go.
+func (a *Agent) discoverByScanning(dataDir, projectPath string) *agent.SessionInfo {
+	candidates := scanRecentSessions(dataDir, agent.RecentSessionTimeout)
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	best := pickRecentSession(candidates, projectPath)
+	if best == nil {
+		return nil
+	}
+
+	transcriptData := collectSessionMessages(dataDir, best.ID, best.Path)
+
+	return &agent.SessionInfo{
+		SessionID:      best.ID,
+		StartedAt:      best.ModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+		TranscriptData: transcriptData,
+	}
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -497,4 +540,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
