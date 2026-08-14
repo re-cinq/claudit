@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +129,73 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// FindRecentSessionByDirectory recursively scans dataDir for a session file
+// whose "directory" field matches projectPath, modified within timeout.
+// OpenCode's on-disk storage layout has changed across releases (the exact
+// nesting under the data directory is not stable), so this does not assume
+// any particular directory structure beneath dataDir — it matches purely on
+// file content.
+func FindRecentSessionByDirectory(dataDir, projectPath string, timeout time.Duration) (sessionID, sessionFilePath string) {
+	now := time.Now()
+	var bestModTime time.Time
+
+	_ = filepath.Walk(dataDir, func(p string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if info.IsDir() || !strings.HasSuffix(info.Name(), ".json") {
+			return nil
+		}
+		if now.Sub(info.ModTime()) > timeout {
+			return nil
+		}
+
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+
+		var rec sessionInfo
+		if err := json.Unmarshal(data, &rec); err != nil || rec.ID == "" || rec.Directory == "" {
+			return nil
+		}
+
+		if !agent.PathsEqual(rec.Directory, projectPath) {
+			return nil
+		}
+
+		if sessionFilePath == "" || info.ModTime().After(bestModTime) {
+			sessionID = rec.ID
+			sessionFilePath = p
+			bestModTime = info.ModTime()
+		}
+		return nil
+	})
+
+	return sessionID, sessionFilePath
+}
+
+// FindMessageDir recursively searches dataDir for a directory named after
+// sessionID. OpenCode typically stores a session's message files in a
+// directory named after the session ID, but the parent path of that
+// directory varies across versions, so it is located by name rather than by
+// assuming a fixed layout.
+func FindMessageDir(dataDir, sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+
+	var found string
+	_ = filepath.Walk(dataDir, func(p string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || found != "" {
+			return nil
+		}
+		if info.IsDir() && info.Name() == sessionID {
+			found = p
+		}
+		return nil
+	})
+	return found
 }
