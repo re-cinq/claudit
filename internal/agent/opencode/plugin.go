@@ -35,27 +35,51 @@ export const ShiftlogPlugin = async ({ directory, client }) => {
     },
 
     "tool.execute.after": async (input, output) => {
-      const pending = pendingCommits.get(input.callID);
-      if (!pending) return;
-      pendingCommits.delete(input.callID);
-
-      // Try to fetch messages via the SDK client API
+      // Fetch the session transcript via the SDK client API. This is done on
+      // every tool call (not just git commits) and cached to disk so that a
+      // later *manual* commit — which runs outside the plugin, via the
+      // post-commit hook — can still find the transcript. OpenCode's on-disk
+      // session storage layout has changed across releases, but the client
+      // SDK's message API stays stable, so caching through it here is more
+      // reliable than shiftlog reverse-engineering the storage format.
       let transcriptData = "";
-      if (client && pending.sessionID) {
+      if (client && input.sessionID) {
         try {
-          const msgs = await client.session.messages({ path: { id: pending.sessionID } });
+          const msgs = await client.session.messages({ path: { id: input.sessionID } });
           if (msgs && Array.isArray(msgs)) {
-            transcriptData = JSON.stringify(msgs.map(m => ({
+            const transcriptMessages = msgs.map(m => ({
               role: m.role || "",
               id: m.id || "",
               content: m.content || "",
               time: m.time || {},
-            })));
+            }));
+            transcriptData = JSON.stringify(transcriptMessages);
+
+            try {
+              const fs = await import("fs");
+              const path = await import("path");
+              const cacheDir = path.join(directory, ".shiftlog");
+              fs.mkdirSync(cacheDir, { recursive: true });
+              fs.writeFileSync(
+                path.join(cacheDir, "opencode-session-cache.json"),
+                JSON.stringify({
+                  session_id: input.sessionID,
+                  updated_at: new Date().toISOString(),
+                  transcript_data: transcriptMessages,
+                })
+              );
+            } catch (e) {
+              // Best-effort cache; ignore failures
+            }
           }
         } catch (e) {
           // Fall back to data_dir approach below
         }
       }
+
+      const pending = pendingCommits.get(input.callID);
+      if (!pending) return;
+      pendingCommits.delete(input.callID);
 
       const dataDir = process.platform === "darwin"
           ? process.env.HOME + "/Library/Application Support/opencode"

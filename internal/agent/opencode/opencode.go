@@ -230,8 +230,18 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first tries the plugin-written session cache (most reliable, since it
+// goes through OpenCode's own client SDK rather than its on-disk storage
+// format), then flat file storage (pre-v1.2), then falls back to SQLite
+// (v1.2+).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	// Prefer the plugin-written session cache: it uses OpenCode's client SDK
+	// to fetch messages, so it stays correct even when OpenCode's internal
+	// on-disk storage format changes between releases.
+	if cached := ReadSessionCache(projectPath); cached != nil {
+		return cached, nil
+	}
+
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
@@ -454,7 +464,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +506,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-

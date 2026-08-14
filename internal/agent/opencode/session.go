@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +129,48 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// sessionCacheFile represents the on-disk cache written by the shiftlog
+// OpenCode plugin after each tool call, via ShiftlogPlugin's client-SDK
+// transcript fetch (see plugin.go). It lets manual (non-plugin) commits
+// discover the active session without depending on OpenCode's internal
+// on-disk storage layout, which has changed across OpenCode releases.
+type sessionCacheFile struct {
+	SessionID      string          `json:"session_id"`
+	UpdatedAt      string          `json:"updated_at"`
+	TranscriptData json.RawMessage `json:"transcript_data"`
+}
+
+// ReadSessionCache reads the plugin-written session cache for a project.
+// Returns nil (with no error) if no cache exists, it can't be parsed, or it
+// is older than agent.RecentSessionTimeout.
+func ReadSessionCache(projectPath string) *agent.SessionInfo {
+	cachePath := filepath.Join(projectPath, ".shiftlog", "opencode-session-cache.json")
+
+	data, err := os.ReadFile(cachePath)
+	if err != nil {
+		return nil
+	}
+
+	var cache sessionCacheFile
+	if err := json.Unmarshal(data, &cache); err != nil {
+		return nil
+	}
+
+	if cache.SessionID == "" || len(cache.TranscriptData) == 0 {
+		return nil
+	}
+
+	updatedAt, err := time.Parse(time.RFC3339, cache.UpdatedAt)
+	if err != nil || time.Since(updatedAt) > agent.RecentSessionTimeout {
+		return nil
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      cache.SessionID,
+		StartedAt:      cache.UpdatedAt,
+		ProjectPath:    projectPath,
+		TranscriptData: []byte(cache.TranscriptData),
+	}
 }
