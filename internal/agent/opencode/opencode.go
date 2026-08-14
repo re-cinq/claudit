@@ -1,12 +1,16 @@
+```go
 package opencode
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -186,31 +190,50 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 }
 
 // parseMessageDir reads all message files from an OpenCode message directory.
+// Recurses one level into subdirectories, since some OpenCode releases nest
+// per-message data under an extra directory (e.g. message/<id>/parts/*.json).
 func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
-	dirEntries, err := os.ReadDir(dir)
-	if err != nil {
+	var entries []agent.TranscriptEntry
+	if err := a.collectMessageFiles(dir, 1, &entries); err != nil {
 		return nil, err
 	}
+	return &agent.Transcript{Entries: entries}, nil
+}
 
-	var entries []agent.TranscriptEntry
+func (a *Agent) collectMessageFiles(dir string, depthRemaining int, entries *[]agent.TranscriptEntry) error {
+	dirEntries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+
 	for _, de := range dirEntries {
-		if de.IsDir() || !strings.HasSuffix(de.Name(), ".json") {
-			// Handle .jsonl files too
-			if strings.HasSuffix(de.Name(), ".jsonl") {
-				f, err := os.Open(filepath.Join(dir, de.Name()))
-				if err != nil {
-					continue
-				}
-				transcript, err := a.ParseTranscript(f)
-				_ = f.Close()
-				if err == nil {
-					entries = append(entries, transcript.Entries...)
-				}
+		path := filepath.Join(dir, de.Name())
+
+		if de.IsDir() {
+			if depthRemaining > 0 {
+				_ = a.collectMessageFiles(path, depthRemaining-1, entries)
 			}
 			continue
 		}
 
-		data, err := os.ReadFile(filepath.Join(dir, de.Name()))
+		if strings.HasSuffix(de.Name(), ".jsonl") {
+			f, err := os.Open(path)
+			if err != nil {
+				continue
+			}
+			transcript, err := a.ParseTranscript(f)
+			_ = f.Close()
+			if err == nil {
+				*entries = append(*entries, transcript.Entries...)
+			}
+			continue
+		}
+
+		if !strings.HasSuffix(de.Name(), ".json") {
+			continue
+		}
+
+		data, err := os.ReadFile(path)
 		if err != nil {
 			continue
 		}
@@ -222,17 +245,19 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 
 		entry := parseOpenCodeEntry(raw, data)
 		if entry.Type != "" {
-			entries = append(entries, entry)
+			*entries = append(*entries, entry)
 		}
 	}
 
-	return &agent.Transcript{Entries: entries}, nil
+	return nil
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first tries flat file storage, then falls back to SQLite. OpenCode's
+// on-disk storage layout and schema have changed across releases, so both
+// paths are written to tolerate drift rather than assume one fixed shape.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
+	// Try flat file storage first
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
 		return nil, err
@@ -241,7 +266,7 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
+	// Fall back to SQLite
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
@@ -251,60 +276,103 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 	return discoverFromSQLite(dataDir, projectID, projectPath)
 }
 
-// discoverFromFlatFiles tries the legacy flat file session discovery.
+// discoverFromFlatFiles tries the flat file session discovery.
+//
+// The preferred layout is <dataDir>/storage/session/<projectID>/<sessionID>.json,
+// but some OpenCode releases store session files without the per-project
+// subdirectory. To tolerate that, we walk the whole storage/session tree and
+// match candidates either by their parent directory name (legacy layout) or
+// by a "directory"/"projectID" field inside the session file itself.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
-	if err != nil {
-		return nil, nil
-	}
+	projectID := GetProjectID(projectPath)
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestSessionID string
+	var bestPath string
 	var bestModTime time.Time
 
-	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
+	_ = filepath.WalkDir(sessionRoot, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d == nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
 		}
 
-		info, err := entry.Info()
+		info, err := d.Info()
 		if err != nil {
-			continue
+			return nil
 		}
 
 		modTime := info.ModTime()
 		if now.Sub(modTime) > recentTimeout {
-			continue
+			return nil
 		}
 
-		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+		if !sessionFileMatchesProject(path, projectID, projectPath) {
+			return nil
+		}
+
+		if bestPath == "" || modTime.After(bestModTime) {
+			bestPath = path
 			bestModTime = modTime
 		}
-	}
+		return nil
+	})
 
-	if bestSessionID == "" {
+	if bestPath == "" {
 		return nil, nil
 	}
 
+	sessionID := strings.TrimSuffix(filepath.Base(bestPath), ".json")
+
 	// The transcript path for OpenCode is the message directory
-	msgDir, _ := GetMessageDir(bestSessionID)
+	msgDir, _ := GetMessageDir(sessionID)
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
+		SessionID:      sessionID,
 		TranscriptPath: msgDir,
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
 
-// discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
+// sessionFileMatchesProject reports whether a session JSON file belongs to
+// the given project: either its parent directory is named after the
+// project ID (storage/session/<projectID>/<sessionID>.json), or the file's
+// own "directory"/"projectID" field matches the current project.
+func sessionFileMatchesProject(path, projectID, projectPath string) bool {
+	if filepath.Base(filepath.Dir(path)) == projectID {
+		return true
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+
+	var info sessionInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return false
+	}
+
+	if info.Directory != "" && info.Directory == projectPath {
+		return true
+	}
+	if info.ProjectID != "" && info.ProjectID == projectID {
+		return true
+	}
+	return false
+}
+
+// discoverFromSQLite queries the OpenCode SQLite database for the most recent
+// session. Table and column names are discovered at runtime (via
+// sqlite_master / PRAGMA table_info) instead of being hardcoded, since
+// OpenCode's internal schema has changed across releases and hardcoded names
+// silently stop matching anything rather than erroring loudly.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
@@ -316,57 +384,111 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
-	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+	sessionTable := findSQLiteTable(dbPath, "session")
+	messageTable := findSQLiteTable(dbPath, "message")
+	if sessionTable == "" || messageTable == "" {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
-	// Check if this session was recent (within timeout)
-	timeQuery := fmt.Sprintf(
-		`SELECT time_updated FROM session WHERE id='%s';`,
-		sessionID,
-	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
-	timeOutput, err := cmd.Output()
-	if err == nil {
-		timeStr := strings.TrimSpace(string(timeOutput))
-		if t, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02T15:04:05.000Z", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02 15:04:05", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		}
-		// If we can't parse the time, proceed anyway — better to try than skip
+	sessionCols := sqliteColumns(dbPath, sessionTable)
+	idCol := pickColumn(sessionCols, "id")
+	projectCol := pickColumn(sessionCols, "project_id", "projectid", "project")
+	sessionTimeCol := pickColumn(sessionCols, "time_updated", "updated_at", "updatedat", "time_created", "created_at", "createdat")
+	if idCol == "" {
+		return nil, nil
 	}
 
-	// Get messages for this session as a JSON array
+	orderBy := "rowid"
+	if sessionTimeCol != "" {
+		orderBy = sessionTimeCol
+	}
+
+	var sessionQuery string
+	if projectCol != "" {
+		sessionQuery = fmt.Sprintf(
+			`SELECT %s FROM %s WHERE %s='%s' ORDER BY %s DESC LIMIT 1;`,
+			idCol, sessionTable, projectCol, projectID, orderBy,
+		)
+	} else {
+		sessionQuery = fmt.Sprintf(`SELECT %s FROM %s ORDER BY %s DESC LIMIT 1;`, idCol, sessionTable, orderBy)
+	}
+
+	sessionOutput, err := sqliteQuery(dbPath, sessionQuery)
+	if err != nil || sessionOutput == "" {
+		return nil, nil
+	}
+	sessionID := strings.TrimSpace(strings.Split(sessionOutput, "\n")[0])
+	if sessionID == "" {
+		return nil, nil
+	}
+
+	// Check if this session was recent (within timeout), when we know how to.
+	if sessionTimeCol != "" {
+		timeOutput, err := sqliteQuery(dbPath, fmt.Sprintf(`SELECT %s FROM %s WHERE %s='%s';`, sessionTimeCol, sessionTable, idCol, sessionID))
+		if err == nil && !withinRecentTimeout(timeOutput) {
+			return nil, nil
+		}
+	}
+
+	msgCols := sqliteColumns(dbPath, messageTable)
+	msgIDCol := pickColumn(msgCols, "id")
+	sessionFKCol := pickColumn(msgCols, "session_id", "sessionid")
+	dataCol := pickColumn(msgCols, "data", "content", "parts", "body", "message")
+	msgTimeCol := pickColumn(msgCols, "time_created", "created_at", "createdat", "time_updated", "updated_at")
+	if msgIDCol == "" || sessionFKCol == "" || dataCol == "" {
+		return nil, nil
+	}
+
+	msgOrderBy := "rowid"
+	if msgTimeCol != "" {
+		msgOrderBy = msgTimeCol
+	}
+
 	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
+		`SELECT %s AS id, %s AS data FROM %s WHERE %s='%s' ORDER BY %s;`,
+		msgIDCol, dataCol, messageTable, sessionFKCol, sessionID, msgOrderBy,
 	)
-	cmd = exec.Command("sqlite3", dbPath, msgQuery)
+	cmd := exec.Command("sqlite3", "-json", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
 	if err != nil {
 		return nil, nil
 	}
 
-	transcriptData := []byte(strings.TrimSpace(string(msgOutput)))
-	// sqlite3 returns "[null]" when no rows match
-	if string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
+	var rows []map[string]json.RawMessage
+	if err := json.Unmarshal(msgOutput, &rows); err != nil || len(rows) == 0 {
+		return nil, nil
+	}
+
+	var messages []json.RawMessage
+	for _, row := range rows {
+		msg := decodeSQLiteMessageData(row["data"])
+		if msg == nil {
+			continue
+		}
+
+		var id string
+		if rawID, ok := row["id"]; ok {
+			_ = json.Unmarshal(rawID, &id)
+		}
+		if id != "" {
+			if idJSON, err := json.Marshal(id); err == nil {
+				msg["id"] = idJSON
+			}
+		}
+
+		encoded, err := json.Marshal(msg)
+		if err != nil {
+			continue
+		}
+		messages = append(messages, encoded)
+	}
+
+	if len(messages) == 0 {
+		return nil, nil
+	}
+
+	transcriptData, err := json.Marshal(messages)
+	if err != nil {
 		return nil, nil
 	}
 
@@ -377,6 +499,136 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// sqliteQuery runs a single query via the sqlite3 CLI and returns trimmed stdout.
+func sqliteQuery(dbPath, query string) (string, error) {
+	cmd := exec.Command("sqlite3", dbPath, query)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// findSQLiteTable returns the table whose name best matches the given noun:
+// an exact match (singular or plural) is preferred, otherwise any table name
+// containing the noun (e.g. "app_sessions" for noun "session").
+func findSQLiteTable(dbPath, noun string) string {
+	out, err := sqliteQuery(dbPath, `SELECT name FROM sqlite_master WHERE type='table';`)
+	if err != nil {
+		return ""
+	}
+
+	var contains string
+	for _, name := range strings.Split(out, "\n") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		lower := strings.ToLower(name)
+		if lower == noun || lower == noun+"s" {
+			return name
+		}
+		if contains == "" && strings.Contains(lower, noun) {
+			contains = name
+		}
+	}
+	return contains
+}
+
+// sqliteColumns returns a table's column names via PRAGMA table_info.
+func sqliteColumns(dbPath, table string) []string {
+	out, err := sqliteQuery(dbPath, fmt.Sprintf(`PRAGMA table_info(%s);`, table))
+	if err != nil {
+		return nil
+	}
+
+	var cols []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Split(line, "|")
+		if len(fields) >= 2 {
+			cols = append(cols, fields[1])
+		}
+	}
+	return cols
+}
+
+// pickColumn returns the first column (in its real case) whose lowercased
+// name matches one of the given candidates, or "" if none match.
+func pickColumn(cols []string, candidates ...string) string {
+	byLower := make(map[string]string, len(cols))
+	for _, c := range cols {
+		byLower[strings.ToLower(c)] = c
+	}
+	for _, cand := range candidates {
+		if actual, ok := byLower[cand]; ok {
+			return actual
+		}
+	}
+	return ""
+}
+
+// decodeSQLiteMessageData decodes a message row's data column into a JSON
+// object. The column is usually stored as a JSON-encoded string (so it comes
+// back from `sqlite3 -json` as a quoted string that needs one more decode),
+// but tolerate it already being a JSON object too.
+func decodeSQLiteMessageData(raw json.RawMessage) map[string]json.RawMessage {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return nil
+	}
+
+	var obj map[string]json.RawMessage
+	if trimmed[0] == '{' {
+		if err := json.Unmarshal(trimmed, &obj); err == nil {
+			return obj
+		}
+		return nil
+	}
+
+	var s string
+	if err := json.Unmarshal(trimmed, &s); err != nil {
+		return nil
+	}
+	if err := json.Unmarshal([]byte(s), &obj); err != nil {
+		return nil
+	}
+	return obj
+}
+
+// withinRecentTimeout reports whether a raw timestamp value (epoch seconds,
+// epoch milliseconds, or one of a few known string formats) is within
+// agent.RecentSessionTimeout of now. Unparseable or empty values are treated
+// as "recent enough" so an unfamiliar timestamp format doesn't block discovery.
+func withinRecentTimeout(raw string) bool {
+	timeStr := strings.TrimSpace(raw)
+	if timeStr == "" {
+		return true
+	}
+
+	if n, err := strconv.ParseInt(timeStr, 10, 64); err == nil {
+		var t time.Time
+		if n > 1_000_000_000_000 {
+			t = time.UnixMilli(n)
+		} else {
+			t = time.Unix(n, 0)
+		}
+		return time.Since(t) <= agent.RecentSessionTimeout
+	}
+
+	layouts := []string{time.RFC3339Nano, "2006-01-02T15:04:05.000Z", "2006-01-02 15:04:05"}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, timeStr); err == nil {
+			return time.Since(t) <= agent.RecentSessionTimeout
+		}
+	}
+
+	return true
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -497,4 +749,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
