@@ -73,6 +73,31 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// candidateMessageDirs returns plausible on-disk locations for a session's
+// message files. OpenCode has restructured this layout across versions, so
+// discovery tries each candidate rather than assuming a single fixed path.
+func candidateMessageDirs(dataDir, sessionID string) []string {
+	return []string{
+		filepath.Join(dataDir, "storage", "message", sessionID),
+		filepath.Join(dataDir, "storage", "session", "message", sessionID),
+		filepath.Join(dataDir, "storage", "session", sessionID, "message"),
+	}
+}
+
+// discoverMessageDir returns the first candidate message directory that
+// actually exists and contains files, falling back to the default location
+// (dataDir/storage/message/<sessionID>) so callers always get a usable path
+// even when none of the candidates are present yet.
+func discoverMessageDir(dataDir, sessionID string) string {
+	candidates := candidateMessageDirs(dataDir, sessionID)
+	for _, dir := range candidates {
+		if entries, err := os.ReadDir(dir); err == nil && len(entries) > 0 {
+			return dir
+		}
+	}
+	return candidates[0]
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
