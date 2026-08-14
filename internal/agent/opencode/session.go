@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -71,6 +72,71 @@ func GetMessageDir(sessionID string) (string, error) {
 	}
 
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
+}
+
+// FindRecentSessionFile recursively searches the OpenCode session storage
+// tree for the most recently modified session JSON file within the given
+// timeout window, returning its session ID (the filename without extension).
+//
+// OpenCode has stored session files at different depths across versions
+// (flat under storage/session, nested per-project, or nested under an
+// "info" subdirectory), so this walks the whole tree instead of assuming a
+// single fixed layout.
+func FindRecentSessionFile(dataDir string, timeout time.Duration) (sessionID string, modTime time.Time, found bool) {
+	root := filepath.Join(dataDir, "storage", "session")
+	now := time.Now()
+
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		mt := info.ModTime()
+		if now.Sub(mt) > timeout {
+			return nil
+		}
+
+		if !found || mt.After(modTime) {
+			sessionID = strings.TrimSuffix(d.Name(), ".json")
+			modTime = mt
+			found = true
+		}
+		return nil
+	})
+
+	return sessionID, modTime, found
+}
+
+// FindMessageDir searches the OpenCode storage tree for the directory that
+// holds message files for the given session ID. The message directory's
+// location relative to the data dir has varied across OpenCode versions
+// (e.g. storage/message/<id> vs. storage/session/message/<id>), so this
+// walks the whole storage tree looking for a directory named after the
+// session ID rather than assuming a fixed path. Returns "" if not found.
+func FindMessageDir(dataDir, sessionID string) string {
+	root := filepath.Join(dataDir, "storage")
+	var found string
+
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if found != "" {
+			return filepath.SkipAll
+		}
+		if d.IsDir() && d.Name() == sessionID {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+
+	return found
 }
 
 // sessionInfo represents an OpenCode session JSON file.
