@@ -79,7 +79,7 @@ func NormalizeRole(role string) MessageType {
 	switch role {
 	case "user":
 		return MessageTypeUser
-	case "assistant", "model", "gemini":
+	case "assistant", "model", "gemini", "tool":
 		return MessageTypeAssistant
 	case "system":
 		return MessageTypeSystem

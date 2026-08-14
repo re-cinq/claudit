@@ -73,6 +73,14 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// GetDBPath returns the path to OpenCode's SQLite database for a project.
+// Unlike the flat-file storage layout, OpenCode's SQLite database is stored
+// per-project at .opencode/opencode.db within the project directory itself,
+// not under the XDG data directory.
+func GetDBPath(projectPath string) string {
+	return filepath.Join(projectPath, ".opencode", "opencode.db")
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
