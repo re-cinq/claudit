@@ -74,10 +74,14 @@ func GetMessageDir(sessionID string) (string, error) {
 }
 
 // sessionInfo represents an OpenCode session JSON file.
+// Directory/CWD/Path are alternate field names OpenCode has used across
+// versions to record the project directory a session belongs to.
 type sessionInfo struct {
 	ID        string `json:"id"`
 	ProjectID string `json:"projectID,omitempty"`
 	Directory string `json:"directory,omitempty"`
+	CWD       string `json:"cwd,omitempty"`
+	Path      string `json:"path,omitempty"`
 	Title     string `json:"title,omitempty"`
 }
 
