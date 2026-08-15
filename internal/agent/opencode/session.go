@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -81,6 +82,53 @@ type sessionInfo struct {
 	Title     string `json:"title,omitempty"`
 }
 
+// findSessionInfoFiles recursively finds all session info JSON files under
+// the OpenCode data directory. OpenCode has changed the nesting depth of its
+// session storage across versions (e.g. flat vs. project-scoped
+// subdirectories), so we walk the whole tree instead of assuming a fixed
+// depth relative to the data directory.
+func findSessionInfoFiles(dataDir string) []string {
+	var matches []string
+	root := filepath.Join(dataDir, "storage", "session")
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if strings.HasSuffix(d.Name(), ".json") {
+			matches = append(matches, path)
+		}
+		return nil
+	})
+	return matches
+}
+
+// findSessionMessageDir recursively looks for a directory named after
+// sessionID under the OpenCode data directory's storage tree. This is a
+// fallback for when the message storage layout doesn't match the legacy
+// flat storage/message/<sessionID> path assumed by GetMessageDir.
+func findSessionMessageDir(dataDir, sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+
+	var found string
+	root := filepath.Join(dataDir, "storage")
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || found != "" {
+			return nil
+		}
+		if d.IsDir() && d.Name() == sessionID {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
+}
+
 // WriteSessionFile writes a session and its messages to OpenCode's storage.
 func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (string, error) {
 	sessionDir, err := GetSessionDir(projectPath)
@@ -127,3 +175,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
