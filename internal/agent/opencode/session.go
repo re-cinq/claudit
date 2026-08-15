@@ -52,6 +52,63 @@ func GetProjectID(projectPath string) string {
 	return "global"
 }
 
+// cachedProjectID reads OpenCode's own cached project identifier, if present.
+// Recent OpenCode versions generate and persist a project ID under the
+// repository's git directory (<git-common-dir>/opencode) rather than
+// deriving one fresh from git history on every invocation, so a project ID
+// computed purely from git history can no longer be relied on to match the
+// directory OpenCode actually stores its sessions under.
+func cachedProjectID(projectPath string) string {
+	cmd := exec.Command("git", "rev-parse", "--git-common-dir")
+	cmd.Dir = projectPath
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	gitDir := strings.TrimSpace(string(output))
+	if gitDir == "" {
+		return ""
+	}
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(projectPath, gitDir)
+	}
+
+	data, err := os.ReadFile(filepath.Join(gitDir, "opencode"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// PreferredProjectID returns the best-guess project ID for a project: the ID
+// OpenCode itself cached, if any, otherwise the legacy root-commit-hash
+// derived ID.
+func PreferredProjectID(projectPath string) string {
+	if cached := cachedProjectID(projectPath); cached != "" {
+		return cached
+	}
+	return GetProjectID(projectPath)
+}
+
+// ProjectIDCandidates returns the possible project IDs to check when
+// discovering an existing session, in priority order: OpenCode's own cached
+// ID first (used by recent versions), then the legacy root-commit-hash
+// derived ID (used as a fallback for older versions, or for repositories
+// OpenCode hasn't cached an ID for yet).
+func ProjectIDCandidates(projectPath string) []string {
+	var candidates []string
+	if cached := cachedProjectID(projectPath); cached != "" {
+		candidates = append(candidates, cached)
+	}
+
+	rootID := GetProjectID(projectPath)
+	if len(candidates) == 0 || candidates[0] != rootID {
+		candidates = append(candidates, rootID)
+	}
+	return candidates
+}
+
 // GetSessionDir returns the session storage directory for a project.
 func GetSessionDir(projectPath string) (string, error) {
 	dataDir, err := GetDataDir()
@@ -59,7 +116,7 @@ func GetSessionDir(projectPath string) (string, error) {
 		return "", err
 	}
 
-	projectID := GetProjectID(projectPath)
+	projectID := PreferredProjectID(projectPath)
 	return filepath.Join(dataDir, "storage", "session", projectID), nil
 }
 
@@ -97,7 +154,7 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	// Write a minimal session file
 	session := sessionInfo{
 		ID:        sessionID,
-		ProjectID: GetProjectID(projectPath),
+		ProjectID: PreferredProjectID(projectPath),
 		Directory: projectPath,
 		Title:     "Restored session",
 	}
