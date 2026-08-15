@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -305,6 +306,15 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
+//
+// OpenCode's SQLite schema has changed the naming of its timestamp columns across
+// releases (older shiftlog code assumed "time_updated"/"time_created", but recent
+// OpenCode versions use different names). Hardcoding those names meant a single bad
+// column reference broke the entire SQL statement (including the base SELECT), so
+// session discovery silently returned nothing. To stay compatible across OpenCode
+// releases, the actual column names are discovered at runtime via PRAGMA table_info,
+// falling back to rowid-based ordering (insertion order) when no known timestamp
+// column name is found.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
@@ -316,10 +326,16 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
+	sessionTimeCol := findColumn(dbPath, "session", "time_updated", "updated_at", "updatedAt", "time_modified", "modified_at")
+	sessionOrderBy := "rowid"
+	if sessionTimeCol != "" {
+		sessionOrderBy = sessionTimeCol
+	}
+
 	// Find most recent session for this project
 	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
+		`SELECT id FROM session WHERE project_id='%s' ORDER BY %s DESC LIMIT 1;`,
+		projectID, sessionOrderBy,
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
@@ -328,35 +344,38 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	}
 	sessionID := strings.TrimSpace(string(sessionOutput))
 
-	// Check if this session was recent (within timeout)
-	timeQuery := fmt.Sprintf(
-		`SELECT time_updated FROM session WHERE id='%s';`,
-		sessionID,
-	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
-	timeOutput, err := cmd.Output()
-	if err == nil {
-		timeStr := strings.TrimSpace(string(timeOutput))
-		if t, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
+	// Check if this session was recent (within timeout), if we found a timestamp column
+	if sessionTimeCol != "" {
+		timeQuery := fmt.Sprintf(
+			`SELECT %s FROM session WHERE id='%s';`,
+			sessionTimeCol, sessionID,
+		)
+		cmd = exec.Command("sqlite3", dbPath, timeQuery)
+		timeOutput, err := cmd.Output()
+		if err == nil {
+			timeStr := strings.TrimSpace(string(timeOutput))
+			if recent, ok := isRecentTimestamp(timeStr); ok && !recent {
 				return nil, nil
 			}
-		} else if t, err := time.Parse("2006-01-02T15:04:05.000Z", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02 15:04:05", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
+			// If we can't parse the time, proceed anyway — better to try than skip
 		}
-		// If we can't parse the time, proceed anyway — better to try than skip
+	}
+
+	msgSessionCol := findColumn(dbPath, "message", "session_id", "sessionID", "sessionId", "session")
+	if msgSessionCol == "" {
+		msgSessionCol = "session_id"
+	}
+
+	msgTimeCol := findColumn(dbPath, "message", "time_created", "created_at", "createdAt", "time_created_at")
+	msgOrderBy := "rowid"
+	if msgTimeCol != "" {
+		msgOrderBy = msgTimeCol
 	}
 
 	// Get messages for this session as a JSON array
 	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
+		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE %s='%s' ORDER BY %s;`,
+		msgSessionCol, sessionID, msgOrderBy,
 	)
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
@@ -377,6 +396,66 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// findColumn returns the first of candidates that exists as a column in table,
+// discovered via PRAGMA table_info. Returns "" if none exist or introspection fails.
+// OpenCode's SQLite column names have shifted across releases, so callers should
+// not assume any particular candidate is guaranteed to be present.
+func findColumn(dbPath, table string, candidates ...string) string {
+	cmd := exec.Command("sqlite3", dbPath, fmt.Sprintf("PRAGMA table_info(%s);", table))
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	existing := make(map[string]bool)
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		fields := strings.Split(line, "|")
+		if len(fields) > 1 {
+			existing[fields[1]] = true
+		}
+	}
+
+	for _, candidate := range candidates {
+		if existing[candidate] {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// isRecentTimestamp parses a timestamp value in any format OpenCode is known to use
+// (RFC3339 variants, or a unix epoch in seconds or milliseconds) and reports whether
+// it falls within agent.RecentSessionTimeout. ok is false if the value couldn't be
+// parsed in any known format.
+func isRecentTimestamp(s string) (recent bool, ok bool) {
+	if s == "" {
+		return false, false
+	}
+
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return time.Since(t) <= agent.RecentSessionTimeout, true
+	}
+	if t, err := time.Parse("2006-01-02T15:04:05.000Z", s); err == nil {
+		return time.Since(t) <= agent.RecentSessionTimeout, true
+	}
+	if t, err := time.Parse("2006-01-02 15:04:05", s); err == nil {
+		return time.Since(t) <= agent.RecentSessionTimeout, true
+	}
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return time.Since(epochToTime(n)) <= agent.RecentSessionTimeout, true
+	}
+	return false, false
+}
+
+// epochToTime converts a unix epoch integer to a time.Time, heuristically treating
+// values above 1e12 as milliseconds and smaller values as seconds.
+func epochToTime(n int64) time.Time {
+	if n > 1_000_000_000_000 {
+		return time.UnixMilli(n)
+	}
+	return time.Unix(n, 0)
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -497,4 +576,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
