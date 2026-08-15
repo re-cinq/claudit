@@ -304,6 +304,51 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
+// sqliteColumns returns the column names of a table in the OpenCode SQLite
+// database via PRAGMA table_info. Column names have shifted across OpenCode
+// releases (e.g. time_updated vs updated, session_id vs sessionID), so
+// discoverFromSQLite resolves the actual columns at runtime instead of
+// hardcoding names that may no longer exist in newer/older CLI versions.
+func sqliteColumns(dbPath, table string) ([]string, error) {
+	cmd := exec.Command("sqlite3", "-json", dbPath, fmt.Sprintf("PRAGMA table_info(%s);", table))
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	var rows []struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(output, &rows); err != nil {
+		return nil, err
+	}
+
+	names := make([]string, 0, len(rows))
+	for _, r := range rows {
+		names = append(names, r.Name)
+	}
+	return names, nil
+}
+
+// findColumn returns the first column whose name contains all of the given
+// substrings (case-insensitive), or "" if none match.
+func findColumn(columns []string, substrs ...string) string {
+	for _, c := range columns {
+		lower := strings.ToLower(c)
+		match := true
+		for _, s := range substrs {
+			if !strings.Contains(lower, s) {
+				match = false
+				break
+			}
+		}
+		if match {
+			return c
+		}
+	}
+	return ""
+}
+
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
@@ -316,11 +361,21 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
+	sessionCols, err := sqliteColumns(dbPath, "session")
+	if err != nil {
+		return nil, nil
+	}
+	sessionTimeCol := findColumn(sessionCols, "time", "updat")
+	if sessionTimeCol == "" {
+		sessionTimeCol = findColumn(sessionCols, "updat")
+	}
+
 	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
-	)
+	sessionQuery := fmt.Sprintf(`SELECT id FROM session WHERE project_id='%s'`, projectID)
+	if sessionTimeCol != "" {
+		sessionQuery += fmt.Sprintf(` ORDER BY %s DESC`, sessionTimeCol)
+	}
+	sessionQuery += ` LIMIT 1;`
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
 	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
@@ -329,35 +384,55 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	sessionID := strings.TrimSpace(string(sessionOutput))
 
 	// Check if this session was recent (within timeout)
-	timeQuery := fmt.Sprintf(
-		`SELECT time_updated FROM session WHERE id='%s';`,
-		sessionID,
-	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
-	timeOutput, err := cmd.Output()
-	if err == nil {
-		timeStr := strings.TrimSpace(string(timeOutput))
-		if t, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
+	if sessionTimeCol != "" {
+		timeQuery := fmt.Sprintf(`SELECT %s FROM session WHERE id='%s';`, sessionTimeCol, sessionID)
+		cmd = exec.Command("sqlite3", dbPath, timeQuery)
+		timeOutput, err := cmd.Output()
+		if err == nil {
+			timeStr := strings.TrimSpace(string(timeOutput))
+			if t, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
+				if time.Since(t) > agent.RecentSessionTimeout {
+					return nil, nil
+				}
+			} else if t, err := time.Parse("2006-01-02T15:04:05.000Z", timeStr); err == nil {
+				if time.Since(t) > agent.RecentSessionTimeout {
+					return nil, nil
+				}
+			} else if t, err := time.Parse("2006-01-02 15:04:05", timeStr); err == nil {
+				if time.Since(t) > agent.RecentSessionTimeout {
+					return nil, nil
+				}
 			}
-		} else if t, err := time.Parse("2006-01-02T15:04:05.000Z", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02 15:04:05", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
+			// If we can't parse the time, proceed anyway — better to try than skip
 		}
-		// If we can't parse the time, proceed anyway — better to try than skip
 	}
+
+	messageCols, err := sqliteColumns(dbPath, "message")
+	if err != nil {
+		return nil, nil
+	}
+	messageSessionCol := findColumn(messageCols, "session")
+	if messageSessionCol == "" {
+		return nil, nil
+	}
+	messageDataCol := findColumn(messageCols, "data")
+	if messageDataCol == "" {
+		messageDataCol = findColumn(messageCols, "content")
+	}
+	if messageDataCol == "" {
+		return nil, nil
+	}
+	messageTimeCol := findColumn(messageCols, "time", "creat")
 
 	// Get messages for this session as a JSON array
 	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
+		`SELECT json_group_array(json_patch(%s, json_object('id', id))) FROM message WHERE %s='%s'`,
+		messageDataCol, messageSessionCol, sessionID,
 	)
+	if messageTimeCol != "" {
+		msgQuery += fmt.Sprintf(` ORDER BY %s`, messageTimeCol)
+	}
+	msgQuery += ";"
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
 	if err != nil {
@@ -365,8 +440,8 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	}
 
 	transcriptData := []byte(strings.TrimSpace(string(msgOutput)))
-	// sqlite3 returns "[null]" when no rows match
-	if string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
+	// sqlite3 prints an empty line (or the literal "[null]"/"[]") when no rows match
+	if len(transcriptData) == 0 || string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
 		return nil, nil
 	}
 
@@ -497,4 +572,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
