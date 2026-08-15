@@ -353,20 +353,14 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
 
-	// Get messages for this session as a JSON array
-	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
-	)
-	cmd = exec.Command("sqlite3", dbPath, msgQuery)
-	msgOutput, err := cmd.Output()
-	if err != nil {
-		return nil, nil
-	}
-
-	transcriptData := []byte(strings.TrimSpace(string(msgOutput)))
-	// sqlite3 returns "[null]" when no rows match
-	if string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
+	// Get messages for this session. Rows are fetched individually and merged
+	// in Go rather than via SQL json_patch/json_group_array: newer OpenCode
+	// versions can write message rows whose data column is NULL or not a
+	// JSON object (e.g. summary/compaction entries), and json_patch raises a
+	// SQL error on such rows — which previously aborted the whole query and
+	// silently dropped an otherwise valid, recent session.
+	transcriptData, err := fetchSQLiteMessages(dbPath, sessionID)
+	if err != nil || len(transcriptData) == 0 {
 		return nil, nil
 	}
 
@@ -377,6 +371,64 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// fetchSQLiteMessages reads message rows for a session and reassembles them
+// into a JSON array in Go. Each row's data is merged with its id
+// individually so that a single row with a NULL or non-object data column
+// doesn't fail retrieval for the entire session.
+func fetchSQLiteMessages(dbPath, sessionID string) ([]byte, error) {
+	msgQuery := fmt.Sprintf(
+		`SELECT id, COALESCE(data, '') AS data FROM message WHERE session_id='%s' ORDER BY time_created;`,
+		sessionID,
+	)
+	cmd := exec.Command("sqlite3", "-json", dbPath, msgQuery)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	trimmed := strings.TrimSpace(string(out))
+	if trimmed == "" {
+		return nil, nil
+	}
+
+	var rows []struct {
+		ID   string `json:"id"`
+		Data string `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(trimmed), &rows); err != nil {
+		return nil, err
+	}
+
+	messages := make([]json.RawMessage, 0, len(rows))
+	for _, row := range rows {
+		obj := map[string]json.RawMessage{}
+		if row.Data != "" {
+			var parsed map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(row.Data), &parsed); err == nil {
+				obj = parsed
+			}
+		}
+
+		idBytes, err := json.Marshal(row.ID)
+		if err != nil {
+			continue
+		}
+		obj["id"] = idBytes
+
+		merged, err := json.Marshal(obj)
+		if err != nil {
+			continue
+		}
+		messages = append(messages, merged)
+	}
+
+	if len(messages) == 0 {
+		return nil, nil
+	}
+
+	return json.Marshal(messages)
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -497,4 +549,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
