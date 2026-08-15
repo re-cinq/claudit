@@ -1,3 +1,4 @@
+<complete corrected file content>
 package agent
 
 import (
@@ -83,6 +84,10 @@ func NormalizeRole(role string) MessageType {
 		return MessageTypeAssistant
 	case "system":
 		return MessageTypeSystem
+	case "tool":
+		// OpenCode emits a separate "tool" role message for tool call/result
+		// entries; treat these as part of the assistant's turn.
+		return MessageTypeAssistant
 	default:
 		return ""
 	}
