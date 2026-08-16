@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -73,6 +74,23 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// findOpenCodeDB locates the OpenCode SQLite database. Newer OpenCode
+// versions store it project-locally under .opencode/opencode.db; older
+// versions store it under the global XDG data directory. We check both
+// so DiscoverSession keeps working across OpenCode releases.
+func findOpenCodeDB(dataDir, projectPath string) string {
+	candidates := []string{
+		filepath.Join(projectPath, ".opencode", "opencode.db"),
+		filepath.Join(dataDir, "opencode.db"),
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return ""
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
@@ -127,3 +145,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
