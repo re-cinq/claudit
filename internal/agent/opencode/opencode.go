@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -304,6 +305,20 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
+// querySQLiteScalar runs a single-column, single-row (or single-value)
+// sqlite3 query and returns the trimmed output, or "" if the query failed
+// or produced no output. Errors are intentionally swallowed here: callers
+// treat an empty result as "try the next thing" rather than a hard failure,
+// since OpenCode's on-disk schema has shifted across releases.
+func querySQLiteScalar(dbPath, query string) string {
+	cmd := exec.Command("sqlite3", dbPath, query)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
@@ -316,57 +331,65 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
+	// Find most recent session for this project. We order by rowid rather
+	// than a timestamp column: OpenCode has renamed/reshaped its timestamp
+	// columns across releases, and ordering on a column that no longer
+	// exists makes the whole query fail, which silently drops discovery
+	// entirely. Every ordinary SQLite table has an implicit rowid that
+	// reliably reflects insertion order for these append-mostly tables,
+	// regardless of schema churn elsewhere.
 	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
+		`SELECT id FROM session WHERE project_id='%s' ORDER BY rowid DESC LIMIT 1;`,
 		projectID,
 	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+	sessionID := querySQLiteScalar(dbPath, sessionQuery)
+	if sessionID == "" {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
-	// Check if this session was recent (within timeout)
+	// Check if this session was recent (within timeout). Best effort: if
+	// the timestamp column is missing/renamed or its format can't be
+	// parsed, proceed anyway rather than dropping a session we've already
+	// found.
 	timeQuery := fmt.Sprintf(
 		`SELECT time_updated FROM session WHERE id='%s';`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
-	timeOutput, err := cmd.Output()
-	if err == nil {
-		timeStr := strings.TrimSpace(string(timeOutput))
-		if t, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02T15:04:05.000Z", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02 15:04:05", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
+	if timeStr := querySQLiteScalar(dbPath, timeQuery); timeStr != "" {
+		formats := []string{time.RFC3339Nano, "2006-01-02T15:04:05.000Z", "2006-01-02 15:04:05"}
+		for _, layout := range formats {
+			if t, err := time.Parse(layout, timeStr); err == nil {
+				if time.Since(t) > agent.RecentSessionTimeout {
+					return nil, nil
+				}
+				break
 			}
 		}
-		// If we can't parse the time, proceed anyway — better to try than skip
+		// If none of the formats match, proceed anyway — better to try than skip
 	}
 
-	// Get messages for this session as a JSON array
+	// Get messages for this session as a JSON array, again ordered by
+	// rowid instead of a timestamp column.
 	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
+		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY rowid;`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, msgQuery)
-	msgOutput, err := cmd.Output()
-	if err != nil {
-		return nil, nil
+	transcriptData := []byte(querySQLiteScalar(dbPath, msgQuery))
+
+	// sqlite3 returns "[null]" when no rows match, and querySQLiteScalar
+	// returns "" if the query itself errored (e.g. json_patch choking on a
+	// message payload shape it doesn't expect). In either case, fall back
+	// to the raw, unpatched rows so we can still surface a transcript
+	// instead of discarding a session we've already confirmed exists.
+	if len(transcriptData) == 0 || string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
+		rawMsgQuery := fmt.Sprintf(
+			`SELECT data FROM message WHERE session_id='%s' ORDER BY rowid;`,
+			sessionID,
+		)
+		transcriptData = []byte(querySQLiteScalar(dbPath, rawMsgQuery))
 	}
 
-	transcriptData := []byte(strings.TrimSpace(string(msgOutput)))
-	// sqlite3 returns "[null]" when no rows match
-	if string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
+	if len(transcriptData) == 0 {
 		return nil, nil
 	}
 
@@ -497,4 +520,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
