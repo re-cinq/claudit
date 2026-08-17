@@ -73,6 +73,28 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// candidateMessageDirs returns possible message storage directories for a
+// session, in priority order. OpenCode has nested the message directory
+// differently across versions (flat under "storage/message/<id>" vs. nested
+// under "storage/session/message/<id>"), so callers should try each in turn.
+func candidateMessageDirs(dataDir, sessionID string) []string {
+	return []string{
+		filepath.Join(dataDir, "storage", "message", sessionID),
+		filepath.Join(dataDir, "storage", "session", "message", sessionID),
+	}
+}
+
+// firstNonEmptyDir returns the first directory in paths that exists and
+// contains at least one entry, or "" if none do.
+func firstNonEmptyDir(paths []string) string {
+	for _, p := range paths {
+		if entries, err := os.ReadDir(p); err == nil && len(entries) > 0 {
+			return p
+		}
+	}
+	return ""
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
