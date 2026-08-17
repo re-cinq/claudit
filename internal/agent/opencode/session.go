@@ -3,11 +3,13 @@ package opencode
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +128,94 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// SessionCandidate is a session file discovered on disk, with best-effort
+// metadata extracted from its JSON content.
+type SessionCandidate struct {
+	ID        string
+	Directory string // best-effort project directory hint, if present in the file
+	ModTime   time.Time
+	Path      string
+}
+
+// FindSessionCandidates walks OpenCode's session storage tree looking for
+// session JSON files modified more recently than cutoff.
+//
+// OpenCode's on-disk layout has changed across releases (a flat
+// storage/session/<projectID>/<id>.json layout in older versions, a shared
+// storage/session/info/<id>.json layout in newer ones, etc), so this walks
+// the whole storage/session tree rather than assuming one fixed shape.
+func FindSessionCandidates(dataDir string, cutoff time.Time) []SessionCandidate {
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+
+	var candidates []SessionCandidate
+	_ = filepath.WalkDir(sessionRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil || info.ModTime().Before(cutoff) {
+			return nil
+		}
+
+		id := strings.TrimSuffix(d.Name(), ".json")
+
+		var meta struct {
+			ID        string `json:"id"`
+			ProjectID string `json:"projectID"`
+			Directory string `json:"directory"`
+			Path      string `json:"path"`
+			Cwd       string `json:"cwd"`
+			Worktree  string `json:"worktree"`
+		}
+		if data, err := os.ReadFile(path); err == nil {
+			_ = json.Unmarshal(data, &meta)
+		}
+		if meta.ID != "" {
+			id = meta.ID
+		}
+
+		dir := meta.Directory
+		if dir == "" {
+			dir = meta.Path
+		}
+		if dir == "" {
+			dir = meta.Cwd
+		}
+		if dir == "" {
+			dir = meta.Worktree
+		}
+
+		candidates = append(candidates, SessionCandidate{
+			ID:        id,
+			Directory: dir,
+			ModTime:   info.ModTime(),
+			Path:      path,
+		})
+		return nil
+	})
+
+	return candidates
+}
+
+// FindMessageDir locates the message storage directory for a session,
+// trying the directory layouts used by different OpenCode versions. It
+// returns false if no non-empty message directory could be found.
+func FindMessageDir(dataDir, sessionID string) (string, bool) {
+	candidates := []string{
+		filepath.Join(dataDir, "storage", "message", sessionID),
+		filepath.Join(dataDir, "storage", "session", "message", sessionID),
+		filepath.Join(dataDir, "storage", "session", sessionID, "message"),
+	}
+
+	for _, dir := range candidates {
+		entries, err := os.ReadDir(dir)
+		if err == nil && len(entries) > 0 {
+			return dir, true
+		}
+	}
+
+	return "", false
 }
