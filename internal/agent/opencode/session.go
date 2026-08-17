@@ -81,6 +81,34 @@ type sessionInfo struct {
 	Title     string `json:"title,omitempty"`
 }
 
+// sessionIDFromFile derives a session ID from a discovered session JSON file.
+// It prefers the "id" field recorded inside the file itself. If that's
+// missing or unparsable, it falls back to the filename (without its .json
+// extension) for the legacy flat "<sessionID>.json" layout, and finally to
+// the parent directory name for newer layouts that nest a session's files
+// under a directory named after the session ID (e.g. "<sessionID>/info.json").
+func sessionIDFromFile(path, root string) string {
+	if data, err := os.ReadFile(path); err == nil {
+		var session sessionInfo
+		if json.Unmarshal(data, &session) == nil && session.ID != "" {
+			return session.ID
+		}
+	}
+
+	base := strings.TrimSuffix(filepath.Base(path), ".json")
+	if base != "" && base != "info" && base != "session" && base != "data" {
+		return base
+	}
+
+	if dir := filepath.Dir(path); dir != root {
+		if name := filepath.Base(dir); name != "." && name != string(filepath.Separator) {
+			return name
+		}
+	}
+
+	return ""
+}
+
 // WriteSessionFile writes a session and its messages to OpenCode's storage.
 func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (string, error) {
 	sessionDir, err := GetSessionDir(projectPath)
