@@ -251,20 +251,46 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 	return discoverFromSQLite(dataDir, projectID, projectPath)
 }
 
-// discoverFromFlatFiles tries the legacy flat file session discovery.
+// discoverFromFlatFiles tries the flat file session discovery.
+// OpenCode's on-disk layout has changed across releases, so this tries
+// multiple known layouts and returns the first match.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
-	if err != nil {
-		return nil, nil
-	}
-
-	dirEntries, err := os.ReadDir(sessionDir)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
+	projectID := GetProjectID(projectPath)
+
+	// Layout A (pre-v1.2): storage/session/<projectID>/<sessionID>.json,
+	// storage/message/<sessionID>/*.json
+	if session := discoverLegacySessionDir(dataDir, projectID, projectPath, now, recentTimeout); session != nil {
+		return session, nil
+	}
+
+	// Layout B (opencode-ai 1.x): sessions are stored flat under
+	// storage/session/info/<sessionID>.json (no per-project subdirectory),
+	// scoped by a "projectID"/"directory" field inside each session file.
+	// Messages live under storage/session/message/<sessionID>/*.json.
+	if session := discoverSessionInfoDir(dataDir, projectID, projectPath, now, recentTimeout); session != nil {
+		return session, nil
+	}
+
+	return nil, nil
+}
+
+// discoverLegacySessionDir looks for sessions under
+// storage/session/<projectID>/<sessionID>.json (pre-v1.2 OpenCode).
+func discoverLegacySessionDir(dataDir, projectID, projectPath string, now time.Time, recentTimeout time.Duration) *agent.SessionInfo {
+	sessionDir := filepath.Join(dataDir, "storage", "session", projectID)
+
+	dirEntries, err := os.ReadDir(sessionDir)
+	if err != nil {
+		return nil
+	}
+
 	var bestSessionID string
 	var bestModTime time.Time
 
@@ -290,18 +316,83 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}
 
 	if bestSessionID == "" {
-		return nil, nil
+		return nil
 	}
 
-	// The transcript path for OpenCode is the message directory
-	msgDir, _ := GetMessageDir(bestSessionID)
+	msgDir := filepath.Join(dataDir, "storage", "message", bestSessionID)
 
 	return &agent.SessionInfo{
 		SessionID:      bestSessionID,
 		TranscriptPath: msgDir,
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
-	}, nil
+	}
+}
+
+// discoverSessionInfoDir looks for sessions under the flat
+// storage/session/info/<sessionID>.json layout used by newer OpenCode
+// releases, matching by the projectID or directory field recorded inside
+// each session file rather than by directory partitioning.
+func discoverSessionInfoDir(dataDir, projectID, projectPath string, now time.Time, recentTimeout time.Duration) *agent.SessionInfo {
+	infoDir := filepath.Join(dataDir, "storage", "session", "info")
+
+	dirEntries, err := os.ReadDir(infoDir)
+	if err != nil {
+		return nil
+	}
+
+	var bestSessionID string
+	var bestModTime time.Time
+
+	for _, entry := range dirEntries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > recentTimeout {
+			continue
+		}
+
+		data, err := os.ReadFile(filepath.Join(infoDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+
+		var si sessionInfo
+		if err := json.Unmarshal(data, &si); err != nil {
+			continue
+		}
+
+		matches := (si.ProjectID != "" && si.ProjectID == projectID) ||
+			(si.Directory != "" && si.Directory == projectPath)
+		if !matches {
+			continue
+		}
+
+		if bestSessionID == "" || modTime.After(bestModTime) {
+			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			bestModTime = modTime
+		}
+	}
+
+	if bestSessionID == "" {
+		return nil
+	}
+
+	msgDir := filepath.Join(dataDir, "storage", "session", "message", bestSessionID)
+
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: msgDir,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -487,6 +578,27 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 		}
 	}
 
+	// Try "parts" field (message-v2 format: content split into typed parts,
+	// e.g. {"type":"text","text":"..."})
+	if partsRaw, ok := raw["parts"]; ok {
+		var parts []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(partsRaw, &parts); err == nil {
+			var blocks []agent.ContentBlock
+			for _, p := range parts {
+				if p.Type == "text" && p.Text != "" {
+					blocks = append(blocks, agent.ContentBlock{Type: "text", Text: p.Text})
+				}
+			}
+			if len(blocks) > 0 {
+				msg.Content = blocks
+				return msg
+			}
+		}
+	}
+
 	// Try "message" field
 	if msgRaw, ok := raw["message"]; ok {
 		var innerMsg agent.Message
@@ -497,4 +609,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
