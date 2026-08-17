@@ -3,11 +3,15 @@ package opencode
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +130,127 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// scanSessionInfo is the subset of fields we look for when scanning arbitrary
+// JSON files under the data directory for a session record.
+type scanSessionInfo struct {
+	ID        string `json:"id"`
+	ProjectID string `json:"projectID"`
+	Directory string `json:"directory"`
+	Cwd       string `json:"cwd"`
+}
+
+// samePath reports whether two filesystem paths refer to the same location,
+// tolerating trailing slashes and symlink differences.
+func samePath(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	ra, errA := filepath.EvalSymlinks(a)
+	rb, errB := filepath.EvalSymlinks(b)
+	return errA == nil && errB == nil && ra == rb
+}
+
+// FindRecentSessionFile scans the OpenCode data directory for a session
+// record belonging to the given project, without assuming a fixed on-disk
+// layout. OpenCode is published without a version constraint and its storage
+// format has changed across releases (flat per-project directories, a shared
+// SQLite database, etc.), so directory-listing a single hardcoded path is
+// not reliable. This walks dataDir/storage (or dataDir, if "storage" isn't
+// present) looking for JSON files that look like session records — anything
+// with an "id" field and a projectID/directory/cwd field matching this
+// project — and returns the most recently modified match within
+// agent.RecentSessionTimeout.
+func FindRecentSessionFile(dataDir, projectID, projectPath string) (sessionID string, modTime time.Time, found bool) {
+	root := filepath.Join(dataDir, "storage")
+	if _, err := os.Stat(root); err != nil {
+		root = dataDir
+	}
+
+	now := time.Now()
+	const maxScan = 20000
+	scanned := 0
+
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if scanned >= maxScan {
+			return filepath.SkipAll
+		}
+		if !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+		scanned++
+
+		info, err := d.Info()
+		if err != nil || now.Sub(info.ModTime()) > agent.RecentSessionTimeout {
+			return nil
+		}
+
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+
+		var rec scanSessionInfo
+		if err := json.Unmarshal(data, &rec); err != nil || rec.ID == "" {
+			return nil
+		}
+
+		matches := (rec.ProjectID != "" && rec.ProjectID == projectID) ||
+			(rec.Directory != "" && samePath(rec.Directory, projectPath)) ||
+			(rec.Cwd != "" && samePath(rec.Cwd, projectPath))
+		if !matches {
+			return nil
+		}
+
+		if !found || info.ModTime().After(modTime) {
+			sessionID = rec.ID
+			modTime = info.ModTime()
+			found = true
+		}
+		return nil
+	})
+
+	return sessionID, modTime, found
+}
+
+// FindMessageSource locates the message storage location for a session
+// without assuming a fixed nesting depth. It looks for a directory named
+// exactly after the session ID somewhere under dataDir/storage (or dataDir).
+// Returns the directory path and true if found.
+func FindMessageSource(dataDir, sessionID string) (string, bool) {
+	if sessionID == "" {
+		return "", false
+	}
+
+	root := filepath.Join(dataDir, "storage")
+	if _, err := os.Stat(root); err != nil {
+		root = dataDir
+	}
+
+	var found string
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || found != "" {
+			return nil
+		}
+		if d.IsDir() && d.Name() == sessionID {
+			found = p
+			return filepath.SkipAll
+		}
+		return nil
+	})
+
+	if found == "" {
+		return "", false
+	}
+	return found, true
 }
