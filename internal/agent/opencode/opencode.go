@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -305,6 +306,15 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
+//
+// OpenCode's session/message tables don't expose separate "time_updated" /
+// "time_created" SQL columns — timestamps live inside the JSON "data" blob
+// (e.g. data.time.updated), same as every other field on these rows. Querying
+// a raw "time_updated"/"time_created" column errors ("no such column"), which
+// previously made sqlite3 exit non-zero and this whole lookup fail silently,
+// so DiscoverSession never found a session and no note was written. Use
+// json_extract with a COALESCE fallback so a missing/renamed JSON path
+// degrades to 0 instead of erroring the query.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
@@ -316,9 +326,12 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
+	// Find most recent session for this project.
 	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
+		`SELECT id, COALESCE(json_extract(data, '$.time.updated'), json_extract(data, '$.time.created'), 0)
+		 FROM session WHERE project_id='%s'
+		 ORDER BY COALESCE(json_extract(data, '$.time.updated'), json_extract(data, '$.time.created'), 0) DESC
+		 LIMIT 1;`,
 		projectID,
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
@@ -326,36 +339,26 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
-	// Check if this session was recent (within timeout)
-	timeQuery := fmt.Sprintf(
-		`SELECT time_updated FROM session WHERE id='%s';`,
-		sessionID,
-	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
-	timeOutput, err := cmd.Output()
-	if err == nil {
-		timeStr := strings.TrimSpace(string(timeOutput))
-		if t, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02T15:04:05.000Z", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02 15:04:05", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
+	fields := strings.SplitN(strings.TrimSpace(string(sessionOutput)), "\t", 2)
+	sessionID := fields[0]
+
+	// Check if this session was recent (within timeout). If we can't parse
+	// a timestamp, proceed anyway — better to try than skip.
+	if len(fields) == 2 {
+		if updatedMs, err := strconv.ParseFloat(fields[1], 64); err == nil && updatedMs > 0 {
+			updatedTime := time.UnixMilli(int64(updatedMs))
+			if time.Since(updatedTime) > agent.RecentSessionTimeout {
 				return nil, nil
 			}
 		}
-		// If we can't parse the time, proceed anyway — better to try than skip
 	}
 
 	// Get messages for this session as a JSON array
 	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
+		`SELECT json_group_array(json_patch(data, json_object('id', id)))
+		 FROM message WHERE session_id='%s'
+		 ORDER BY COALESCE(json_extract(data, '$.time.created'), 0);`,
 		sessionID,
 	)
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
@@ -497,4 +500,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
