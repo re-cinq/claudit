@@ -449,7 +449,15 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		// Match on either the reported working directory or the git root.
+		// Newer Copilot CLI releases populate git_root in workspace.yaml and
+		// may leave cwd empty or pointed at a subdirectory of the repo, so a
+		// session should still match when cwd doesn't line up but git_root does.
+		matched := agent.PathsEqual(meta.CWD, projectPath)
+		if !matched && meta.GitRoot != "" {
+			matched = agent.PathsEqual(meta.GitRoot, projectPath)
+		}
+		if !matched {
 			continue
 		}
 
@@ -471,5 +479,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
