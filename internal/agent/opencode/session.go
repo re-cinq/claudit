@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -127,3 +128,99 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+
+// sessionSearchRoots returns the directories that may contain OpenCode
+// session files, across the different storage layouts OpenCode has used:
+//   - storage/session/<projectID>/<id>.json (flat layout)
+//   - project/<projectID>/storage/session/<id>.json (nested layout)
+func sessionSearchRoots(dataDir string) []string {
+	return []string{
+		filepath.Join(dataDir, "storage", "session"),
+		filepath.Join(dataDir, "project"),
+	}
+}
+
+// isSessionFileForProject reports whether a session JSON file belongs to
+// the given project, either by its location on disk (a path segment
+// matching projectID) or by fields inside the file itself
+// (projectID/directory/path/cwd).
+func isSessionFileForProject(path, projectID, projectPath string) bool {
+	for _, part := range strings.Split(filepath.ToSlash(filepath.Dir(path)), "/") {
+		if part != "" && part == projectID {
+			return true
+		}
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+
+	var meta struct {
+		ProjectID string `json:"projectID"`
+		Directory string `json:"directory"`
+		Path      string `json:"path"`
+		CWD       string `json:"cwd"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return false
+	}
+	if meta.ProjectID != "" && meta.ProjectID == projectID {
+		return true
+	}
+	for _, candidate := range []string{meta.Directory, meta.Path, meta.CWD} {
+		if candidate == "" {
+			continue
+		}
+		if candidate == projectPath {
+			return true
+		}
+		if abs, err := filepath.Abs(candidate); err == nil && abs == projectPath {
+			return true
+		}
+	}
+	return false
+}
+
+// findMessageDir locates the message directory for a session, trying the
+// known storage layouts before falling back to a search of the whole data
+// directory for a "message/<sessionID>" path. OpenCode has moved the
+// message directory around relative to the session directory across
+// releases, so this doesn't assume a single fixed relationship.
+func findMessageDir(dataDir, sessionID, sessionFilePath string) string {
+	candidates := []string{
+		filepath.Join(dataDir, "storage", "message", sessionID),
+	}
+
+	if sessionFilePath != "" {
+		sessionDir := filepath.Dir(sessionFilePath)
+		if filepath.Base(sessionDir) == "session" {
+			storageDir := filepath.Dir(sessionDir)
+			candidates = append(candidates, filepath.Join(storageDir, "message", sessionID))
+		}
+	}
+
+	for _, c := range candidates {
+		if info, err := os.Stat(c); err == nil && info.IsDir() {
+			return c
+		}
+	}
+
+	var found string
+	_ = filepath.WalkDir(dataDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || found != "" || !d.IsDir() {
+			return nil
+		}
+		if d.Name() == sessionID && filepath.Base(filepath.Dir(path)) == "message" {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if found != "" {
+		return found
+	}
+
+	return candidates[0]
+}
+```
