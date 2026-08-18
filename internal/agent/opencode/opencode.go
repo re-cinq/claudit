@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -265,7 +266,7 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestSessionID string
+	var bestFileName string
 	var bestModTime time.Time
 
 	for _, entry := range dirEntries {
@@ -283,14 +284,27 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 			continue
 		}
 
-		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+		if bestFileName == "" || modTime.After(bestModTime) {
+			bestFileName = entry.Name()
 			bestModTime = modTime
 		}
 	}
 
-	if bestSessionID == "" {
+	if bestFileName == "" {
 		return nil, nil
+	}
+
+	// The session file name is not guaranteed to match the session's actual
+	// ID (OpenCode may name the file by slug/timestamp rather than session
+	// ID), so read the "id" field from the file content and use that to
+	// locate the message directory. Fall back to the filename-derived ID
+	// only if the content can't be read or doesn't carry an "id".
+	bestSessionID := strings.TrimSuffix(bestFileName, ".json")
+	if data, err := os.ReadFile(filepath.Join(sessionDir, bestFileName)); err == nil {
+		var session sessionInfo
+		if err := json.Unmarshal(data, &session); err == nil && session.ID != "" {
+			bestSessionID = session.ID
+		}
 	}
 
 	// The transcript path for OpenCode is the message directory
@@ -497,4 +511,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
