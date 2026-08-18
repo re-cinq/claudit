@@ -1,13 +1,19 @@
+```go
 package opencode
 
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -127,3 +133,145 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+
+// discoverByScanningStorage scans OpenCode's entire data directory for a
+// session belonging to projectPath. OpenCode's on-disk storage layout has
+// changed across versions (sessions nested under a project-hash directory,
+// stored in SQLite, stored flat with an embedded directory field, etc.), so
+// rather than assuming one fixed layout this walks every JSON file under the
+// data directory and looks for one that identifies itself as belonging to
+// this project via a directory/cwd/path/worktree field, picking the most
+// recently modified match within the recent-session window.
+func discoverByScanningStorage(dataDir, projectPath string) (*agent.SessionInfo, error) {
+	storageDir := filepath.Join(dataDir, "storage")
+	if _, err := os.Stat(storageDir); err != nil {
+		return nil, nil
+	}
+
+	absProject := projectPath
+	if abs, err := filepath.Abs(projectPath); err == nil {
+		absProject = abs
+	}
+
+	now := time.Now()
+	var bestID string
+	var bestModTime time.Time
+
+	_ = filepath.WalkDir(storageDir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return nil
+		}
+
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+
+		var meta struct {
+			ID        string `json:"id"`
+			Directory string `json:"directory"`
+			CWD       string `json:"cwd"`
+			Path      string `json:"path"`
+			Worktree  string `json:"worktree"`
+		}
+		if err := json.Unmarshal(data, &meta); err != nil {
+			return nil
+		}
+
+		dir := meta.Directory
+		for _, alt := range []string{meta.CWD, meta.Path, meta.Worktree} {
+			if dir == "" {
+				dir = alt
+			}
+		}
+		if dir == "" || !agent.PathsEqual(dir, absProject) {
+			return nil
+		}
+
+		id := meta.ID
+		if id == "" {
+			id = strings.TrimSuffix(d.Name(), ".json")
+		}
+
+		if bestID == "" || modTime.After(bestModTime) {
+			bestID = id
+			bestModTime = modTime
+		}
+		return nil
+	})
+
+	if bestID == "" {
+		return nil, nil
+	}
+
+	transcriptData := collectSessionMessages(storageDir, bestID)
+	if len(transcriptData) == 0 {
+		transcriptData = []byte("[]")
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      bestID,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+		TranscriptData: transcriptData,
+	}, nil
+}
+
+// collectSessionMessages walks the storage directory for any JSON files
+// associated with sessionID, matched by the session ID appearing as a path
+// segment (e.g. ".../message/<sessionID>/...", ".../part/<sessionID>/...",
+// or ".../session/message/<sessionID>/<messageID>.json"), and combines them
+// into a single JSON array in path order. Returns nil if nothing is found.
+func collectSessionMessages(storageDir, sessionID string) []byte {
+	var paths []string
+	_ = filepath.WalkDir(storageDir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		rel, err := filepath.Rel(storageDir, p)
+		if err != nil {
+			return nil
+		}
+		for _, seg := range strings.Split(filepath.ToSlash(filepath.Dir(rel)), "/") {
+			if seg == sessionID {
+				paths = append(paths, p)
+				break
+			}
+		}
+		return nil
+	})
+
+	if len(paths) == 0 {
+		return nil
+	}
+	sort.Strings(paths)
+
+	var messages []json.RawMessage
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		messages = append(messages, json.RawMessage(data))
+	}
+	if len(messages) == 0 {
+		return nil
+	}
+
+	out, err := json.Marshal(messages)
+	if err != nil {
+		return nil
+	}
+	return out
+}
+```
