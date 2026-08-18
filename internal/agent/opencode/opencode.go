@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -7,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -304,6 +306,32 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
+// sqliteRetryAttempts and sqliteRetryDelay bound how long we wait for the
+// OpenCode SQLite database to become readable. Newer OpenCode versions may
+// keep a background process (e.g. a local server backing the plugin SDK
+// client) holding the database open briefly after a CLI invocation exits,
+// which can cause a "database is locked" error on an immediate read.
+const (
+	sqliteRetryAttempts = 3
+	sqliteRetryDelay    = 250 * time.Millisecond
+)
+
+// runSQLite runs the sqlite3 CLI with the given arguments, retrying briefly
+// on transient errors (e.g. the database being locked by another process).
+func runSQLite(args ...string) ([]byte, error) {
+	var out []byte
+	var err error
+	for attempt := 0; attempt < sqliteRetryAttempts; attempt++ {
+		cmd := exec.Command("sqlite3", args...)
+		out, err = cmd.Output()
+		if err == nil {
+			return out, nil
+		}
+		time.Sleep(sqliteRetryDelay)
+	}
+	return out, err
+}
+
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
@@ -321,8 +349,7 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
 		projectID,
 	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
+	sessionOutput, err := runSQLite("-separator", "\t", dbPath, sessionQuery)
 	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
 		return nil, nil
 	}
@@ -333,8 +360,7 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		`SELECT time_updated FROM session WHERE id='%s';`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
-	timeOutput, err := cmd.Output()
+	timeOutput, err := runSQLite(dbPath, timeQuery)
 	if err == nil {
 		timeStr := strings.TrimSpace(string(timeOutput))
 		if t, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
@@ -349,17 +375,32 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 			if time.Since(t) > agent.RecentSessionTimeout {
 				return nil, nil
 			}
+		} else if ms, err := strconv.ParseInt(timeStr, 10, 64); err == nil {
+			// Some OpenCode versions store time_updated as a Unix timestamp
+			// (milliseconds, or seconds on older schemas) rather than a string.
+			t := time.UnixMilli(ms)
+			if ms < 1e12 {
+				t = time.Unix(ms, 0)
+			}
+			if time.Since(t) > agent.RecentSessionTimeout {
+				return nil, nil
+			}
 		}
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
 
-	// Get messages for this session as a JSON array
+	// Get messages for this session as a JSON array. Some message rows may
+	// have a NULL or non-object `data` value (e.g. transient/system rows);
+	// coerce those to an empty object instead of letting json_patch fail the
+	// entire aggregate query for the whole session.
 	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
+		`SELECT json_group_array(json_patch(
+			CASE WHEN json_valid(data) AND json_type(data) = 'object' THEN data ELSE '{}' END,
+			json_object('id', id)
+		)) FROM message WHERE session_id='%s' ORDER BY time_created;`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, msgQuery)
-	msgOutput, err := cmd.Output()
+	msgOutput, err := runSQLite(dbPath, msgQuery)
 	if err != nil {
 		return nil, nil
 	}
@@ -497,4 +538,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
