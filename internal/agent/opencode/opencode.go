@@ -252,29 +252,50 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
+//
+// OpenCode's on-disk project grouping has changed across releases (older
+// versions nested session files under a project-ID directory derived from
+// the git root commit; newer versions may key projects by worktree path
+// instead, or may not nest sessions under a project directory at all). Rather
+// than depending on reproducing whatever ID scheme the installed OpenCode
+// version uses, we scan both possible layouts and identify the right session
+// by matching its own recorded "directory" field against projectPath,
+// falling back to the most recently modified session when no directory
+// match is available.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
-	if err != nil {
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+
+	var candidates []string
+	if flat, globErr := filepath.Glob(filepath.Join(sessionRoot, "*.json")); globErr == nil {
+		candidates = append(candidates, flat...)
+	}
+	if nested, globErr := filepath.Glob(filepath.Join(sessionRoot, "*", "*.json")); globErr == nil {
+		candidates = append(candidates, nested...)
+	}
+
+	if len(candidates) == 0 {
 		return nil, nil
+	}
+
+	wantDir := projectPath
+	if resolved, resolveErr := filepath.EvalSymlinks(projectPath); resolveErr == nil {
+		wantDir = resolved
 	}
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
 	var bestSessionID string
 	var bestModTime time.Time
+	var bestMatched bool
 
-	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-
-		info, err := entry.Info()
-		if err != nil {
+	for _, path := range candidates {
+		info, statErr := os.Stat(path)
+		if statErr != nil {
 			continue
 		}
 
@@ -283,9 +304,32 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 			continue
 		}
 
-		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+		sessionID := strings.TrimSuffix(filepath.Base(path), ".json")
+		matched := false
+
+		if data, readErr := os.ReadFile(path); readErr == nil {
+			var session sessionInfo
+			if json.Unmarshal(data, &session) == nil {
+				if session.ID != "" {
+					sessionID = session.ID
+				}
+				if session.Directory != "" {
+					sessDir := session.Directory
+					if resolved, resolveErr := filepath.EvalSymlinks(sessDir); resolveErr == nil {
+						sessDir = resolved
+					}
+					matched = sessDir == wantDir
+				}
+			}
+		}
+
+		// A directory-matched session always wins over an unmatched one;
+		// among sessions with the same match status, prefer the most recent.
+		if bestSessionID == "" || (matched && !bestMatched) ||
+			(matched == bestMatched && modTime.After(bestModTime)) {
+			bestSessionID = sessionID
 			bestModTime = modTime
+			bestMatched = matched
 		}
 	}
 
@@ -324,7 +368,15 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
 	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
-		return nil, nil
+		// The project_id scheme may not match this OpenCode version (e.g.
+		// worktree-based IDs instead of git root commit). Fall back to the
+		// most recently updated session across all projects.
+		cmd = exec.Command("sqlite3", "-separator", "\t", dbPath,
+			`SELECT id FROM session ORDER BY time_updated DESC LIMIT 1;`)
+		sessionOutput, err = cmd.Output()
+		if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+			return nil, nil
+		}
 	}
 	sessionID := strings.TrimSpace(string(sessionOutput))
 
@@ -497,4 +549,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
