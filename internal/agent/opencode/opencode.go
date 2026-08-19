@@ -305,6 +305,13 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
+//
+// OpenCode's SQLite schema has changed across releases: some versions expose
+// fields like the project reference or timestamps as dedicated columns, while
+// others only store them nested inside the JSON "data" blob. To stay
+// compatible across versions, we inspect the real columns at query time via
+// PRAGMA table_info and fall back to json_extract() against "data" for any
+// field that isn't a materialized column.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
@@ -316,10 +323,18 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
+	sessionCols, err := sqliteTableColumns(dbPath, "session")
+	if err != nil || len(sessionCols) == 0 {
+		return nil, nil
+	}
+
+	projectIDExpr := sqliteFieldExpr(sessionCols, "$.projectID", "project_id", "projectID", "projectId")
+	updatedExpr := sqliteFieldExpr(sessionCols, "$.time.updated", "time_updated", "updated", "timeUpdated")
+
 	// Find most recent session for this project
 	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
+		`SELECT id FROM session WHERE %s='%s' ORDER BY %s DESC LIMIT 1;`,
+		projectIDExpr, projectID, updatedExpr,
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
@@ -330,8 +345,8 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
-		`SELECT time_updated FROM session WHERE id='%s';`,
-		sessionID,
+		`SELECT %s FROM session WHERE id='%s';`,
+		updatedExpr, sessionID,
 	)
 	cmd = exec.Command("sqlite3", dbPath, timeQuery)
 	timeOutput, err := cmd.Output()
@@ -353,10 +368,19 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
 
+	msgCols, err := sqliteTableColumns(dbPath, "message")
+	if err != nil || len(msgCols) == 0 {
+		return nil, nil
+	}
+
+	sessionIDExpr := sqliteFieldExpr(msgCols, "$.sessionID", "session_id", "sessionID", "sessionId")
+	createdExpr := sqliteFieldExpr(msgCols, "$.time.created", "time_created", "created", "timeCreated")
+	idExpr := sqliteFieldExpr(msgCols, "$.id", "id")
+
 	// Get messages for this session as a JSON array
 	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
+		`SELECT json_group_array(json_patch(data, json_object('id', %s))) FROM message WHERE %s='%s' ORDER BY %s;`,
+		idExpr, sessionIDExpr, sessionID, createdExpr,
 	)
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
@@ -377,6 +401,38 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// sqliteTableColumns returns the set of column names for a SQLite table.
+func sqliteTableColumns(dbPath, table string) (map[string]bool, error) {
+	cmd := exec.Command("sqlite3", dbPath, fmt.Sprintf("PRAGMA table_info(%s);", table))
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	cols := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		fields := strings.Split(line, "|")
+		if len(fields) > 1 {
+			cols[fields[1]] = true
+		}
+	}
+	return cols, nil
+}
+
+// sqliteFieldExpr returns a SQL expression for a field: the first matching
+// literal column name from candidates, or a json_extract() fallback against
+// the "data" JSON blob when none of the candidate columns exist as real
+// columns. This keeps queries working whether a given OpenCode version
+// materializes a field as a column or only nests it inside "data".
+func sqliteFieldExpr(cols map[string]bool, jsonPath string, candidates ...string) string {
+	for _, c := range candidates {
+		if cols[c] {
+			return c
+		}
+	}
+	return fmt.Sprintf("json_extract(data, '%s')", jsonPath)
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -497,4 +553,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
