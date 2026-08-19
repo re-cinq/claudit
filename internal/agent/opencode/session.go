@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +129,249 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
+//
+// OpenCode's on-disk SQLite schema is not a stable public contract and has
+// changed across releases (table/column names have been renamed at least
+// once already). Rather than hardcode a specific schema version, this
+// introspects the actual tables and columns at query time so discovery
+// keeps working as OpenCode's storage format evolves.
+func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
+	dbPath := filepath.Join(dataDir, "opencode.db")
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		return nil, nil
+	}
+
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		return nil, nil
+	}
+
+	sessionTable, err := findSQLiteTable(dbPath, "session", "sessions")
+	if err != nil || sessionTable == nil {
+		return nil, nil
+	}
+
+	idCol := pickColumn(sessionTable.Columns, "id")
+	projectCol := pickColumn(sessionTable.Columns,
+		"project_id", "projectid", "project", "directory", "cwd", "worktree", "path")
+	timeCol := pickColumn(sessionTable.Columns,
+		"time_updated", "updated_at", "updatedat",
+		"time_created", "created_at", "createdat")
+	if idCol == "" || projectCol == "" {
+		return nil, nil
+	}
+
+	orderClause := ""
+	if timeCol != "" {
+		orderClause = " ORDER BY " + quoteIdent(timeCol) + " DESC"
+	}
+	sessionQuery := fmt.Sprintf(
+		"SELECT * FROM %s WHERE %s = %s%s LIMIT 1;",
+		quoteIdent(sessionTable.Name), quoteIdent(projectCol), sqlQuote(projectID), orderClause,
+	)
+
+	sessionRows, err := runSQLiteJSONQuery(dbPath, sessionQuery)
+	if err != nil || len(sessionRows) == 0 {
+		return nil, nil
+	}
+	row := sessionRows[0]
+
+	sessionID := stringValue(row[idCol])
+	if sessionID == "" {
+		return nil, nil
+	}
+
+	// Check if this session was recent (within timeout). If we can't
+	// determine recency, proceed anyway — better to try than skip.
+	if timeCol != "" && !isRecentTimestamp(row[timeCol]) {
+		return nil, nil
+	}
+
+	messageTable, err := findSQLiteTable(dbPath, "message", "messages")
+	if err != nil || messageTable == nil {
+		return nil, nil
+	}
+
+	sessionFKCol := pickColumn(messageTable.Columns, "session_id", "sessionid", "session")
+	if sessionFKCol == "" {
+		return nil, nil
+	}
+	msgOrderCol := pickColumn(messageTable.Columns,
+		"time_created", "created_at", "createdat",
+		"time_updated", "updated_at", "updatedat", "id")
+
+	msgOrderClause := ""
+	if msgOrderCol != "" {
+		msgOrderClause = " ORDER BY " + quoteIdent(msgOrderCol)
+	}
+	msgQuery := fmt.Sprintf(
+		"SELECT * FROM %s WHERE %s = %s%s;",
+		quoteIdent(messageTable.Name), quoteIdent(sessionFKCol), sqlQuote(sessionID), msgOrderClause,
+	)
+
+	msgOut, err := exec.Command("sqlite3", "-json", dbPath, msgQuery).Output()
+	if err != nil {
+		return nil, nil
+	}
+
+	// sqlite3 -json prints nothing (not "[]") when a query matches zero rows.
+	transcriptData := []byte(strings.TrimSpace(string(msgOut)))
+	if len(transcriptData) == 0 {
+		transcriptData = []byte("[]")
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      sessionID,
+		TranscriptPath: "", // no file path for SQLite
+		StartedAt:      time.Now().Format(time.RFC3339),
+		ProjectPath:    projectPath,
+		TranscriptData: transcriptData,
+	}, nil
+}
+
+// sqliteTableInfo describes an introspected SQLite table and its columns.
+type sqliteTableInfo struct {
+	Name    string
+	Columns []string
+}
+
+// findSQLiteTable finds the first table in dbPath matching one of the given
+// candidate names (case-insensitive, checked in priority order) and returns
+// its name and column list. Returns (nil, nil) if no candidate matches.
+func findSQLiteTable(dbPath string, candidates ...string) (*sqliteTableInfo, error) {
+	out, err := exec.Command("sqlite3", "-json", dbPath,
+		"SELECT name FROM sqlite_master WHERE type='table';").Output()
+	if err != nil {
+		return nil, err
+	}
+
+	var tables []struct {
+		Name string `json:"name"`
+	}
+	if strings.TrimSpace(string(out)) != "" {
+		if err := json.Unmarshal(out, &tables); err != nil {
+			return nil, err
+		}
+	}
+
+	var match string
+	for _, cand := range candidates {
+		for _, t := range tables {
+			if strings.EqualFold(t.Name, cand) {
+				match = t.Name
+				break
+			}
+		}
+		if match != "" {
+			break
+		}
+	}
+	if match == "" {
+		return nil, nil
+	}
+
+	colOut, err := exec.Command("sqlite3", "-json", dbPath,
+		fmt.Sprintf("PRAGMA table_info(%s);", quoteIdent(match))).Output()
+	if err != nil {
+		return nil, err
+	}
+
+	var cols []struct {
+		Name string `json:"name"`
+	}
+	if strings.TrimSpace(string(colOut)) != "" {
+		if err := json.Unmarshal(colOut, &cols); err != nil {
+			return nil, err
+		}
+	}
+
+	names := make([]string, len(cols))
+	for i, c := range cols {
+		names[i] = c.Name
+	}
+
+	return &sqliteTableInfo{Name: match, Columns: names}, nil
+}
+
+// runSQLiteJSONQuery runs a query against dbPath and decodes the result as a
+// slice of column-name-keyed rows.
+func runSQLiteJSONQuery(dbPath, query string) ([]map[string]interface{}, error) {
+	out, err := exec.Command("sqlite3", "-json", dbPath, query).Output()
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(string(out)) == "" {
+		return nil, nil
+	}
+	var rows []map[string]interface{}
+	if err := json.Unmarshal(out, &rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// pickColumn returns the first column in cols matching one of the candidates
+// (case-insensitive, checked in priority order), or "" if none match.
+func pickColumn(cols []string, candidates ...string) string {
+	for _, cand := range candidates {
+		for _, c := range cols {
+			if strings.EqualFold(c, cand) {
+				return c
+			}
+		}
+	}
+	return ""
+}
+
+// quoteIdent quotes a SQLite identifier (table or column name).
+func quoteIdent(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+// sqlQuote quotes a SQLite string literal.
+func sqlQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
+// stringValue converts a JSON-decoded value to its string form.
+func stringValue(v interface{}) string {
+	switch val := v.(type) {
+	case string:
+		return val
+	case nil:
+		return ""
+	default:
+		return fmt.Sprintf("%v", val)
+	}
+}
+
+// isRecentTimestamp reports whether a JSON-decoded timestamp value (an
+// RFC3339-ish string, or a numeric Unix epoch in seconds or milliseconds)
+// falls within RecentSessionTimeout. Values that can't be interpreted are
+// treated as recent — better to try than to skip a real session.
+func isRecentTimestamp(v interface{}) bool {
+	switch val := v.(type) {
+	case string:
+		layouts := []string{
+			time.RFC3339Nano,
+			"2006-01-02T15:04:05.000Z",
+			"2006-01-02 15:04:05",
+		}
+		for _, layout := range layouts {
+			if t, err := time.Parse(layout, val); err == nil {
+				return time.Since(t) <= agent.RecentSessionTimeout
+			}
+		}
+		return true
+	case float64:
+		sec := int64(val)
+		if sec > 1_000_000_000_000 {
+			sec /= 1000 // milliseconds -> seconds
+		}
+		return time.Since(time.Unix(sec, 0)) <= agent.RecentSessionTimeout
+	default:
+		return true
+	}
 }
