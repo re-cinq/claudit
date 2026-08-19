@@ -73,6 +73,28 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// FindMessageDir locates the directory containing message files for a
+// session, checking both the legacy layout (storage/message/<sessionID>)
+// and newer OpenCode releases that have been observed nesting messages
+// under storage/session/message/<sessionID> instead. Falls back to the
+// legacy path (used by RestoreSession) if neither is found yet.
+func FindMessageDir(dataDir, sessionID string) string {
+	candidates := []string{
+		filepath.Join(dataDir, "storage", "message", sessionID),
+		filepath.Join(dataDir, "storage", "session", "message", sessionID),
+	}
+
+	for _, dir := range candidates {
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			if entries, err := os.ReadDir(dir); err == nil && len(entries) > 0 {
+				return dir
+			}
+		}
+	}
+
+	return candidates[0]
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
