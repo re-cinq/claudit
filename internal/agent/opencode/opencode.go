@@ -304,6 +304,41 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
+// sqliteTableColumns returns the column names of a table in the given SQLite
+// database, or nil if the table doesn't exist or sqlite3 fails.
+func sqliteTableColumns(dbPath, table string) []string {
+	cmd := exec.Command("sqlite3", dbPath, fmt.Sprintf("PRAGMA table_info(%s);", table))
+	output, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	var cols []string
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		fields := strings.Split(line, "|")
+		if len(fields) >= 2 && fields[1] != "" {
+			cols = append(cols, fields[1])
+		}
+	}
+	return cols
+}
+
+// pickSQLiteColumn returns the first candidate present in cols, or fallback
+// if none match. This lets session discovery tolerate OpenCode renaming
+// timestamp columns across releases instead of failing the whole query.
+func pickSQLiteColumn(cols []string, candidates []string, fallback string) string {
+	present := make(map[string]bool, len(cols))
+	for _, c := range cols {
+		present[c] = true
+	}
+	for _, cand := range candidates {
+		if present[cand] {
+			return cand
+		}
+	}
+	return fallback
+}
+
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
@@ -316,10 +351,23 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
+	// Timestamp column names have drifted across OpenCode releases (e.g.
+	// time_updated vs updated_at). A hard-coded name in the ORDER BY clause
+	// makes the *entire* query fail if the column doesn't exist, silently
+	// dropping session discovery. Resolve the real column dynamically and
+	// fall back to rowid ordering (insertion order) when none match.
+	sessionCols := sqliteTableColumns(dbPath, "session")
+	sessionTimeCol := pickSQLiteColumn(sessionCols,
+		[]string{"time_updated", "updated_at", "updatedAt", "time_updated_at"}, "rowid")
+
+	messageCols := sqliteTableColumns(dbPath, "message")
+	messageTimeCol := pickSQLiteColumn(messageCols,
+		[]string{"time_created", "created_at", "createdAt"}, "rowid")
+
 	// Find most recent session for this project
 	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
+		`SELECT id FROM session WHERE project_id='%s' ORDER BY %s DESC LIMIT 1;`,
+		projectID, sessionTimeCol,
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
@@ -330,8 +378,8 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
-		`SELECT time_updated FROM session WHERE id='%s';`,
-		sessionID,
+		`SELECT %s FROM session WHERE id='%s';`,
+		sessionTimeCol, sessionID,
 	)
 	cmd = exec.Command("sqlite3", dbPath, timeQuery)
 	timeOutput, err := cmd.Output()
@@ -355,8 +403,8 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 
 	// Get messages for this session as a JSON array
 	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
+		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY %s;`,
+		sessionID, messageTimeCol,
 	)
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
@@ -497,4 +545,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
