@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -241,14 +242,28 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
+	// Fall back to SQLite (OpenCode v1.2+)
 	projectID := GetProjectID(projectPath)
-	return discoverFromSQLite(dataDir, projectID, projectPath)
+	session, err = discoverFromSQLite(dataDir, projectID, projectPath)
+	if err != nil {
+		return nil, err
+	}
+	if session != nil {
+		return session, nil
+	}
+
+	// Last resort: OpenCode's project ID derivation has changed across
+	// releases and may no longer match our git-root-commit-hash assumption.
+	// Walk every project's session directory and match sessions by their
+	// "directory" field instead of relying on the project ID subdirectory
+	// name (mirrors the ScanAllProjectDirs fallback used for Gemini and the
+	// content-matching walk used for Codex).
+	return scanAllSessionDirs(dataDir, projectPath)
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -323,10 +338,21 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
-		return nil, nil
-	}
 	sessionID := strings.TrimSpace(string(sessionOutput))
+
+	if err != nil || sessionID == "" {
+		// OpenCode's project ID derivation has changed across releases and
+		// may no longer match our git-root-commit-hash assumption. Fall back
+		// to the single most recently updated session across all projects;
+		// the recency check below still bounds how stale it can be.
+		fallbackQuery := `SELECT id FROM session ORDER BY time_updated DESC LIMIT 1;`
+		cmd = exec.Command("sqlite3", "-separator", "\t", dbPath, fallbackQuery)
+		fallbackOutput, ferr := cmd.Output()
+		if ferr != nil || strings.TrimSpace(string(fallbackOutput)) == "" {
+			return nil, nil
+		}
+		sessionID = strings.TrimSpace(string(fallbackOutput))
+	}
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
@@ -376,6 +402,90 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		StartedAt:      time.Now().Format(time.RFC3339),
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
+	}, nil
+}
+
+// scanAllSessionDirs walks every project subdirectory under storage/session,
+// matching sessions to projectPath by their "directory" field rather than by
+// the project ID subdirectory name. OpenCode's project ID derivation has
+// changed across releases (it no longer reliably matches the git root commit
+// hash computed by GetProjectID), so this scan is used as a last resort when
+// the direct project-ID lookup misses.
+func scanAllSessionDirs(dataDir, projectPath string) (*agent.SessionInfo, error) {
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	projectDirs, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		return nil, nil
+	}
+
+	now := time.Now()
+	var bestSessionID string
+	var bestModTime time.Time
+
+	for _, pd := range projectDirs {
+		if !pd.IsDir() {
+			continue
+		}
+
+		dir := filepath.Join(sessionRoot, pd.Name())
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+
+			modTime := info.ModTime()
+			if now.Sub(modTime) > agent.RecentSessionTimeout {
+				continue
+			}
+
+			data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+			if err != nil {
+				continue
+			}
+
+			var header struct {
+				ID        string `json:"id"`
+				Directory string `json:"directory"`
+			}
+			if err := json.Unmarshal(data, &header); err != nil {
+				continue
+			}
+			if header.Directory != "" && !agent.PathsEqual(header.Directory, projectPath) {
+				continue
+			}
+
+			if bestSessionID == "" || modTime.After(bestModTime) {
+				sessionID := header.ID
+				if sessionID == "" {
+					sessionID = strings.TrimSuffix(entry.Name(), ".json")
+				}
+				bestSessionID = sessionID
+				bestModTime = modTime
+			}
+		}
+	}
+
+	if bestSessionID == "" {
+		return nil, nil
+	}
+
+	msgDir, _ := GetMessageDir(bestSessionID)
+
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: msgDir,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
 	}, nil
 }
 
@@ -497,4 +607,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
