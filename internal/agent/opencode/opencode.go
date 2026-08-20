@@ -353,21 +353,34 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
 
-	// Get messages for this session as a JSON array
+	// Get messages for this session as a JSON array. The message table's
+	// foreign-key and ordering column names have changed across OpenCode
+	// versions, so detect them from the live schema instead of assuming
+	// fixed names (e.g. "session_id"/"time_created").
+	sessionCol, timeCol := detectMessageColumns(dbPath)
 	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
+		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE %s='%s' ORDER BY %s;`,
+		sessionCol, sessionID, timeCol,
 	)
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
 	if err != nil {
-		return nil, nil
+		// Fall back to an empty transcript rather than dropping the
+		// session entirely — we already confirmed a matching, recent
+		// session exists, so a note is still worth creating.
+		return &agent.SessionInfo{
+			SessionID:      sessionID,
+			TranscriptPath: "",
+			StartedAt:      time.Now().Format(time.RFC3339),
+			ProjectPath:    projectPath,
+			TranscriptData: []byte("[]"),
+		}, nil
 	}
 
 	transcriptData := []byte(strings.TrimSpace(string(msgOutput)))
 	// sqlite3 returns "[null]" when no rows match
 	if string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
-		return nil, nil
+		transcriptData = []byte("[]")
 	}
 
 	return &agent.SessionInfo{
@@ -377,6 +390,56 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// detectMessageColumns inspects the "message" table schema to find the
+// column that references the owning session and the column used to order
+// messages chronologically. OpenCode has renamed these columns between
+// versions (e.g. "session_id" vs "sessionID"), so we detect them at
+// runtime instead of hardcoding names that may no longer exist.
+// Falls back to the historical "session_id"/"time_created" names if
+// detection fails, preserving prior behavior.
+func detectMessageColumns(dbPath string) (sessionCol, timeCol string) {
+	sessionCol, timeCol = "session_id", "time_created"
+
+	cmd := exec.Command("sqlite3", "-json", dbPath, "PRAGMA table_info(message);")
+	output, err := cmd.Output()
+	if err != nil {
+		return sessionCol, timeCol
+	}
+
+	var columns []struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(output, &columns); err != nil || len(columns) == 0 {
+		return sessionCol, timeCol
+	}
+
+	foundSessionCol, foundTimeCol := "", ""
+	for _, col := range columns {
+		lower := strings.ToLower(col.Name)
+		if lower == "session_id" || lower == "sessionid" {
+			foundSessionCol = col.Name
+		} else if foundSessionCol == "" && strings.Contains(lower, "session") {
+			foundSessionCol = col.Name
+		}
+
+		if lower == "time_created" || lower == "created_at" || lower == "createdat" {
+			foundTimeCol = col.Name
+		} else if foundTimeCol == "" && strings.Contains(lower, "created") {
+			foundTimeCol = col.Name
+		} else if foundTimeCol == "" && strings.Contains(lower, "time") {
+			foundTimeCol = col.Name
+		}
+	}
+
+	if foundSessionCol != "" {
+		sessionCol = foundSessionCol
+	}
+	if foundTimeCol != "" {
+		timeCol = foundTimeCol
+	}
+	return sessionCol, timeCol
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -497,4 +560,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
