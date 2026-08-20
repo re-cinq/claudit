@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -7,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -316,58 +318,30 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
-	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+	sessionID := findRecentSessionID(dbPath, projectID)
+	if sessionID == "" {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
 	// Check if this session was recent (within timeout)
-	timeQuery := fmt.Sprintf(
-		`SELECT time_updated FROM session WHERE id='%s';`,
-		sessionID,
-	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
-	timeOutput, err := cmd.Output()
-	if err == nil {
-		timeStr := strings.TrimSpace(string(timeOutput))
-		if t, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02T15:04:05.000Z", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02 15:04:05", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		}
-		// If we can't parse the time, proceed anyway — better to try than skip
+	timeStr := runSQLiteScalar(dbPath, fmt.Sprintf(`SELECT time_updated FROM session WHERE id='%s';`, sessionID))
+	if timeStr != "" && !isRecentTimestamp(timeStr) {
+		return nil, nil
 	}
 
-	// Get messages for this session as a JSON array
+	// Get messages for this session as a JSON array. A query failure or empty
+	// result here (e.g. the message table's column layout changed in a newer
+	// OpenCode release) should not discard a session we already confirmed
+	// exists — fall back to an empty transcript so a note still gets recorded
+	// instead of silently dropping the whole discovery.
 	msgQuery := fmt.Sprintf(
 		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, msgQuery)
-	msgOutput, err := cmd.Output()
-	if err != nil {
-		return nil, nil
-	}
-
-	transcriptData := []byte(strings.TrimSpace(string(msgOutput)))
-	// sqlite3 returns "[null]" when no rows match
-	if string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
-		return nil, nil
+	transcriptData := []byte(runSQLiteScalar(dbPath, msgQuery))
+	switch string(transcriptData) {
+	case "", "[null]", "null":
+		transcriptData = []byte("[]")
 	}
 
 	return &agent.SessionInfo{
@@ -377,6 +351,74 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// findRecentSessionID looks up the most recently updated OpenCode session for
+// a project. It first tries an exact project_id match (OpenCode's historical
+// schema). If that yields nothing — e.g. because a newer OpenCode release
+// changed how project IDs are computed — it falls back to the single most
+// recently inserted session in the whole database. This is safe because the
+// caller still verifies the session falls within RecentSessionTimeout before
+// using it.
+func findRecentSessionID(dbPath, projectID string) string {
+	scoped := fmt.Sprintf(
+		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
+		projectID,
+	)
+	if id := runSQLiteScalar(dbPath, scoped); id != "" {
+		return id
+	}
+
+	return runSQLiteScalar(dbPath, `SELECT id FROM session ORDER BY rowid DESC LIMIT 1;`)
+}
+
+// runSQLiteScalar runs a query against the OpenCode SQLite database and
+// returns the trimmed scalar output, or "" if the query failed (e.g. because
+// a table or column referenced by the query no longer exists).
+func runSQLiteScalar(dbPath, query string) string {
+	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, query)
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+
+// isRecentTimestamp reports whether timeStr — in any of the formats OpenCode
+// has used for session timestamps (RFC3339, a truncated ISO variant, a plain
+// SQL datetime, or a Unix epoch in seconds/milliseconds/microseconds/
+// nanoseconds) — is within RecentSessionTimeout of now. An unparseable
+// timestamp is treated as recent — better to try storing than to silently skip.
+func isRecentTimestamp(timeStr string) bool {
+	if t, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
+		return time.Since(t) <= agent.RecentSessionTimeout
+	}
+	if t, err := time.Parse("2006-01-02T15:04:05.000Z", timeStr); err == nil {
+		return time.Since(t) <= agent.RecentSessionTimeout
+	}
+	if t, err := time.Parse("2006-01-02 15:04:05", timeStr); err == nil {
+		return time.Since(t) <= agent.RecentSessionTimeout
+	}
+	if epoch, err := strconv.ParseInt(timeStr, 10, 64); err == nil {
+		return time.Since(parseEpoch(epoch)) <= agent.RecentSessionTimeout
+	}
+	return true
+}
+
+// parseEpoch converts a Unix epoch integer of unknown precision (seconds,
+// milliseconds, microseconds, or nanoseconds) to a time.Time based on its
+// magnitude.
+func parseEpoch(v int64) time.Time {
+	switch {
+	case v > 100_000_000_000_000_000: // nanoseconds
+		return time.Unix(0, v)
+	case v > 100_000_000_000_000: // microseconds
+		return time.Unix(0, v*1_000)
+	case v > 100_000_000_000: // milliseconds
+		return time.Unix(0, v*1_000_000)
+	default: // seconds
+		return time.Unix(v, 0)
+	}
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -454,7 +496,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +538,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
