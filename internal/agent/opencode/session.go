@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -79,6 +82,114 @@ type sessionInfo struct {
 	ProjectID string `json:"projectID,omitempty"`
 	Directory string `json:"directory,omitempty"`
 	Title     string `json:"title,omitempty"`
+}
+
+// ScanAllProjectDirs scans every entry under storage/session for a session
+// belonging to projectPath, without assuming OpenCode groups sessions under
+// a directory keyed by our locally computed project ID (see GetProjectID).
+// OpenCode's on-disk project ID scheme has changed across releases, so the
+// directory GetSessionDir predicts may no longer be where a given version
+// actually writes sessions. Each candidate entry — whether a nested
+// per-project directory (older layout) or a session file directly under
+// storage/session (newer flat layout) — is opened and matched against
+// projectPath via its own recorded "directory" or "projectID" field, and the
+// most recently modified match within the recent-session window wins.
+func ScanAllProjectDirs(projectPath string) (*agent.SessionInfo, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return nil, nil
+	}
+
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	entries, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		return nil, nil
+	}
+
+	projectID := GetProjectID(projectPath)
+	cleanProjectPath := filepath.Clean(projectPath)
+
+	now := time.Now()
+	var bestSessionID string
+	var bestModTime time.Time
+
+	consider := func(path string, modTime time.Time) {
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return
+		}
+
+		var sess sessionInfo
+		if err := json.Unmarshal(data, &sess); err != nil {
+			return
+		}
+
+		matches := sess.ProjectID != "" && sess.ProjectID == projectID
+		if !matches && sess.Directory != "" {
+			matches = filepath.Clean(sess.Directory) == cleanProjectPath
+		}
+		if !matches {
+			return
+		}
+
+		if bestSessionID == "" || modTime.After(bestModTime) {
+			id := sess.ID
+			if id == "" {
+				id = strings.TrimSuffix(filepath.Base(path), ".json")
+			}
+			bestSessionID = id
+			bestModTime = modTime
+		}
+	}
+
+	for _, entry := range entries {
+		name := entry.Name()
+		fullPath := filepath.Join(sessionRoot, name)
+
+		if entry.IsDir() {
+			children, err := os.ReadDir(fullPath)
+			if err != nil {
+				continue
+			}
+			for _, child := range children {
+				if child.IsDir() || !strings.HasSuffix(child.Name(), ".json") {
+					continue
+				}
+				info, err := child.Info()
+				if err != nil {
+					continue
+				}
+				consider(filepath.Join(fullPath, child.Name()), info.ModTime())
+			}
+			continue
+		}
+
+		if !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		consider(fullPath, info.ModTime())
+	}
+
+	if bestSessionID == "" {
+		return nil, nil
+	}
+
+	msgDir, _ := GetMessageDir(bestSessionID)
+
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: msgDir,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
 }
 
 // WriteSessionFile writes a session and its messages to OpenCode's storage.
