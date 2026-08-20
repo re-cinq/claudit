@@ -7,7 +7,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +128,96 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// sqliteTableColumns returns the first matching table name (from candidates,
+// tried in order) found in the SQLite database at dbPath, along with its
+// column names (via PRAGMA table_info). Returns ("", nil) if none of the
+// candidate table names exist or sqlite3 can't be queried.
+//
+// OpenCode's on-disk schema has changed table/column names across releases,
+// so callers use this instead of hardcoding names, keeping session discovery
+// working across versions.
+func sqliteTableColumns(dbPath string, candidateTables ...string) (string, []string) {
+	for _, name := range candidateTables {
+		cmd := exec.Command("sqlite3", dbPath, fmt.Sprintf("PRAGMA table_info(%s);", name))
+		output, err := cmd.Output()
+		if err != nil {
+			continue
+		}
+
+		var cols []string
+		for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			// PRAGMA table_info columns: cid|name|type|notnull|dflt_value|pk
+			fields := strings.Split(line, "|")
+			if len(fields) > 1 && fields[1] != "" {
+				cols = append(cols, fields[1])
+			}
+		}
+
+		if len(cols) > 0 {
+			return name, cols
+		}
+	}
+
+	return "", nil
+}
+
+// pickColumn returns the first candidate (in the casing it appears in cols)
+// that exists in cols, matching case-insensitively. Returns "" if none match.
+func pickColumn(cols []string, candidates ...string) string {
+	byLower := make(map[string]string, len(cols))
+	for _, c := range cols {
+		byLower[strings.ToLower(c)] = c
+	}
+
+	for _, cand := range candidates {
+		if actual, ok := byLower[strings.ToLower(cand)]; ok {
+			return actual
+		}
+	}
+
+	return ""
+}
+
+// escapeSQLiteString escapes single quotes for safe inclusion in a
+// single-quoted SQLite string literal.
+func escapeSQLiteString(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
+// parseSQLiteTime parses a timestamp value read from OpenCode's SQLite
+// database. OpenCode has stored timestamps as RFC3339-ish strings in some
+// releases and as Unix epoch integers (seconds or milliseconds) in others,
+// so multiple formats are tried.
+func parseSQLiteTime(raw string) (time.Time, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, false
+	}
+
+	formats := []string{
+		time.RFC3339Nano,
+		"2006-01-02T15:04:05.000Z",
+		"2006-01-02 15:04:05",
+	}
+	for _, f := range formats {
+		if t, err := time.Parse(f, raw); err == nil {
+			return t, true
+		}
+	}
+
+	if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
+		if n > 1e12 {
+			// Milliseconds since epoch.
+			return time.UnixMilli(n), true
+		}
+		return time.Unix(n, 0), true
+	}
+
+	return time.Time{}, false
 }
