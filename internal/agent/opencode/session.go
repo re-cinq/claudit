@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -81,6 +82,40 @@ type sessionInfo struct {
 	Title     string `json:"title,omitempty"`
 }
 
+// SessionCachePath returns the path to shiftlog's own OpenCode session cache
+// file. OpenCode's internal storage layout (flat JSON files vs SQLite, and
+// the schema within each) has changed across releases, which broke direct
+// discovery. The shiftlog plugin instead writes the current session ID and
+// transcript here via OpenCode's stable SDK client, so discovery of the
+// active session (e.g. for manual, non-agent-initiated commits) no longer
+// depends on reverse-engineering OpenCode's internal storage format.
+func SessionCachePath(projectPath string) string {
+	return filepath.Join(projectPath, ".git", "shiftlog", "opencode-session.json")
+}
+
+// sessionCache is the on-disk format written by the shiftlog plugin.
+type sessionCache struct {
+	SessionID      string `json:"session_id"`
+	UpdatedAt      string `json:"updated_at"`
+	TranscriptData string `json:"transcript_data"`
+}
+
+// ReadSessionCache reads the shiftlog-owned session cache for a project.
+// Returns nil, nil if there is no cache file or it's malformed.
+func ReadSessionCache(projectPath string) (*sessionCache, error) {
+	data, err := os.ReadFile(SessionCachePath(projectPath))
+	if err != nil {
+		return nil, nil
+	}
+
+	var cache sessionCache
+	if err := json.Unmarshal(data, &cache); err != nil || cache.SessionID == "" {
+		return nil, nil
+	}
+
+	return &cache, nil
+}
+
 // WriteSessionFile writes a session and its messages to OpenCode's storage.
 func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (string, error) {
 	sessionDir, err := GetSessionDir(projectPath)
@@ -127,3 +162,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
