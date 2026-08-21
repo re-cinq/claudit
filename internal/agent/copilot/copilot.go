@@ -432,17 +432,11 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
-
-		// Check if this session directory has a workspace.yaml
+		// Check if this session directory has a workspace.yaml. Match on
+		// content (cwd) before filtering by recency: a session's own
+		// directory entry can carry a stale mtime (see latestActivity)
+		// even while the session is still active, so recency is decided
+		// only for directories that actually belong to this project.
 		entryPath := filepath.Join(sessionDir, entry.Name())
 		meta, err := parseSessionMeta(entryPath)
 		if err != nil || meta == nil {
@@ -450,6 +444,11 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		}
 
 		if !agent.PathsEqual(meta.CWD, projectPath) {
+			continue
+		}
+
+		modTime := latestActivity(entry, entryPath)
+		if now.Sub(modTime) > recentTimeout {
 			continue
 		}
 
@@ -472,4 +471,27 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	}, nil
 }
 
+// latestActivity returns the most recent modification time among the session
+// directory itself and the files written inside it. A directory's own mtime
+// only advances when entries are added to or removed from it, not when an
+// existing file's contents are rewritten in place — so a session that has
+// been appending to events.jsonl (or was assembled in a staging location and
+// moved/renamed into session-state once ready) can look stale by directory
+// mtime alone even though it was active moments ago. Checking the session
+// files directly avoids treating such a session as "not recent".
+func latestActivity(dirEntry os.DirEntry, dirPath string) time.Time {
+	var latest time.Time
+	if info, err := dirEntry.Info(); err == nil {
+		latest = info.ModTime()
+	}
 
+	for _, name := range []string{"workspace.yaml", "events.jsonl"} {
+		if info, err := os.Stat(filepath.Join(dirPath, name)); err == nil {
+			if info.ModTime().After(latest) {
+				latest = info.ModTime()
+			}
+		}
+	}
+
+	return latest
+}
