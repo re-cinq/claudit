@@ -77,7 +77,7 @@ func HasFlatHookCommand(hookConfig interface{}, command string) bool {
 // Handles all known role names across Claude, Codex, Copilot, Gemini, and OpenCode.
 func NormalizeRole(role string) MessageType {
 	switch role {
-	case "user":
+	case "user", "tool":
 		return MessageTypeUser
 	case "assistant", "model", "gemini":
 		return MessageTypeAssistant
