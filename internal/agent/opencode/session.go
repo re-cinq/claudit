@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -35,8 +36,19 @@ func GetDataDir() (string, error) {
 }
 
 // GetProjectID returns the project identifier for OpenCode.
-// For git repos, this is the root commit hash. For non-git dirs, it's "global".
+// Newer OpenCode versions (v1.x) generate their own opaque project id the
+// first time they run against a repo and persist it at <git-dir>/opencode,
+// reusing that value afterward instead of recomputing anything from git
+// history. When that marker is present we must match it exactly, or
+// session lookups (flat file dirs and the SQLite project_id column) silently
+// return nothing. Fall back to the root commit hash - OpenCode's original
+// scheme, and our own scheme for repos OpenCode hasn't touched yet - or
+// "global" for non-git dirs.
 func GetProjectID(projectPath string) string {
+	if id := readOpenCodeProjectIDMarker(projectPath); id != "" {
+		return id
+	}
+
 	cmd := exec.Command("git", "rev-list", "--max-parents=0", "--all")
 	cmd.Dir = projectPath
 	output, err := cmd.Output()
@@ -50,6 +62,29 @@ func GetProjectID(projectPath string) string {
 		return strings.TrimSpace(lines[0])
 	}
 	return "global"
+}
+
+// readOpenCodeProjectIDMarker reads the project id OpenCode itself persists
+// at <git-common-dir>/opencode, if present. Returns "" if there's no marker
+// (e.g. non-git dir, or OpenCode hasn't run against this repo yet).
+func readOpenCodeProjectIDMarker(projectPath string) string {
+	cmd := exec.Command("git", "rev-parse", "--git-common-dir")
+	cmd.Dir = projectPath
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	gitDir := strings.TrimSpace(string(output))
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(projectPath, gitDir)
+	}
+
+	data, err := os.ReadFile(filepath.Join(gitDir, "opencode"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 // GetSessionDir returns the session storage directory for a project.
@@ -127,3 +162,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
