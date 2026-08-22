@@ -409,6 +409,14 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
+// sessionCandidate is a directory found while scanning Copilot's session
+// state tree that yielded parseable metadata.
+type sessionCandidate struct {
+	dir     string
+	meta    *sessionMeta
+	modTime time.Time
+}
+
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
@@ -416,60 +424,88 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		return nil, nil
 	}
 
-	entries, err := os.ReadDir(sessionDir)
-	if err != nil {
-		return nil, nil
-	}
+	candidates := collectSessionCandidates(sessionDir, 0)
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
 
+	var bestMatch *sessionCandidate
+	var bestAny *sessionCandidate
+
+	for _, c := range candidates {
+		if now.Sub(c.modTime) > recentTimeout {
+			continue
+		}
+
+		if bestAny == nil || c.modTime.After(bestAny.modTime) {
+			bestAny = c
+		}
+
+		if c.meta.CWD != "" && agent.PathsEqual(c.meta.CWD, projectPath) {
+			if bestMatch == nil || c.modTime.After(bestMatch.modTime) {
+				bestMatch = c
+			}
+		}
+	}
+
+	// Prefer an exact CWD match. If the metadata format changed such that
+	// the CWD can no longer be determined, fall back to the most recent
+	// session overall rather than reporting nothing found.
+	chosen := bestMatch
+	if chosen == nil {
+		chosen = bestAny
+	}
+	if chosen == nil {
+		return nil, nil
+	}
+
+	sessionID := chosen.meta.ID
+	if sessionID == "" {
+		sessionID = filepath.Base(chosen.dir)
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      sessionID,
+		TranscriptPath: GetTranscriptPath(chosen.dir),
+		StartedAt:      chosen.modTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
+}
+
+// collectSessionCandidates walks the session state tree looking for
+// directories that contain parseable session metadata. It descends one
+// extra level below dirs without metadata of their own, since some Copilot
+// CLI releases nest session directories under an intermediate bucket (e.g.
+// a date-based directory) rather than storing them flat.
+func collectSessionCandidates(dir string, depth int) []*sessionCandidate {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+
+	var out []*sessionCandidate
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
 
-		info, err := entry.Info()
-		if err != nil {
+		entryPath := filepath.Join(dir, entry.Name())
+		if meta, err := parseSessionMeta(entryPath); err == nil && meta != nil {
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			out = append(out, &sessionCandidate{
+				dir:     entryPath,
+				meta:    meta,
+				modTime: info.ModTime(),
+			})
 			continue
 		}
 
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
-
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
-		}
-
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
-		}
-
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+		if depth < 1 {
+			out = append(out, collectSessionCandidates(entryPath, depth+1)...)
 		}
 	}
-
-	if bestDir == "" {
-		return nil, nil
-	}
-
-	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
-		ProjectPath:    projectPath,
-	}, nil
+	return out
 }
-
-
