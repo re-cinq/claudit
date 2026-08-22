@@ -160,6 +160,14 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 		}
 	}
 
+	// Snapshot the transcript to disk while the session is still live. Newer
+	// Copilot CLI releases remove the session-state directory once the
+	// process exits, which would otherwise leave nothing for a later
+	// `shiftlog store --manual` (post-commit hook) invocation to find.
+	if hook.CWD != "" && sessionID != "" && transcriptPath != "" {
+		cacheActiveSession(hook.CWD, sessionID, transcriptPath)
+	}
+
 	return &agent.HookData{
 		SessionID:      sessionID,
 		TranscriptPath: transcriptPath,
@@ -228,7 +236,13 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 
 // DiscoverSession finds an active or recent Copilot CLI session.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	return scanForRecentSession(projectPath)
+	if info, err := scanForRecentSession(projectPath); err == nil && info != nil {
+		return info, nil
+	}
+	// The live session-state directory may already be gone (Copilot CLI
+	// cleans it up on exit) — fall back to a snapshot taken while it was
+	// still live, see cacheActiveSession.
+	return loadCachedSession(projectPath)
 }
 
 // RestoreSession writes a transcript to Copilot CLI's expected location.
@@ -471,5 +485,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
