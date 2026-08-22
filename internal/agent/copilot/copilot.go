@@ -227,8 +227,19 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent Copilot CLI session.
+// Copilot CLI's on-disk session layout has changed across releases (e.g.
+// the workspace.yaml metadata file or its fields may be missing/renamed),
+// so if the known session-state layout doesn't yield a match, fall back to
+// a recency-based scan of the whole Copilot data directory.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	return scanForRecentSession(projectPath)
+	session, err := scanForRecentSession(projectPath)
+	if err != nil {
+		return nil, err
+	}
+	if session != nil {
+		return session, nil
+	}
+	return scanForRecentSessionFuzzy(projectPath)
 }
 
 // RestoreSession writes a transcript to Copilot CLI's expected location.
@@ -472,4 +483,64 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	}, nil
 }
 
+// scanForRecentSessionFuzzy performs a best-effort recursive scan of the
+// Copilot CLI data directory (~/.copilot) for a recently modified
+// transcript-like (.jsonl) file, used when the documented session-state
+// layout (session-state/<id>/workspace.yaml + events.jsonl) doesn't
+// produce a match. Copilot CLI has restructured its on-disk session
+// storage between releases before; this tolerates that by not depending
+// on a fixed directory shape or metadata file. It doesn't verify the
+// project path — it just picks the most recently touched transcript file
+// within the recent-session window, which in practice is the session that
+// was just active in this working directory.
+func scanForRecentSessionFuzzy(projectPath string) (*agent.SessionInfo, error) {
+	copilotDir, err := GetCopilotDir()
+	if err != nil {
+		return nil, nil
+	}
 
+	now := time.Now()
+	var bestPath string
+	var bestModTime time.Time
+
+	_ = filepath.WalkDir(copilotDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil // ignore unreadable entries, keep scanning
+		}
+		if d.IsDir() || !strings.HasSuffix(d.Name(), ".jsonl") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return nil
+		}
+
+		if bestPath == "" || modTime.After(bestModTime) {
+			bestPath = path
+			bestModTime = modTime
+		}
+		return nil
+	})
+
+	if bestPath == "" {
+		return nil, nil
+	}
+
+	sessionID := filepath.Base(filepath.Dir(bestPath))
+	if sessionID == "." || sessionID == string(filepath.Separator) || sessionID == filepath.Base(copilotDir) {
+		sessionID = strings.TrimSuffix(filepath.Base(bestPath), filepath.Ext(bestPath))
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      sessionID,
+		TranscriptPath: bestPath,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
+}
