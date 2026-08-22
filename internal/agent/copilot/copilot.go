@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -426,30 +427,43 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestDir string
 	var bestSessionID string
 	var bestModTime time.Time
+	var bestTranscriptPath string
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
 
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
+		entryPath := filepath.Join(sessionDir, entry.Name())
 
 		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
 		meta, err := parseSessionMeta(entryPath)
 		if err != nil || meta == nil {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		// Match on cwd, falling back to git_root: newer Copilot CLI versions
+		// may leave cwd empty or renamed, but still populate git_root.
+		if !agent.PathsEqual(meta.CWD, projectPath) &&
+			(meta.GitRoot == "" || !agent.PathsEqual(meta.GitRoot, projectPath)) {
+			continue
+		}
+
+		// Prefer the transcript file's own mtime over the session
+		// directory's mtime: on most filesystems a directory's mtime only
+		// changes when entries are added or removed, not when an existing
+		// file (like events.jsonl) is appended to, so relying on the
+		// directory alone can make an actively-updating session look stale.
+		modTime := time.Time{}
+		if info, err := entry.Info(); err == nil {
+			modTime = info.ModTime()
+		}
+		transcriptPath := resolveTranscriptPath(entryPath)
+		if info, err := os.Stat(transcriptPath); err == nil && info.ModTime().After(modTime) {
+			modTime = info.ModTime()
+		}
+
+		if now.Sub(modTime) > recentTimeout {
 			continue
 		}
 
@@ -457,6 +471,7 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			bestDir = entryPath
 			bestSessionID = meta.ID
 			bestModTime = modTime
+			bestTranscriptPath = transcriptPath
 		}
 	}
 
@@ -466,10 +481,9 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	return &agent.SessionInfo{
 		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
+		TranscriptPath: bestTranscriptPath,
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
