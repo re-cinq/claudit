@@ -449,7 +449,15 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		// Newer Copilot CLI versions record git_root in workspace.yaml
+		// instead of (or in addition to) cwd. shiftlog always resolves
+		// projectPath to the repo root, so prefer git_root and fall back
+		// to cwd for older sessions that only set that field.
+		sessionPath := meta.GitRoot
+		if sessionPath == "" {
+			sessionPath = meta.CWD
+		}
+		if sessionPath == "" || !agent.PathsEqual(sessionPath, projectPath) {
 			continue
 		}
 
@@ -471,5 +479,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
