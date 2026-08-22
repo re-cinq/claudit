@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -413,12 +414,12 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
-		return nil, nil
+		return readCachedSession(projectPath), nil
 	}
 
 	entries, err := os.ReadDir(sessionDir)
 	if err != nil {
-		return nil, nil
+		return readCachedSession(projectPath), nil
 	}
 
 	now := time.Now()
@@ -461,15 +462,121 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	}
 
 	if bestDir == "" {
-		return nil, nil
+		// Copilot CLI may have already removed the session-state directory for
+		// a completed one-shot (--print) session by the time something asks for
+		// it (e.g. the post-commit hook running a few seconds later). Fall back
+		// to the most recent session we observed live via a hook call.
+		return readCachedSession(projectPath), nil
 	}
 
-	return &agent.SessionInfo{
+	si := &agent.SessionInfo{
 		SessionID:      bestSessionID,
 		TranscriptPath: GetTranscriptPath(bestDir),
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
-	}, nil
+	}
+	cacheSession(si)
+	return si, nil
 }
 
+// cachedSessionEntry is a lightweight record of a session observed live via a
+// hook call. It lets manual (post-commit) session discovery recover a session
+// after Copilot CLI has torn down its own session-state directory.
+type cachedSessionEntry struct {
+	SessionID      string    `json:"session_id"`
+	TranscriptPath string    `json:"transcript_path"`
+	ProjectPath    string    `json:"project_path"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
 
+// shiftlogCachePath returns the path to shiftlog's own cache of recently
+// observed Copilot sessions, kept outside Copilot's own session-state
+// directory so it survives Copilot's own cleanup.
+func shiftlogCachePath() (string, error) {
+	copilotDir, err := GetCopilotDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(copilotDir, "shiftlog-session-cache.json"), nil
+}
+
+// cacheSession records a live-discovered session for later recovery.
+func cacheSession(si *agent.SessionInfo) {
+	if si == nil || si.SessionID == "" {
+		return
+	}
+	path, err := shiftlogCachePath()
+	if err != nil {
+		return
+	}
+
+	var entries []cachedSessionEntry
+	if data, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(data, &entries)
+	}
+
+	kept := entries[:0]
+	for _, e := range entries {
+		if agent.PathsEqual(e.ProjectPath, si.ProjectPath) {
+			continue // superseded by the fresh entry below
+		}
+		if time.Since(e.UpdatedAt) > agent.RecentSessionTimeout {
+			continue // stale, drop it
+		}
+		kept = append(kept, e)
+	}
+	entries = append(kept, cachedSessionEntry{
+		SessionID:      si.SessionID,
+		TranscriptPath: si.TranscriptPath,
+		ProjectPath:    si.ProjectPath,
+		UpdatedAt:      time.Now(),
+	})
+
+	data, err := json.Marshal(entries)
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, data, 0600)
+}
+
+// readCachedSession returns the most recently cached session for projectPath,
+// if any, within the recent-session window.
+func readCachedSession(projectPath string) *agent.SessionInfo {
+	path, err := shiftlogCachePath()
+	if err != nil {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var entries []cachedSessionEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil
+	}
+
+	var best *cachedSessionEntry
+	for i := range entries {
+		e := &entries[i]
+		if time.Since(e.UpdatedAt) > agent.RecentSessionTimeout {
+			continue
+		}
+		if !agent.PathsEqual(e.ProjectPath, projectPath) {
+			continue
+		}
+		if best == nil || e.UpdatedAt.After(best.UpdatedAt) {
+			best = e
+		}
+	}
+	if best == nil {
+		return nil
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      best.SessionID,
+		TranscriptPath: best.TranscriptPath,
+		StartedAt:      best.UpdatedAt.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}
+}
+```
