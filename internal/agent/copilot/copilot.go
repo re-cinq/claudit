@@ -410,6 +410,12 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// Newer Copilot CLI releases have been observed nesting session directories one
+// level deeper (e.g. session-state/<workspaceID>/<sessionID>/workspace.yaml)
+// instead of storing workspace.yaml directly under session-state/<sessionID>/.
+// candidateSessionDirs collects both layouts so discovery keeps working across
+// that kind of directory-structure drift.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -421,18 +427,16 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		return nil, nil
 	}
 
+	candidates := candidateSessionDirs(sessionDir, entries)
+
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
 	var bestDir string
 	var bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-
-		info, err := entry.Info()
+	for _, entryPath := range candidates {
+		info, err := os.Stat(entryPath)
 		if err != nil {
 			continue
 		}
@@ -442,8 +446,6 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
 		meta, err := parseSessionMeta(entryPath)
 		if err != nil || meta == nil {
 			continue
@@ -472,4 +474,38 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	}, nil
 }
 
+// candidateSessionDirs returns directories under sessionDir that directly
+// contain a workspace.yaml file, checking both the flat layout
+// (session-state/<sessionID>/workspace.yaml) and a one-level-nested layout
+// (session-state/<workspaceID>/<sessionID>/workspace.yaml).
+func candidateSessionDirs(sessionDir string, entries []os.DirEntry) []string {
+	var candidates []string
 
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		entryPath := filepath.Join(sessionDir, entry.Name())
+		if _, err := os.Stat(filepath.Join(entryPath, "workspace.yaml")); err == nil {
+			candidates = append(candidates, entryPath)
+			continue
+		}
+
+		nested, err := os.ReadDir(entryPath)
+		if err != nil {
+			continue
+		}
+		for _, ne := range nested {
+			if !ne.IsDir() {
+				continue
+			}
+			nestedPath := filepath.Join(entryPath, ne.Name())
+			if _, err := os.Stat(filepath.Join(nestedPath, "workspace.yaml")); err == nil {
+				candidates = append(candidates, nestedPath)
+			}
+		}
+	}
+
+	return candidates
+}
