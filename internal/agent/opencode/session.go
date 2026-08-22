@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -8,6 +9,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -81,6 +85,117 @@ type sessionInfo struct {
 	Title     string `json:"title,omitempty"`
 }
 
+// directoryKeys are the known key names OpenCode has used to record a
+// session's working directory in its session JSON file.
+var directoryKeys = []string{"directory", "cwd", "path", "projectpath", "workingdirectory", "workingdir", "dir"}
+
+// lookupStringCI returns the string value of the first key in candidates
+// found in m, matching key names case-insensitively.
+func lookupStringCI(m map[string]interface{}, candidates []string) string {
+	for k, v := range m {
+		lk := strings.ToLower(k)
+		for _, c := range candidates {
+			if lk == c {
+				if s, ok := v.(string); ok {
+					return s
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// findSessionFileByDirectory recursively scans dataDir's session storage for
+// a session JSON file, modified within timeout, whose recorded directory
+// matches projectPath. Unlike GetSessionDir, it does not assume the session
+// lives under a specific project-ID subdirectory, so it tolerates OpenCode
+// changing how project IDs are derived or where sessions are nested. If no
+// file records a recognizable directory field but exactly one recent session
+// exists, that session is returned as a best-effort match.
+func findSessionFileByDirectory(dataDir, projectPath string, timeout time.Duration) (sessionID string, modTime time.Time, found bool) {
+	root := filepath.Join(dataDir, "storage")
+	now := time.Now()
+
+	var fallbackID string
+	var fallbackModTime time.Time
+	fallbackCount := 0
+
+	_ = filepath.Walk(root, func(p string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info == nil {
+			return nil
+		}
+		if info.IsDir() {
+			if info.Name() == "message" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(info.Name(), ".json") {
+			return nil
+		}
+		if now.Sub(info.ModTime()) > timeout {
+			return nil
+		}
+
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+		var raw map[string]interface{}
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil
+		}
+
+		id := lookupStringCI(raw, []string{"id"})
+		if id == "" {
+			id = strings.TrimSuffix(filepath.Base(p), ".json")
+		}
+
+		dir := lookupStringCI(raw, directoryKeys)
+		if dir != "" {
+			if agent.PathsEqual(dir, projectPath) {
+				if !found || info.ModTime().After(modTime) {
+					sessionID, modTime, found = id, info.ModTime(), true
+				}
+			}
+			return nil
+		}
+
+		// This version's schema doesn't record a recognizable directory
+		// field - track as an unscoped fallback, used only if unambiguous.
+		fallbackCount++
+		if fallbackID == "" || info.ModTime().After(fallbackModTime) {
+			fallbackID, fallbackModTime = id, info.ModTime()
+		}
+		return nil
+	})
+
+	if !found && fallbackCount == 1 {
+		sessionID, modTime, found = fallbackID, fallbackModTime, true
+	}
+
+	return sessionID, modTime, found
+}
+
+// findMessageDir locates a session's message directory when the standard
+// storage/message/<sessionID> path doesn't exist, tolerating storage-layout
+// changes across OpenCode versions.
+func findMessageDir(dataDir, sessionID string) string {
+	root := filepath.Join(dataDir, "storage")
+	var found string
+	_ = filepath.Walk(root, func(p string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info == nil || found != "" {
+			return nil
+		}
+		if info.IsDir() && info.Name() == sessionID {
+			found = p
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	return found
+}
+
 // WriteSessionFile writes a session and its messages to OpenCode's storage.
 func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (string, error) {
 	sessionDir, err := GetSessionDir(projectPath)
@@ -127,3 +242,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
