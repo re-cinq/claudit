@@ -46,6 +46,21 @@ func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 		return nil, err
 	}
 
+	if meta.CWD == "" {
+		// Recent Copilot CLI releases have shuffled workspace.yaml's keys
+		// before. Fall back to scanning the raw document for a commonly
+		// used alternative key rather than failing to match entirely.
+		var raw map[string]interface{}
+		if err := yaml.Unmarshal(data, &raw); err == nil {
+			for _, key := range []string{"workspace", "directory", "dir", "folder", "path", "workdir"} {
+				if v, ok := raw[key].(string); ok && v != "" {
+					meta.CWD = v
+					break
+				}
+			}
+		}
+	}
+
 	return &meta, nil
 }
 
@@ -81,4 +96,3 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-

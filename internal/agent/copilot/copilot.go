@@ -442,20 +442,34 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
+
+		// Check if this session directory has a workspace.yaml naming its cwd.
+		cwd := ""
+		sessionID := entry.Name()
+		if meta, err := parseSessionMeta(entryPath); err == nil && meta != nil {
+			cwd = meta.CWD
+			if meta.ID != "" {
+				sessionID = meta.ID
+			}
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		// workspace.yaml may be missing, or may no longer carry a usable cwd
+		// (e.g. if it's only written while the session is still active).
+		// Fall back to the cwd recorded in the transcript itself, which is
+		// flushed to disk for the lifetime of the session and survives
+		// after the Copilot CLI process has exited.
+		if cwd == "" {
+			cwd = cwdFromTranscript(GetTranscriptPath(entryPath))
+		}
+
+		if cwd == "" || !agent.PathsEqual(cwd, projectPath) {
 			continue
 		}
 
 		if bestDir == "" || modTime.After(bestModTime) {
 			bestDir = entryPath
-			bestSessionID = meta.ID
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
 	}
@@ -472,4 +486,43 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	}, nil
 }
 
+// cwdFromTranscript reads the first few lines of a Copilot events.jsonl
+// transcript looking for a recorded working directory (e.g. on a
+// session.start event). Returns "" if none is found.
+func cwdFromTranscript(transcriptPath string) string {
+	f, err := os.Open(transcriptPath)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = f.Close() }()
 
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	// The cwd is only ever recorded near the start of a session, so we only
+	// need to look at the first several lines.
+	for i := 0; i < 20 && scanner.Scan(); i++ {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		var raw struct {
+			CWD  string `json:"cwd"`
+			Data struct {
+				CWD string `json:"cwd"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal([]byte(line), &raw); err != nil {
+			continue
+		}
+		if raw.CWD != "" {
+			return raw.CWD
+		}
+		if raw.Data.CWD != "" {
+			return raw.Data.CWD
+		}
+	}
+
+	return ""
+}
