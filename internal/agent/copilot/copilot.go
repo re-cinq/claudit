@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -5,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -409,14 +411,21 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
-// scanForRecentSession scans Copilot's session state directory for recent session directories.
+// scanForRecentSession searches Copilot's data directory for the most recently
+// active session matching projectPath.
+//
+// Earlier versions of this scan only looked one level deep inside
+// ~/.copilot/session-state/<id>/. That still matches while a session is live
+// (proven by the postToolUse hook path above, which calls this same function
+// with the CWD Copilot reports mid-session), but newer Copilot CLI releases can
+// relocate or nest a session's on-disk record once the process exits (e.g. active
+// vs. finalized/history session state living under different subdirectories of
+// ~/.copilot). Rather than assume a single fixed location, this walks the whole
+// ~/.copilot tree for any workspace.yaml and verifies the match by content (cwd)
+// instead of by directory-naming convention, so it keeps working regardless of
+// exactly where a given Copilot CLI version parks the file.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionStateDir()
-	if err != nil {
-		return nil, nil
-	}
-
-	entries, err := os.ReadDir(sessionDir)
+	copilotDir, err := GetCopilotDir()
 	if err != nil {
 		return nil, nil
 	}
@@ -427,38 +436,36 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
+	_ = filepath.WalkDir(copilotDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || d.Name() != "workspace.yaml" {
+			return nil
 		}
 
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
-
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
+		sessionDir := filepath.Dir(path)
+		meta, err := parseSessionMeta(sessionDir)
 		if err != nil || meta == nil {
-			continue
+			return nil
 		}
 
 		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
+			return nil
+		}
+
+		modTime := latestModTime(sessionDir)
+		if now.Sub(modTime) > recentTimeout {
+			return nil
 		}
 
 		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
+			bestDir = sessionDir
 			bestSessionID = meta.ID
+			if bestSessionID == "" {
+				bestSessionID = filepath.Base(sessionDir)
+			}
 			bestModTime = modTime
 		}
-	}
+		return nil
+	})
 
 	if bestDir == "" {
 		return nil, nil
@@ -472,4 +479,30 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	}, nil
 }
 
+// latestModTime returns the most recent modification time among the entries
+// directly inside dir, falling back to dir's own mtime if it can't be read.
+// A session's workspace.yaml is typically written once at session start and
+// never touched again (only events.jsonl grows), so using the directory's own
+// mtime alone can under-report how recently a session was actually active.
+func latestModTime(dir string) time.Time {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if info, statErr := os.Stat(dir); statErr == nil {
+			return info.ModTime()
+		}
+		return time.Time{}
+	}
 
+	var latest time.Time
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(latest) {
+			latest = info.ModTime()
+		}
+	}
+	return latest
+}
+```
