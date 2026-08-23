@@ -449,7 +449,7 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		if !sessionMatchesProject(meta, projectPath) {
 			continue
 		}
 
@@ -472,4 +472,18 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	}, nil
 }
 
-
+// sessionMatchesProject reports whether a Copilot session's recorded
+// location matches projectPath. Older Copilot CLI releases only populated
+// workspace.yaml's "cwd" field; newer releases (observed starting around
+// 1.0.5x+) instead (or additionally) populate "git_root" and may leave "cwd"
+// pointing at a subdirectory or blank. Match against either field so
+// discovery keeps working across that shift.
+func sessionMatchesProject(meta *sessionMeta, projectPath string) bool {
+	if meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath) {
+		return true
+	}
+	if meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath) {
+		return true
+	}
+	return false
+}
