@@ -449,7 +449,11 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		// Copilot CLI records the invocation directory in "cwd", but recent
+		// versions may leave it blank while "git_root" reflects where the
+		// session actually ran. Accept a match on either field so discovery
+		// keeps working regardless of which one the CLI populates.
+		if !agent.PathsEqual(meta.CWD, projectPath) && !agent.PathsEqual(meta.GitRoot, projectPath) {
 			continue
 		}
 
@@ -471,5 +475,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
