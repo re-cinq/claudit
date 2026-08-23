@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -9,10 +10,26 @@ import (
 )
 
 // sessionMeta represents lightweight metadata from a Copilot session workspace.yaml.
+// CWD/Directory/WorkingDirectory are accepted as aliases since different Copilot
+// CLI versions have used different field names for the working directory.
 type sessionMeta struct {
-	ID      string `yaml:"id"`
-	CWD     string `yaml:"cwd"`
-	GitRoot string `yaml:"git_root,omitempty"`
+	ID               string `yaml:"id"`
+	CWD              string `yaml:"cwd"`
+	Directory        string `yaml:"directory,omitempty"`
+	WorkingDirectory string `yaml:"workingDirectory,omitempty"`
+	GitRoot          string `yaml:"git_root,omitempty"`
+}
+
+// effectiveCWD returns the working directory recorded for the session,
+// checking known field aliases in order of preference.
+func (m *sessionMeta) effectiveCWD() string {
+	if m.CWD != "" {
+		return m.CWD
+	}
+	if m.Directory != "" {
+		return m.Directory
+	}
+	return m.WorkingDirectory
 }
 
 // GetCopilotDir returns the path to Copilot's config/data directory.
@@ -81,4 +98,4 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-
+```
