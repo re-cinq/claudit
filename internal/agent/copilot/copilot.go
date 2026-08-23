@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -409,56 +410,83 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
-// scanForRecentSession scans Copilot's session state directory for recent session directories.
+// scanForRecentSession scans Copilot's session state directory for recent
+// sessions belonging to projectPath. A session directory is identified by
+// the presence of an events.jsonl file. Older Copilot CLI versions place
+// these directly under session-state/<sessionID>/; some observed newer
+// versions add an extra grouping directory (e.g. by workspace), so this
+// walks a couple of levels deep rather than assuming a fixed depth.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionStateDir()
-	if err != nil {
-		return nil, nil
-	}
-
-	entries, err := os.ReadDir(sessionDir)
+	stateDir, err := GetSessionStateDir()
 	if err != nil {
 		return nil, nil
 	}
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
+
 	var bestDir string
 	var bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-
-		info, err := entry.Info()
+	const maxDepth = 2
+	var walk func(dir string, depth int)
+	walk = func(dir string, depth int) {
+		entries, err := os.ReadDir(dir)
 		if err != nil {
-			continue
+			return
 		}
 
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
 
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
-		}
+			entryPath := filepath.Join(dir, entry.Name())
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
-		}
+			if _, statErr := os.Stat(GetTranscriptPath(entryPath)); statErr == nil {
+				info, err := entry.Info()
+				if err != nil {
+					continue
+				}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+				modTime := info.ModTime()
+				if now.Sub(modTime) > recentTimeout {
+					continue
+				}
+
+				meta := resolveSessionMeta(entryPath, entry.Name())
+				if meta == nil || meta.CWD == "" {
+					continue
+				}
+
+				if !agent.PathsEqual(meta.CWD, projectPath) {
+					continue
+				}
+
+				sessionID := meta.ID
+				if sessionID == "" {
+					sessionID = entry.Name()
+				}
+
+				if bestDir == "" || modTime.After(bestModTime) {
+					bestDir = entryPath
+					bestSessionID = sessionID
+					bestModTime = modTime
+				}
+
+				// This directory is a session directory itself; don't
+				// descend into it looking for nested sessions.
+				continue
+			}
+
+			if depth < maxDepth {
+				walk(entryPath, depth+1)
+			}
 		}
 	}
+
+	walk(stateDir, 0)
 
 	if bestDir == "" {
 		return nil, nil
@@ -472,4 +500,24 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	}, nil
 }
 
+// resolveSessionMeta returns session metadata for a session directory,
+// preferring workspace.yaml but falling back to metadata embedded in the
+// first event of events.jsonl when workspace.yaml is absent or lacks a cwd.
+func resolveSessionMeta(sessionDir, dirName string) *sessionMeta {
+	if meta, err := parseSessionMeta(sessionDir); err == nil && meta != nil && meta.CWD != "" {
+		if meta.ID == "" {
+			meta.ID = dirName
+		}
+		return meta
+	}
 
+	meta, err := extractSessionStartMeta(sessionDir)
+	if err != nil || meta == nil {
+		return nil
+	}
+	if meta.ID == "" {
+		meta.ID = dirName
+	}
+	return meta
+}
+```
