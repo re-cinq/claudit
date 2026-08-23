@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -409,30 +410,66 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
+// sessionLeafDirs returns candidate session directories under root: either
+// root's immediate subdirectories (the classic <session-id>/ layout), or,
+// when a subdirectory has no events.jsonl of its own, its children (to
+// tolerate newer Copilot CLI versions that group sessions one level deeper,
+// e.g. <workspace-hash>/<session-id>/).
+func sessionLeafDirs(root string) []string {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+
+	var leaves []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, entry.Name())
+		if _, err := os.Stat(GetTranscriptPath(dir)); err == nil {
+			leaves = append(leaves, dir)
+			continue
+		}
+
+		nested, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, ne := range nested {
+			if !ne.IsDir() {
+				continue
+			}
+			ndir := filepath.Join(dir, ne.Name())
+			if _, err := os.Stat(GetTranscriptPath(ndir)); err == nil {
+				leaves = append(leaves, ndir)
+			}
+		}
+	}
+	return leaves
+}
+
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+// It prefers a session whose recorded working directory matches projectPath, but falls back to
+// the single most recently modified session within the timeout window when no confirmed match is
+// found (e.g. because a newer Copilot CLI version no longer populates workspace.yaml the same way).
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	entries, err := os.ReadDir(sessionDir)
-	if err != nil {
-		return nil, nil
-	}
-
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
+	var bestMatchDir, bestMatchSessionID string
+	var bestMatchModTime time.Time
 
-		info, err := entry.Info()
+	var mostRecentDir, mostRecentSessionID string
+	var mostRecentModTime time.Time
+
+	for _, entryPath := range sessionLeafDirs(sessionDir) {
+		info, err := os.Stat(GetTranscriptPath(entryPath))
 		if err != nil {
 			continue
 		}
@@ -442,34 +479,49 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
+		sessionID := filepath.Base(entryPath)
+		meta, metaErr := parseSessionMeta(entryPath)
+		if metaErr == nil && meta != nil && meta.ID != "" {
+			sessionID = meta.ID
+		}
+
+		if mostRecentDir == "" || modTime.After(mostRecentModTime) {
+			mostRecentDir = entryPath
+			mostRecentSessionID = sessionID
+			mostRecentModTime = modTime
+		}
+
+		if meta == nil {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		matched := (meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)) ||
+			(meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath))
+		if !matched {
 			continue
 		}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+		if bestMatchDir == "" || modTime.After(bestMatchModTime) {
+			bestMatchDir = entryPath
+			bestMatchSessionID = sessionID
+			bestMatchModTime = modTime
 		}
 	}
 
-	if bestDir == "" {
+	chosenDir, chosenSessionID, chosenModTime := bestMatchDir, bestMatchSessionID, bestMatchModTime
+	if chosenDir == "" {
+		chosenDir, chosenSessionID, chosenModTime = mostRecentDir, mostRecentSessionID, mostRecentModTime
+	}
+
+	if chosenDir == "" {
 		return nil, nil
 	}
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
+		SessionID:      chosenSessionID,
+		TranscriptPath: GetTranscriptPath(chosenDir),
+		StartedAt:      chosenModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
