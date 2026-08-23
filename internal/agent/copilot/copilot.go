@@ -427,6 +427,13 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestSessionID string
 	var bestModTime time.Time
 
+	// Track recent session directories that we couldn't confidently match by
+	// path, in case metadata field matching fails (e.g. a Copilot CLI release
+	// changes/omits workspace.yaml fields) but there's an unambiguous winner.
+	var recentCount int
+	var onlyRecentDir string
+	var onlyRecentModTime time.Time
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -442,14 +449,24 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
+
+		recentCount++
+		onlyRecentDir = entryPath
+		onlyRecentModTime = modTime
+
+		// Check if this session directory has a workspace.yaml
 		meta, err := parseSessionMeta(entryPath)
 		if err != nil || meta == nil {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		// Match by cwd, or by git_root if the CLI reports the repository
+		// root separately (some Copilot CLI versions populate git_root
+		// instead of, or in addition to, a raw cwd).
+		matches := agent.PathsEqual(meta.CWD, projectPath) ||
+			(meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath))
+		if !matches {
 			continue
 		}
 
@@ -457,6 +474,17 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			bestDir = entryPath
 			bestSessionID = meta.ID
 			bestModTime = modTime
+		}
+	}
+
+	if bestDir == "" && recentCount == 1 {
+		// Last resort: exactly one recent session exists, so even though its
+		// metadata didn't match by cwd/git_root, it's almost certainly the
+		// session we're looking for.
+		if meta, err := parseSessionMeta(onlyRecentDir); err == nil && meta != nil && meta.ID != "" {
+			bestDir = onlyRecentDir
+			bestSessionID = meta.ID
+			bestModTime = onlyRecentModTime
 		}
 	}
 
@@ -471,5 +499,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
