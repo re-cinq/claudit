@@ -305,6 +305,14 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
+// Sessions are matched primarily by their literal working directory, which is stored
+// in each session's JSON payload (mirrored by sessionInfo.Directory in session.go).
+// OpenCode's internal project-identifier scheme (the project_id column) has changed
+// across releases and can no longer be reliably reproduced locally via GetProjectID,
+// but the directory a session was started in is a plain filesystem path both sides
+// agree on, so it's matched via the same symlink-tolerant comparison used elsewhere
+// (agent.PathsEqual). The project_id column is kept as a fallback for rows whose
+// JSON payload has no directory field (older OpenCode databases).
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
@@ -316,42 +324,59 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
-	)
+	// Pull a batch of recent sessions along with their directory (extracted
+	// from the JSON payload) and project_id, then match in Go rather than in
+	// SQL so we can apply the same symlink-tolerant path comparison used by
+	// other agents.
+	sessionQuery := `SELECT id, time_updated, project_id, json_extract(data, '$.directory') FROM session ORDER BY time_updated DESC LIMIT 50;`
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
 	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
+
+	var sessionID, timeStr string
+	for _, line := range strings.Split(strings.TrimSpace(string(sessionOutput)), "\n") {
+		fields := strings.SplitN(line, "\t", 4)
+		if len(fields) < 4 {
+			continue
+		}
+		id, updated, rowProjectID, directory := fields[0], fields[1], fields[2], fields[3]
+
+		matched := false
+		if directory != "" && directory != "NULL" {
+			matched = agent.PathsEqual(directory, projectPath)
+		} else {
+			matched = rowProjectID == projectID
+		}
+		if !matched {
+			continue
+		}
+
+		sessionID = id
+		timeStr = updated
+		break // rows are ordered by time_updated DESC, so the first match is most recent
+	}
+
+	if sessionID == "" {
+		return nil, nil
+	}
 
 	// Check if this session was recent (within timeout)
-	timeQuery := fmt.Sprintf(
-		`SELECT time_updated FROM session WHERE id='%s';`,
-		sessionID,
-	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
-	timeOutput, err := cmd.Output()
-	if err == nil {
-		timeStr := strings.TrimSpace(string(timeOutput))
-		if t, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02T15:04:05.000Z", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02 15:04:05", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
+	if t, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
+		if time.Since(t) > agent.RecentSessionTimeout {
+			return nil, nil
 		}
-		// If we can't parse the time, proceed anyway — better to try than skip
+	} else if t, err := time.Parse("2006-01-02T15:04:05.000Z", timeStr); err == nil {
+		if time.Since(t) > agent.RecentSessionTimeout {
+			return nil, nil
+		}
+	} else if t, err := time.Parse("2006-01-02 15:04:05", timeStr); err == nil {
+		if time.Since(t) > agent.RecentSessionTimeout {
+			return nil, nil
+		}
 	}
+	// If we can't parse the time, proceed anyway — better to try than skip
 
 	// Get messages for this session as a JSON array
 	msgQuery := fmt.Sprintf(
