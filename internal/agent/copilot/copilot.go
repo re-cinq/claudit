@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -432,24 +433,34 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		info, err := entry.Info()
+		// Use the most recent activity within the session directory rather
+		// than the directory's own mtime: on Linux, a directory's mtime only
+		// changes when entries are added or removed, not when an existing
+		// file inside it (like events.jsonl) is appended to. A long-running
+		// session would otherwise look stale by the time discovery runs,
+		// even though it's still active.
+		entryPath := filepath.Join(sessionDir, entry.Name())
+		modTime, err := latestActivity(entryPath)
 		if err != nil {
 			continue
 		}
-
-		modTime := info.ModTime()
 		if now.Sub(modTime) > recentTimeout {
 			continue
 		}
 
 		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
 		meta, err := parseSessionMeta(entryPath)
 		if err != nil || meta == nil {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		// Match on cwd, falling back to git_root when cwd doesn't match.
+		// Callers pass the repo root (via `git rev-parse --show-toplevel`)
+		// as projectPath; a session launched from a subdirectory of the
+		// repo would record that subdirectory as cwd, but git_root should
+		// still equal the repo root.
+		if !agent.PathsEqual(meta.CWD, projectPath) &&
+			!(meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath)) {
 			continue
 		}
 
@@ -472,4 +483,23 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	}, nil
 }
 
+// latestActivity returns the most recent modification time among a session
+// directory and its known files, so appending to events.jsonl during a
+// long-running session still counts as recent activity.
+func latestActivity(sessionDir string) (time.Time, error) {
+	info, err := os.Stat(sessionDir)
+	if err != nil {
+		return time.Time{}, err
+	}
+	best := info.ModTime()
 
+	for _, name := range []string{"workspace.yaml", "events.jsonl"} {
+		if fi, statErr := os.Stat(filepath.Join(sessionDir, name)); statErr == nil {
+			if fi.ModTime().After(best) {
+				best = fi.ModTime()
+			}
+		}
+	}
+	return best, nil
+}
+```
