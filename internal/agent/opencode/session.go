@@ -35,8 +35,15 @@ func GetDataDir() (string, error) {
 }
 
 // GetProjectID returns the project identifier for OpenCode.
-// For git repos, this is the root commit hash. For non-git dirs, it's "global".
+// OpenCode caches a stable project ID in the repo's git directory (as
+// "opencode") so the ID survives history rewrites; when present, that cached
+// value is authoritative. Otherwise, for git repos, it falls back to the root
+// commit hash. For non-git dirs, it's "global".
 func GetProjectID(projectPath string) string {
+	if id := readCachedProjectID(projectPath); id != "" {
+		return id
+	}
+
 	cmd := exec.Command("git", "rev-list", "--max-parents=0", "--all")
 	cmd.Dir = projectPath
 	output, err := cmd.Output()
@@ -50,6 +57,28 @@ func GetProjectID(projectPath string) string {
 		return strings.TrimSpace(lines[0])
 	}
 	return "global"
+}
+
+// readCachedProjectID reads OpenCode's cached project ID from
+// <git-dir>/opencode, if present.
+func readCachedProjectID(projectPath string) string {
+	cmd := exec.Command("git", "rev-parse", "--git-dir")
+	cmd.Dir = projectPath
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	gitDir := strings.TrimSpace(string(output))
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(projectPath, gitDir)
+	}
+
+	data, err := os.ReadFile(filepath.Join(gitDir, "opencode"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 // GetSessionDir returns the session storage directory for a project.
