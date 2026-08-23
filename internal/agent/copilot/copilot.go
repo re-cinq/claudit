@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -427,6 +428,13 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestSessionID string
 	var bestModTime time.Time
 
+	// Fallback tracking: some Copilot CLI versions omit or rename the CWD
+	// metadata in workspace.yaml, so we also track the most recently active
+	// session overall in case no exact workspace-path match is found.
+	var bestAnyDir string
+	var bestAnySessionID string
+	var bestAnyModTime time.Time
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -449,7 +457,15 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		if bestAnyDir == "" || modTime.After(bestAnyModTime) {
+			bestAnyDir = entryPath
+			bestAnySessionID = meta.ID
+			bestAnyModTime = modTime
+		}
+
+		matched := agent.PathsEqual(meta.CWD, projectPath) ||
+			(meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath))
+		if !matched {
 			continue
 		}
 
@@ -458,6 +474,16 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			bestSessionID = meta.ID
 			bestModTime = modTime
 		}
+	}
+
+	if bestDir == "" {
+		// No session matched by workspace path metadata — the Copilot CLI
+		// may have changed the workspace.yaml format. Fall back to the most
+		// recently active session, mirroring the recency-only discovery
+		// used for Claude/Gemini.
+		bestDir = bestAnyDir
+		bestSessionID = bestAnySessionID
+		bestModTime = bestAnyModTime
 	}
 
 	if bestDir == "" {
@@ -471,5 +497,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
