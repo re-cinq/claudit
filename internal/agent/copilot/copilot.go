@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -432,16 +433,6 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
-
 		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
 		meta, err := parseSessionMeta(entryPath)
@@ -449,7 +440,16 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		if !agent.PathsEqual(meta.CWD, projectPath) && !agent.PathsEqual(meta.GitRoot, projectPath) {
+			continue
+		}
+
+		// Recency is based on the most recently modified file belonging to
+		// the session rather than the session directory's own mtime: the
+		// directory's mtime only changes when an entry is added or removed
+		// from it, not when an existing transcript file is appended to.
+		modTime := latestModTime(entryPath, entry)
+		if now.Sub(modTime) > recentTimeout {
 			continue
 		}
 
@@ -472,4 +472,22 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	}, nil
 }
 
+// latestModTime returns the most recent modification time among a session
+// directory itself, its workspace.yaml, and its transcript file.
+func latestModTime(sessionDir string, dirEntry os.DirEntry) time.Time {
+	best := time.Time{}
+	if info, err := dirEntry.Info(); err == nil {
+		best = info.ModTime()
+	}
 
+	if info, err := os.Stat(filepath.Join(sessionDir, "workspace.yaml")); err == nil && info.ModTime().After(best) {
+		best = info.ModTime()
+	}
+
+	if info, err := os.Stat(GetTranscriptPath(sessionDir)); err == nil && info.ModTime().After(best) {
+		best = info.ModTime()
+	}
+
+	return best
+}
+```
