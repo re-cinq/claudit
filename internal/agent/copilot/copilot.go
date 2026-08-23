@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -442,20 +443,33 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
+		// Check if this session directory has workspace metadata we recognize.
 		entryPath := filepath.Join(sessionDir, entry.Name())
 		meta, err := parseSessionMeta(entryPath)
 		if err != nil || meta == nil {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		// Match against either the recorded working directory or git root,
+		// since the CLI may record either depending on how it was invoked
+		// (e.g. from a subdirectory of the repo rather than the repo root
+		// that DiscoverSession is called with).
+		cwdMatches := meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)
+		gitRootMatches := meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath)
+		if !cwdMatches && !gitRootMatches {
 			continue
+		}
+
+		sessionID := meta.ID
+		if sessionID == "" {
+			// Some versions omit the id from the metadata file since the
+			// session directory name already is the session ID.
+			sessionID = entry.Name()
 		}
 
 		if bestDir == "" || modTime.After(bestModTime) {
 			bestDir = entryPath
-			bestSessionID = meta.ID
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
 	}
@@ -471,5 +485,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
