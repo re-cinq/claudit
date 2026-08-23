@@ -168,6 +168,78 @@ func ScanDirForRecentSession(sessionDir, ext string, skipNames []string, project
 	}, nil
 }
 
+// activeSessionMarker mirrors the shape written by Claude's SessionStart hook
+// (.shiftlog/active-session.json). Agents without their own session-lifecycle
+// hooks (Copilot, OpenCode) can use WriteActiveSessionMarker from any
+// postToolUse-style callback to persist a pointer to the live session. This
+// keeps manual-commit discovery working even when the underlying agent CLI
+// removes its own session state once the process exits, which is what
+// scanning the CLI's native storage directly is vulnerable to.
+type activeSessionMarker struct {
+	SessionID      string `json:"session_id"`
+	TranscriptPath string `json:"transcript_path"`
+	StartedAt      string `json:"started_at"`
+	ProjectPath    string `json:"project_path"`
+}
+
+// WriteActiveSessionMarker persists a pointer to the active session under
+// <projectPath>/.shiftlog/active-session.json. Best-effort: errors are
+// swallowed so a failed write never disrupts the calling hook.
+func WriteActiveSessionMarker(projectPath, sessionID, transcriptPath string) {
+	if sessionID == "" || projectPath == "" {
+		return
+	}
+
+	marker := activeSessionMarker{
+		SessionID:      sessionID,
+		TranscriptPath: transcriptPath,
+		StartedAt:      time.Now().UTC().Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}
+
+	data, err := json.MarshalIndent(marker, "", "  ")
+	if err != nil {
+		return
+	}
+
+	dir := filepath.Join(projectPath, ".shiftlog")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return
+	}
+
+	_ = os.WriteFile(filepath.Join(dir, "active-session.json"), data, 0644)
+}
+
+// DiscoverActiveSessionMarker reads the marker written by WriteActiveSessionMarker.
+// Returns nil if the marker is missing, for a different project, malformed, or stale.
+func DiscoverActiveSessionMarker(projectPath string) *SessionInfo {
+	data, err := os.ReadFile(filepath.Join(projectPath, ".shiftlog", "active-session.json"))
+	if err != nil {
+		return nil
+	}
+
+	var marker activeSessionMarker
+	if err := json.Unmarshal(data, &marker); err != nil {
+		return nil
+	}
+
+	if !PathsEqual(marker.ProjectPath, projectPath) {
+		return nil
+	}
+
+	startedAt, err := time.Parse(time.RFC3339, marker.StartedAt)
+	if err != nil || time.Since(startedAt) > RecentSessionTimeout {
+		return nil
+	}
+
+	return &SessionInfo{
+		SessionID:      marker.SessionID,
+		TranscriptPath: marker.TranscriptPath,
+		StartedAt:      marker.StartedAt,
+		ProjectPath:    marker.ProjectPath,
+	}
+}
+
 // Name identifies a coding agent CLI.
 type Name string
 

@@ -83,6 +83,16 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 		transcriptData = []byte(hook.TranscriptData)
 	}
 
+	// Persist a pointer to the live session on every hook call (not just
+	// commits). Newer OpenCode versions may no longer retain discoverable
+	// flat-file/SQLite session state for a session once its process has
+	// exited, so the git post-commit "manual" discovery path can't rely on
+	// scanning OpenCode's own storage after the fact — this marker survives
+	// that, the same way Claude's SessionStart hook already does.
+	if hook.SessionID != "" && hook.ProjectDir != "" {
+		agent.WriteActiveSessionMarker(hook.ProjectDir, hook.SessionID, transcriptPath)
+	}
+
 	return &agent.HookData{
 		SessionID:      hook.SessionID,
 		TranscriptPath: transcriptPath,
@@ -230,8 +240,17 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It checks (in order): the active-session marker, flat file storage
+// (pre-v1.2 OpenCode), then SQLite (v1.2+).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	// Try the active-session marker first (written by ParseHookInput on
+	// every tool-use hook call). This survives even if OpenCode's own
+	// session storage no longer retains data for a session once its
+	// process has exited, which pure directory/SQLite scanning depends on.
+	if info := agent.DiscoverActiveSessionMarker(projectPath); info != nil {
+		return info, nil
+	}
+
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
@@ -497,4 +516,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-

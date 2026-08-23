@@ -160,6 +160,14 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 		}
 	}
 
+	// Persist a pointer to the live session on every hook call (not just
+	// commits). Copilot CLI can remove its own session-state directory once
+	// the process exits, so the git post-commit "manual" discovery path
+	// can't rely on scanning it after the fact — this marker survives that.
+	if sessionID != "" && hook.CWD != "" {
+		agent.WriteActiveSessionMarker(hook.CWD, sessionID, transcriptPath)
+	}
+
 	return &agent.HookData{
 		SessionID:      sessionID,
 		TranscriptPath: transcriptPath,
@@ -228,6 +236,14 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 
 // DiscoverSession finds an active or recent Copilot CLI session.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	// Try the active-session marker first (written by ParseHookInput on every
+	// postToolUse call). This survives even if Copilot CLI has already
+	// removed its own session-state directory by the time a manual commit
+	// triggers discovery.
+	if info := agent.DiscoverActiveSessionMarker(projectPath); info != nil {
+		return info, nil
+	}
+
 	return scanForRecentSession(projectPath)
 }
 
@@ -471,5 +487,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
