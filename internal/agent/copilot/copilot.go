@@ -427,6 +427,14 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestSessionID string
 	var bestModTime time.Time
 
+	// Fallback candidate: the most recently modified session in this timeout
+	// window, used when no session's metadata can be matched to projectPath
+	// (e.g. cwd/git_root fields are absent or unrecognized by this Copilot
+	// CLI version).
+	var fallbackDir string
+	var fallbackSessionID string
+	var fallbackModTime time.Time
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -449,7 +457,21 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		if fallbackDir == "" || modTime.After(fallbackModTime) {
+			fallbackDir = entryPath
+			fallbackSessionID = meta.ID
+			fallbackModTime = modTime
+		}
+
+		// Match against either the recorded cwd or the git repo root: cwd
+		// may be absent or point at a subdirectory depending on the Copilot
+		// CLI version, while git_root reliably identifies the repo root
+		// that DiscoverSession is called with.
+		matches := meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)
+		if !matches && meta.GitRoot != "" {
+			matches = agent.PathsEqual(meta.GitRoot, projectPath)
+		}
+		if !matches {
 			continue
 		}
 
@@ -458,6 +480,14 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			bestSessionID = meta.ID
 			bestModTime = modTime
 		}
+	}
+
+	if bestDir == "" {
+		// No session's metadata matched projectPath directly; fall back to
+		// the most recent session rather than reporting none found.
+		bestDir = fallbackDir
+		bestSessionID = fallbackSessionID
+		bestModTime = fallbackModTime
 	}
 
 	if bestDir == "" {
@@ -471,5 +501,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
