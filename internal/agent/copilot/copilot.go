@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -20,7 +21,7 @@ func init() {
 // Agent implements the agent.Agent interface for GitHub Copilot CLI.
 type Agent struct{}
 
-func (a *Agent) Name() agent.Name   { return agent.Copilot }
+func (a *Agent) Name() agent.Name    { return agent.Copilot }
 func (a *Agent) DisplayName() string { return "Copilot CLI" }
 
 // ConfigureHooks sets up Copilot CLI hooks in .github/hooks/shiftlog.json.
@@ -119,10 +120,10 @@ func (a *Agent) DiagnoseHooks(repoRoot string) []agent.DiagnosticCheck {
 func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 	var hook struct {
 		// Generic format fields
-		SessionID      string `json:"session_id"`
-		TranscriptPath string `json:"transcript_path"`
+		SessionID       string `json:"session_id"`
+		TranscriptPath  string `json:"transcript_path"`
 		GenericToolName string `json:"tool_name"`
-		ToolInput      struct {
+		ToolInput       struct {
 			Command string `json:"command"`
 		} `json:"tool_input"`
 
@@ -410,6 +411,10 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+// It prefers a session whose recorded working directory matches projectPath, but Copilot CLI
+// has changed the metadata field name (and even file format) for the working directory across
+// versions. To stay robust to that drift, if no session's metadata can be matched to projectPath
+// but exactly one recent session directory exists, that sole candidate is used.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -427,6 +432,11 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestSessionID string
 	var bestModTime time.Time
 
+	var soleDir string
+	var soleSessionID string
+	var soleModTime time.Time
+	recentCount := 0
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -442,14 +452,22 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
+		// Check if this session directory has parsable metadata
 		entryPath := filepath.Join(sessionDir, entry.Name())
 		meta, err := parseSessionMeta(entryPath)
 		if err != nil || meta == nil {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		recentCount++
+		if soleDir == "" || modTime.After(soleModTime) {
+			soleDir = entryPath
+			soleSessionID = meta.ID
+			soleModTime = modTime
+		}
+
+		cwd := meta.resolvedCWD()
+		if cwd == "" || !agent.PathsEqual(cwd, projectPath) {
 			continue
 		}
 
@@ -458,6 +476,15 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			bestSessionID = meta.ID
 			bestModTime = modTime
 		}
+	}
+
+	// Prefer an exact CWD match, but if metadata couldn't be matched (e.g. the
+	// working-directory field was renamed or omitted in a newer CLI version)
+	// and there's exactly one recent session, use it rather than reporting none.
+	if bestDir == "" && recentCount == 1 {
+		bestDir = soleDir
+		bestSessionID = soleSessionID
+		bestModTime = soleModTime
 	}
 
 	if bestDir == "" {
@@ -471,5 +498,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
