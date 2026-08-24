@@ -324,7 +324,17 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
 	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
-		return nil, nil
+		// The project_id scheme may have changed in newer OpenCode releases
+		// (e.g. a path-derived slug instead of the git root commit hash),
+		// which would make this filtered query never match. Fall back to
+		// the single most recently updated session overall; the recency
+		// check below still bounds how stale it's allowed to be.
+		fallbackQuery := `SELECT id FROM session ORDER BY time_updated DESC LIMIT 1;`
+		cmd = exec.Command("sqlite3", "-separator", "\t", dbPath, fallbackQuery)
+		sessionOutput, err = cmd.Output()
+		if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+			return nil, nil
+		}
 	}
 	sessionID := strings.TrimSpace(string(sessionOutput))
 
@@ -497,4 +507,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
