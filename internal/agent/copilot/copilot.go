@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -410,6 +411,14 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// Copilot CLI has changed the field names used in workspace.yaml across
+// versions (parseSessionMeta already tries several aliases), so a session
+// whose working-directory field can't be matched isn't discarded outright:
+// it's kept as a fallback candidate. If no session matches projectPath
+// exactly, the most recently modified session with a transcript is used
+// instead, since it's rare to have multiple concurrent CLI sessions across
+// different projects within the recency window.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -423,9 +432,12 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
+
+	var bestDir, bestSessionID string
 	var bestModTime time.Time
+
+	var fallbackDir, fallbackSessionID string
+	var fallbackModTime time.Time
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -442,22 +454,43 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
+
+		// Only consider directories that actually hold a transcript.
+		if _, err := os.Stat(GetTranscriptPath(entryPath)); err != nil {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		// The directory name is itself the session ID (see WriteSessionFile),
+		// so it's a reliable fallback if workspace.yaml is missing or its id
+		// field can't be matched.
+		sessionID := entry.Name()
+		meta, metaErr := parseSessionMeta(entryPath)
+		if metaErr == nil && meta != nil && meta.ID != "" {
+			sessionID = meta.ID
+		}
+
+		if fallbackDir == "" || modTime.After(fallbackModTime) {
+			fallbackDir = entryPath
+			fallbackSessionID = sessionID
+			fallbackModTime = modTime
+		}
+
+		if metaErr != nil || meta == nil || meta.CWD == "" || !agent.PathsEqual(meta.CWD, projectPath) {
 			continue
 		}
 
 		if bestDir == "" || modTime.After(bestModTime) {
 			bestDir = entryPath
-			bestSessionID = meta.ID
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
+	}
+
+	if bestDir == "" {
+		bestDir = fallbackDir
+		bestSessionID = fallbackSessionID
+		bestModTime = fallbackModTime
 	}
 
 	if bestDir == "" {
@@ -471,5 +504,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
