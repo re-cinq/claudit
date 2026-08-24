@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -409,6 +410,58 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
+// sessionDirCandidate is a directory that may contain Copilot session metadata.
+type sessionDirCandidate struct {
+	path    string
+	modTime time.Time
+}
+
+// collectSessionDirs walks the session state directory looking for
+// directories that contain session metadata, up to maxDepth levels deep.
+// Older Copilot CLI releases stored sessions as direct children of
+// session-state/; some releases have nested them under an extra level
+// (e.g. by date or workspace hash), so both layouts are supported.
+func collectSessionDirs(root string, maxDepth int) []sessionDirCandidate {
+	var candidates []sessionDirCandidate
+
+	var walk func(dir string, depth int)
+	walk = func(dir string, depth int) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+
+		hasMeta := false
+		for _, name := range sessionMetaFilenames {
+			if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+				hasMeta = true
+				break
+			}
+		}
+
+		if hasMeta {
+			if info, err := os.Stat(dir); err == nil {
+				candidates = append(candidates, sessionDirCandidate{path: dir, modTime: info.ModTime()})
+			}
+			return
+		}
+
+		if depth >= maxDepth {
+			return
+		}
+
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			walk(filepath.Join(dir, entry.Name()), depth+1)
+		}
+	}
+
+	walk(root, 0)
+	return candidates
+}
+
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
@@ -416,60 +469,67 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		return nil, nil
 	}
 
-	entries, err := os.ReadDir(sessionDir)
-	if err != nil {
-		return nil, nil
-	}
+	candidates := collectSessionDirs(sessionDir, 2)
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
+	var bestDir, bestSessionID string
 	var bestModTime time.Time
+	var fallbackDir, fallbackSessionID string
+	var fallbackModTime time.Time
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
+	for _, c := range candidates {
+		modTime := c.modTime
 		if now.Sub(modTime) > recentTimeout {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
+		meta, err := parseSessionMeta(c.path)
 		if err != nil || meta == nil {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		sessionID := meta.effectiveID()
+		if sessionID == "" {
+			continue
+		}
+
+		// Track the most recent session overall as a fallback in case the
+		// working-directory metadata can't be matched (e.g. an upstream
+		// field rename), so discovery degrades gracefully instead of
+		// failing outright.
+		if fallbackDir == "" || modTime.After(fallbackModTime) {
+			fallbackDir = c.path
+			fallbackSessionID = sessionID
+			fallbackModTime = modTime
+		}
+
+		cwd := meta.effectiveCWD()
+		if cwd == "" || !agent.PathsEqual(cwd, projectPath) {
 			continue
 		}
 
 		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
+			bestDir = c.path
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
 	}
 
-	if bestDir == "" {
+	resultDir, resultSessionID, resultModTime := bestDir, bestSessionID, bestModTime
+	if resultDir == "" {
+		resultDir, resultSessionID, resultModTime = fallbackDir, fallbackSessionID, fallbackModTime
+	}
+
+	if resultDir == "" {
 		return nil, nil
 	}
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
+		SessionID:      resultSessionID,
+		TranscriptPath: resolveTranscriptPath(resultDir),
+		StartedAt:      resultModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
