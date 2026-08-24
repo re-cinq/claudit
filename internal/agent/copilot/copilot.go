@@ -409,14 +409,71 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
+// sessionDirCandidate is a directory that may contain a Copilot session
+// (identified by a workspace.yaml file), found either directly under the
+// session-state root or one level deeper. Some Copilot CLI versions shard
+// sessions into subdirectories (e.g. by ID prefix) instead of storing them
+// flat, so both layouts are checked.
+type sessionDirCandidate struct {
+	path    string
+	modTime time.Time
+}
+
+// collectSessionDirs walks the Copilot session-state root looking for
+// directories that contain a workspace.yaml file, checking both the flat
+// layout (session-state/<id>/workspace.yaml) and a one-level-nested layout
+// (session-state/<shard>/<id>/workspace.yaml).
+func collectSessionDirs(root string) []sessionDirCandidate {
+	var out []sessionDirCandidate
+
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return out
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		entryPath := filepath.Join(root, entry.Name())
+
+		if _, err := os.Stat(filepath.Join(entryPath, "workspace.yaml")); err == nil {
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			out = append(out, sessionDirCandidate{path: entryPath, modTime: info.ModTime()})
+			continue
+		}
+
+		// No workspace.yaml directly here; check one level deeper in case
+		// sessions are sharded into subdirectories.
+		nested, err := os.ReadDir(entryPath)
+		if err != nil {
+			continue
+		}
+		for _, ne := range nested {
+			if !ne.IsDir() {
+				continue
+			}
+			nestedPath := filepath.Join(entryPath, ne.Name())
+			if _, err := os.Stat(filepath.Join(nestedPath, "workspace.yaml")); err != nil {
+				continue
+			}
+			info, err := ne.Info()
+			if err != nil {
+				continue
+			}
+			out = append(out, sessionDirCandidate{path: nestedPath, modTime: info.ModTime()})
+		}
+	}
+
+	return out
+}
+
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
-	if err != nil {
-		return nil, nil
-	}
-
-	entries, err := os.ReadDir(sessionDir)
 	if err != nil {
 		return nil, nil
 	}
@@ -427,25 +484,14 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
+	for _, candidate := range collectSessionDirs(sessionDir) {
+		if now.Sub(candidate.modTime) > recentTimeout {
 			continue
 		}
 
 		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
+		meta, err := parseSessionMeta(candidate.path)
+		if err != nil || meta == nil || meta.CWD == "" {
 			continue
 		}
 
@@ -453,10 +499,13 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
+		if bestDir == "" || candidate.modTime.After(bestModTime) {
+			bestDir = candidate.path
 			bestSessionID = meta.ID
-			bestModTime = modTime
+			if bestSessionID == "" {
+				bestSessionID = filepath.Base(candidate.path)
+			}
+			bestModTime = candidate.modTime
 		}
 	}
 
@@ -471,5 +520,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
