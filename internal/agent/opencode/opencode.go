@@ -316,27 +316,51 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
-	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+	// Find most recent session for this project. Newer OpenCode releases store the
+	// `session` row as a single JSON `data` blob (mirroring the `message` table)
+	// instead of dedicated `project_id`/`time_updated` columns, so try the relational
+	// form first and fall back to a json_extract query against the blob.
+	sessionQueries := []string{
+		fmt.Sprintf(
+			`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
+			projectID,
+		),
+		fmt.Sprintf(
+			`SELECT id FROM session WHERE json_extract(data,'$.projectID')='%s' ORDER BY json_extract(data,'$.time.updated') DESC LIMIT 1;`,
+			projectID,
+		),
+	}
+
+	var sessionID string
+	for _, sessionQuery := range sessionQueries {
+		cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
+		sessionOutput, err := cmd.Output()
+		if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+			continue
+		}
+		sessionID = strings.TrimSpace(string(sessionOutput))
+		break
+	}
+	if sessionID == "" {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
-	// Check if this session was recent (within timeout)
-	timeQuery := fmt.Sprintf(
-		`SELECT time_updated FROM session WHERE id='%s';`,
-		sessionID,
-	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
-	timeOutput, err := cmd.Output()
-	if err == nil {
-		timeStr := strings.TrimSpace(string(timeOutput))
+	// Check if this session was recent (within timeout). Try the same two schema
+	// forms used above to fetch the update timestamp.
+	timeQueries := []string{
+		fmt.Sprintf(`SELECT time_updated FROM session WHERE id='%s';`, sessionID),
+		fmt.Sprintf(`SELECT json_extract(data,'$.time.updated') FROM session WHERE id='%s';`, sessionID),
+	}
+	var timeStr string
+	for _, timeQuery := range timeQueries {
+		cmd := exec.Command("sqlite3", dbPath, timeQuery)
+		timeOutput, err := cmd.Output()
+		if err == nil && strings.TrimSpace(string(timeOutput)) != "" {
+			timeStr = strings.TrimSpace(string(timeOutput))
+			break
+		}
+	}
+	if timeStr != "" {
 		if t, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
 			if time.Since(t) > agent.RecentSessionTimeout {
 				return nil, nil
@@ -358,7 +382,7 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, msgQuery)
+	cmd := exec.Command("sqlite3", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
 	if err != nil {
 		return nil, nil
