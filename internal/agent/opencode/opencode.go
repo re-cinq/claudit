@@ -252,44 +252,44 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
+// The primary lookup uses our computed project ID as OpenCode's storage
+// key, but OpenCode has changed how it derives/uses that key across
+// versions. To stay resilient to that drift, sibling project directories
+// (and any top-level session files) are also scanned: a session whose own
+// recorded directory matches projectPath is preferred, and if none match,
+// the most recently active session within the recency window is used —
+// the same recency-only fallback Claude/Gemini discovery relies on.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
+	baseSessionsDir := filepath.Join(dataDir, "storage", "session")
 
-	dirEntries, err := os.ReadDir(sessionDir)
-	if err != nil {
-		return nil, nil
+	sessionDir, _ := GetSessionDir(projectPath)
+
+	var candidates []flatSessionCandidate
+	if sessionDir != "" {
+		candidates = append(candidates, scanSessionCandidates(sessionDir)...)
 	}
 
-	now := time.Now()
-	recentTimeout := agent.RecentSessionTimeout
-	var bestSessionID string
-	var bestModTime time.Time
-
-	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
+	if entries, err := os.ReadDir(baseSessionsDir); err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			p := filepath.Join(baseSessionsDir, entry.Name())
+			if p == sessionDir {
+				continue // already scanned above
+			}
+			candidates = append(candidates, scanSessionCandidates(p)...)
 		}
-
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
-
-		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
-			bestModTime = modTime
-		}
+		// Also handle a flat layout with no per-project subdirectories.
+		candidates = append(candidates, scanSessionCandidates(baseSessionsDir)...)
 	}
 
-	if bestSessionID == "" {
+	bestSessionID, bestModTime, ok := pickBestSession(candidates, projectPath)
+	if !ok {
 		return nil, nil
 	}
 
@@ -302,6 +302,102 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// flatSessionCandidate is a session file discovered while scanning OpenCode's
+// flat-file session storage.
+type flatSessionCandidate struct {
+	id        string
+	modTime   time.Time
+	directory string
+}
+
+// scanSessionCandidates scans a single directory for recently modified
+// *.json session files, reading each one's recorded working directory (if
+// present) so callers can prefer an exact project match over pure recency.
+func scanSessionCandidates(dir string) []flatSessionCandidate {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+
+	now := time.Now()
+	var candidates []flatSessionCandidate
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			continue
+		}
+
+		directory := ""
+		if data, err := os.ReadFile(filepath.Join(dir, entry.Name())); err == nil {
+			var meta struct {
+				Directory string `json:"directory"`
+				Path      string `json:"path"`
+				CWD       string `json:"cwd"`
+			}
+			if json.Unmarshal(data, &meta) == nil {
+				directory = firstNonEmpty(meta.Directory, meta.Path, meta.CWD)
+			}
+		}
+
+		candidates = append(candidates, flatSessionCandidate{
+			id:        strings.TrimSuffix(entry.Name(), ".json"),
+			modTime:   modTime,
+			directory: directory,
+		})
+	}
+	return candidates
+}
+
+// firstNonEmpty returns the first non-empty string among vals.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// pickBestSession selects the best session candidate: the most recently
+// modified session whose recorded directory matches projectPath, falling
+// back to the most recently modified session overall if none match (or
+// none recorded a directory at all).
+func pickBestSession(candidates []flatSessionCandidate, projectPath string) (id string, modTime time.Time, ok bool) {
+	var bestExact, bestAny flatSessionCandidate
+	haveExact, haveAny := false, false
+
+	for _, c := range candidates {
+		if c.directory != "" && agent.PathsEqual(c.directory, projectPath) {
+			if !haveExact || c.modTime.After(bestExact.modTime) {
+				bestExact = c
+				haveExact = true
+			}
+			continue
+		}
+		if !haveAny || c.modTime.After(bestAny.modTime) {
+			bestAny = c
+			haveAny = true
+		}
+	}
+
+	if haveExact {
+		return bestExact.id, bestExact.modTime, true
+	}
+	if haveAny {
+		return bestAny.id, bestAny.modTime, true
+	}
+	return "", time.Time{}, false
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -317,23 +413,23 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	}
 
 	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
-	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+	sessionID := querySessionID(dbPath, projectID)
+	if sessionID == "" {
+		// OpenCode's project ID scheme may not match ours (e.g. it changed
+		// how projects are identified between versions). Fall back to the
+		// most recently updated session across all projects.
+		sessionID = querySessionID(dbPath, "")
+	}
+	if sessionID == "" {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
 		`SELECT time_updated FROM session WHERE id='%s';`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
+	cmd := exec.Command("sqlite3", dbPath, timeQuery)
 	timeOutput, err := cmd.Output()
 	if err == nil {
 		timeStr := strings.TrimSpace(string(timeOutput))
@@ -377,6 +473,26 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// querySessionID queries the most recently updated session ID, optionally
+// scoped to a project ID. An empty projectID queries across all projects.
+func querySessionID(dbPath, projectID string) string {
+	var query string
+	if projectID != "" {
+		query = fmt.Sprintf(
+			`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
+			projectID,
+		)
+	} else {
+		query = `SELECT id FROM session ORDER BY time_updated DESC LIMIT 1;`
+	}
+	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, query)
+	output, err := cmd.Output()
+	if err != nil || strings.TrimSpace(string(output)) == "" {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -497,4 +613,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
