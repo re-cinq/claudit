@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -83,13 +84,25 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 		transcriptData = []byte(hook.TranscriptData)
 	}
 
-	return &agent.HookData{
+	hookData := &agent.HookData{
 		SessionID:      hook.SessionID,
 		TranscriptPath: transcriptPath,
 		ToolName:       hook.ToolName,
 		Command:        hook.ToolInput.Command,
 		TranscriptData: transcriptData,
-	}, nil
+	}
+
+	// Snapshot every live session we see (not just ones ending in a git
+	// commit). The plugin now invokes this hook after every shell tool call
+	// (see plugin.go), which is what lets a session that never itself
+	// committed still be attributed later: OpenCode's own on-disk/DB session
+	// storage isn't reliably readable from the post-commit "shiftlog store
+	// --manual" hook, which runs as a separate process after the agent has
+	// already exited. Caching the live SDK-fetched transcript here means
+	// manual-mode discovery has something to fall back to.
+	cacheOpenCodeSession(hook.ProjectDir, hookData)
+
+	return hookData, nil
 }
 
 // IsCommitCommand checks if a tool invocation represents a git commit.
@@ -230,7 +243,11 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+),
+// then falls back to the last live session snapshot cached by ParseHookInput
+// (see cacheOpenCodeSession) — needed because a session that never itself ran a
+// git commit leaves nothing else for the post-commit "shiftlog store --manual"
+// hook to discover once the agent process has exited.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
@@ -243,12 +260,19 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 
 	// Fall back to SQLite (OpenCode v1.2+)
 	dataDir, err := GetDataDir()
-	if err != nil {
-		return nil, nil
+	if err == nil {
+		projectID := GetProjectID(projectPath)
+		if session, err := discoverFromSQLite(dataDir, projectID, projectPath); err == nil && session != nil {
+			return session, nil
+		}
 	}
 
-	projectID := GetProjectID(projectPath)
-	return discoverFromSQLite(dataDir, projectID, projectPath)
+	// Fall back to the last live session snapshot for this project
+	if cached := readCachedOpenCodeSession(projectPath); cached != nil {
+		return cached, nil
+	}
+
+	return nil, nil
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -379,6 +403,72 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	}, nil
 }
 
+// cachedOpenCodeSession is the on-disk shape of the live-session snapshot
+// written by cacheOpenCodeSession.
+type cachedOpenCodeSession struct {
+	SessionID      string    `json:"session_id"`
+	ProjectPath    string    `json:"project_path"`
+	TranscriptData []byte    `json:"transcript_data"`
+	CachedAt       time.Time `json:"cached_at"`
+}
+
+func openCodeSessionCachePath(projectPath string) string {
+	return filepath.Join(projectPath, ".shiftlog", "opencode-session-cache.json")
+}
+
+// cacheOpenCodeSession snapshots a hook-reported session so it survives the
+// agent process exiting. Best-effort: it silently does nothing if there's no
+// session/transcript data to persist, or if writing fails.
+func cacheOpenCodeSession(projectPath string, hookData *agent.HookData) {
+	if projectPath == "" || hookData == nil || hookData.SessionID == "" || len(hookData.TranscriptData) == 0 {
+		return
+	}
+
+	encoded, err := json.Marshal(cachedOpenCodeSession{
+		SessionID:      hookData.SessionID,
+		ProjectPath:    projectPath,
+		TranscriptData: hookData.TranscriptData,
+		CachedAt:       time.Now(),
+	})
+	if err != nil {
+		return
+	}
+
+	path := openCodeSessionCachePath(projectPath)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return
+	}
+	_ = os.WriteFile(path, encoded, 0600)
+}
+
+// readCachedOpenCodeSession returns a previously cached session for
+// projectPath, if one exists and is still within the recent-session window.
+func readCachedOpenCodeSession(projectPath string) *agent.SessionInfo {
+	data, err := os.ReadFile(openCodeSessionCachePath(projectPath))
+	if err != nil {
+		return nil
+	}
+
+	var cached cachedOpenCodeSession
+	if err := json.Unmarshal(data, &cached); err != nil {
+		return nil
+	}
+
+	if !agent.PathsEqual(cached.ProjectPath, projectPath) {
+		return nil
+	}
+	if time.Since(cached.CachedAt) > agent.RecentSessionTimeout {
+		return nil
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      cached.SessionID,
+		ProjectPath:    projectPath,
+		TranscriptData: cached.TranscriptData,
+		StartedAt:      cached.CachedAt.Format(time.RFC3339),
+	}
+}
+
 // RestoreSession writes a session to OpenCode's storage location.
 func (a *Agent) RestoreSession(projectPath, sessionID, gitBranch string,
 	transcriptData []byte, messageCount int, summary string) error {
@@ -454,7 +544,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +586,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```

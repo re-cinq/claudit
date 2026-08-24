@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -227,8 +228,20 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent Copilot CLI session.
+// It first tries a live scan of Copilot's session-state directory. Copilot CLI
+// removes that directory once a non-interactive session's process exits, so if
+// the live scan comes up empty (e.g. this is running from the post-commit
+// "shiftlog store --manual" hook, well after the agent process has terminated),
+// fall back to the snapshot captured the last time a hook fired during that
+// session (see CacheSession).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	return scanForRecentSession(projectPath)
+	if info, err := scanForRecentSession(projectPath); err == nil && info != nil {
+		return info, nil
+	}
+	if cached := ReadCachedSession(projectPath); cached != nil {
+		return cached, nil
+	}
+	return nil, nil
 }
 
 // RestoreSession writes a transcript to Copilot CLI's expected location.
@@ -464,12 +477,18 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		return nil, nil
 	}
 
+	transcriptPath := GetTranscriptPath(bestDir)
+
+	// Snapshot the transcript now, while the session-state directory still
+	// exists, so manual-mode discovery can recover it after Copilot CLI
+	// removes the directory on process exit.
+	CacheSession(projectPath, bestSessionID, transcriptPath)
+
 	return &agent.SessionInfo{
 		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
+		TranscriptPath: transcriptPath,
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
