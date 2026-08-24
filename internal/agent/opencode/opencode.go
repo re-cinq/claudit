@@ -248,7 +248,20 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 	}
 
 	projectID := GetProjectID(projectPath)
-	return discoverFromSQLite(dataDir, projectID, projectPath)
+	session, err = discoverFromSQLite(dataDir, projectID, projectPath)
+	if err != nil {
+		return nil, err
+	}
+	if session != nil {
+		return session, nil
+	}
+
+	// Final fallback: newer OpenCode releases have been observed to compute
+	// project identity differently than our git-root-commit-hash derivation,
+	// which makes the project_id-scoped lookup above miss valid sessions after
+	// the CLI process has exited. Fall back to the most recently updated
+	// session across all projects in the database.
+	return discoverFromSQLite(dataDir, "", projectPath)
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -304,7 +317,12 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
-// discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
+// discoverFromSQLite queries the OpenCode SQLite database for the most recent
+// session. When projectID is empty, the lookup is not scoped to a project and
+// returns the most recently updated session across the whole database. This
+// is used both for the normal project-scoped lookup and as a last-resort
+// fallback when project-scoped discovery finds nothing (e.g. because a newer
+// OpenCode release changed how project identity is derived).
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
@@ -316,10 +334,14 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
+	// Find most recent session, optionally scoped to a project
+	where := ""
+	if projectID != "" {
+		where = fmt.Sprintf(" WHERE project_id='%s'", projectID)
+	}
 	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
+		`SELECT id FROM session%s ORDER BY time_updated DESC LIMIT 1;`,
+		where,
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
@@ -497,4 +519,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
