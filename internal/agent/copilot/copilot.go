@@ -409,67 +409,100 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
-// scanForRecentSession scans Copilot's session state directory for recent session directories.
+// scanForRecentSession scans Copilot's session state directories for recent session directories.
+// It checks both the global (~/.copilot/session-state) and a project-local
+// (<projectPath>/.copilot/session-state) location, since Copilot CLI has
+// changed where it persists session state across versions.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionStateDir()
-	if err != nil {
-		return nil, nil
+	var dirs []string
+	if sessionDir, err := GetSessionStateDir(); err == nil {
+		dirs = append(dirs, sessionDir)
 	}
-
-	entries, err := os.ReadDir(sessionDir)
-	if err != nil {
-		return nil, nil
-	}
+	dirs = append(dirs, filepath.Join(projectPath, ".copilot", "session-state"))
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
+
+	var bestDir, bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
+	// Fallback: the most recently modified session directory within the
+	// timeout window, used when metadata can't be parsed or matched to the
+	// project (e.g. Copilot CLI changed its metadata format or field names).
+	var fallbackDir, fallbackSessionID string
+	var fallbackModTime time.Time
 
-		info, err := entry.Info()
+	for _, sessionDir := range dirs {
+		entries, err := os.ReadDir(sessionDir)
 		if err != nil {
 			continue
 		}
 
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
 
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
-		}
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
-		}
+			modTime := info.ModTime()
+			if now.Sub(modTime) > recentTimeout {
+				continue
+			}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+			entryPath := filepath.Join(sessionDir, entry.Name())
+
+			if fallbackDir == "" || modTime.After(fallbackModTime) {
+				fallbackDir = entryPath
+				fallbackSessionID = entry.Name()
+				fallbackModTime = modTime
+			}
+
+			meta, err := parseSessionMeta(entryPath)
+			if err != nil || meta == nil {
+				continue
+			}
+			if meta.ID != "" {
+				fallbackSessionID = meta.ID
+			}
+
+			if meta.CWD == "" || !agent.PathsEqual(meta.CWD, projectPath) {
+				continue
+			}
+
+			sessionID := meta.ID
+			if sessionID == "" {
+				sessionID = entry.Name()
+			}
+
+			if bestDir == "" || modTime.After(bestModTime) {
+				bestDir = entryPath
+				bestSessionID = sessionID
+				bestModTime = modTime
+			}
 		}
 	}
 
-	if bestDir == "" {
-		return nil, nil
+	if bestDir != "" {
+		return &agent.SessionInfo{
+			SessionID:      bestSessionID,
+			TranscriptPath: GetTranscriptPath(bestDir),
+			StartedAt:      bestModTime.Format(time.RFC3339),
+			ProjectPath:    projectPath,
+		}, nil
 	}
 
-	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
-		ProjectPath:    projectPath,
-	}, nil
+	if fallbackDir != "" {
+		return &agent.SessionInfo{
+			SessionID:      fallbackSessionID,
+			TranscriptPath: GetTranscriptPath(fallbackDir),
+			StartedAt:      fallbackModTime.Format(time.RFC3339),
+			ProjectPath:    projectPath,
+		}, nil
+	}
+
+	return nil, nil
 }
-
-
