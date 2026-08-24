@@ -227,8 +227,21 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent Copilot CLI session.
+// Copilot CLI may still be flushing session state (workspace.yaml/events.jsonl)
+// to disk in the moments right after its process exits, so this retries briefly
+// before giving up rather than failing on the first empty scan.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	return scanForRecentSession(projectPath)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		session, err := scanForRecentSession(projectPath)
+		if err != nil || session != nil {
+			return session, err
+		}
+		if time.Now().After(deadline) {
+			return nil, nil
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 }
 
 // RestoreSession writes a transcript to Copilot CLI's expected location.
@@ -449,7 +462,11 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		// Match on either the recorded cwd or git_root: newer Copilot CLI
+		// releases may only populate one of the two fields.
+		matchesCWD := meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)
+		matchesGitRoot := meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath)
+		if !matchesCWD && !matchesGitRoot {
 			continue
 		}
 
@@ -471,5 +488,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
