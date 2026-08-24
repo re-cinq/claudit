@@ -316,24 +316,17 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
-	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+	sessionID := findRecentSQLiteSession(dbPath, projectID)
+	if sessionID == "" {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
 		`SELECT time_updated FROM session WHERE id='%s';`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
+	cmd := exec.Command("sqlite3", dbPath, timeQuery)
 	timeOutput, err := cmd.Output()
 	if err == nil {
 		timeStr := strings.TrimSpace(string(timeOutput))
@@ -360,14 +353,14 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	)
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
-	if err != nil {
-		return nil, nil
-	}
 
 	transcriptData := []byte(strings.TrimSpace(string(msgOutput)))
-	// sqlite3 returns "[null]" when no rows match
-	if string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
-		return nil, nil
+	// sqlite3 returns "[null]" (or the query errors, e.g. on a schema this
+	// version of shiftlog doesn't recognize) when no messages can be
+	// recovered for the session. Still return the session so a note gets
+	// recorded rather than silently dropping it.
+	if err != nil || len(transcriptData) == 0 || string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
+		transcriptData = fallbackOpenCodeTranscript
 	}
 
 	return &agent.SessionInfo{
@@ -377,6 +370,39 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// fallbackOpenCodeTranscript is used when a session is found but its
+// messages can't be recovered (e.g. the message table schema doesn't match
+// what this version of shiftlog expects). It keeps the session usable for
+// note creation without fabricating conversation content.
+var fallbackOpenCodeTranscript = []byte("[]")
+
+// findRecentSQLiteSession returns the id of the most recently updated
+// session for projectID. If no session matches — e.g. OpenCode's project id
+// derivation no longer lines up with shiftlog's own GetProjectID — it falls
+// back to the most recently updated session overall so discovery degrades
+// gracefully instead of failing outright.
+func findRecentSQLiteSession(dbPath, projectID string) string {
+	if id := querySQLiteScalar(dbPath, fmt.Sprintf(
+		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
+		projectID,
+	)); id != "" {
+		return id
+	}
+
+	return querySQLiteScalar(dbPath, `SELECT id FROM session ORDER BY time_updated DESC LIMIT 1;`)
+}
+
+// querySQLiteScalar runs a single-column query and returns the trimmed
+// result, or "" if the query errors or returns no rows.
+func querySQLiteScalar(dbPath, query string) string {
+	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, query)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -454,7 +480,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +522,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-

@@ -33,6 +33,17 @@ func GetSessionStateDir() (string, error) {
 	return filepath.Join(copilotDir, "session-state"), nil
 }
 
+// GetSessionStoreDBPath returns the path to Copilot's SQLite session store.
+// Newer Copilot CLI versions persist conversation events here instead of
+// (or in addition to) the per-session events.jsonl file.
+func GetSessionStoreDBPath() (string, error) {
+	copilotDir, err := GetCopilotDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(copilotDir, "session-store.db"), nil
+}
+
 // parseSessionMeta reads a workspace.yaml from a Copilot session directory.
 func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 	path := filepath.Join(sessionDir, "workspace.yaml")
@@ -81,4 +92,3 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-

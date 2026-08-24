@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -464,12 +465,120 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		return nil, nil
 	}
 
+	// Older Copilot CLI versions write a flat events.jsonl transcript directly
+	// into the session directory. Prefer it when present.
+	transcriptPath := GetTranscriptPath(bestDir)
+	if _, err := os.Stat(transcriptPath); err == nil {
+		return &agent.SessionInfo{
+			SessionID:      bestSessionID,
+			TranscriptPath: transcriptPath,
+			StartedAt:      bestModTime.Format(time.RFC3339),
+			ProjectPath:    projectPath,
+		}, nil
+	}
+
+	// Newer Copilot CLI versions no longer write events.jsonl to the session
+	// directory (only workspace.yaml, checkpoints/, files/, research/, and
+	// rewind-file-snapshots/ live there); conversation events are persisted in
+	// session-store.db instead. Fall back to reading from there, and if that
+	// schema doesn't match what we expect either, still return the session so
+	// a note gets recorded rather than silently dropping it.
+	transcriptData, ok := loadTranscriptFromStore(bestSessionID)
+	if !ok {
+		transcriptData = fallbackTranscriptEvent
+	}
+
 	return &agent.SessionInfo{
 		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
+		TranscriptData: transcriptData,
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
 
+// fallbackTranscriptEvent is used when a session is discovered but no
+// transcript events can be recovered from either events.jsonl or
+// session-store.db. It keeps the session usable for note creation without
+// fabricating conversation content.
+var fallbackTranscriptEvent = []byte(`{"type":"session.start","data":{}}` + "\n")
 
+// sessionStoreEventTables lists candidate table names, tried in order, that
+// Copilot CLI may use to persist per-session events in session-store.db.
+var sessionStoreEventTables = []string{"events", "session_events", "conversation_events"}
+
+// loadTranscriptFromStore attempts to reconstruct an events.jsonl-equivalent
+// transcript for sessionID from Copilot's SQLite session store. It returns
+// (nil, false) if the store is unavailable or no known table schema matches.
+func loadTranscriptFromStore(sessionID string) ([]byte, bool) {
+	if !isSafeSessionID(sessionID) {
+		return nil, false
+	}
+
+	dbPath, err := GetSessionStoreDBPath()
+	if err != nil {
+		return nil, false
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, false
+	}
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		return nil, false
+	}
+
+	for _, table := range sessionStoreEventTables {
+		query := fmt.Sprintf(
+			`SELECT type, data FROM %s WHERE session_id='%s' ORDER BY rowid;`,
+			table, sessionID,
+		)
+		cmd := exec.Command("sqlite3", "-json", dbPath, query)
+		out, err := cmd.Output()
+		if err != nil {
+			continue
+		}
+
+		var rows []struct {
+			Type string          `json:"type"`
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(out, &rows); err != nil || len(rows) == 0 {
+			continue
+		}
+
+		lines := make([]string, 0, len(rows))
+		for _, row := range rows {
+			data := row.Data
+			if len(data) == 0 {
+				data = json.RawMessage("{}")
+			}
+			lineBytes, err := json.Marshal(struct {
+				Type string          `json:"type"`
+				Data json.RawMessage `json:"data"`
+			}{Type: row.Type, Data: data})
+			if err != nil {
+				continue
+			}
+			lines = append(lines, string(lineBytes))
+		}
+
+		if len(lines) > 0 {
+			return []byte(strings.Join(lines, "\n") + "\n"), true
+		}
+	}
+
+	return nil, false
+}
+
+// isSafeSessionID reports whether sessionID is safe to interpolate into a
+// SQL statement. Session IDs are UUIDs assigned by Copilot CLI itself
+// (read from workspace.yaml), so this is defense in depth, not user input.
+func isSafeSessionID(sessionID string) bool {
+	if sessionID == "" {
+		return false
+	}
+	for _, r := range sessionID {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_') {
+			return false
+		}
+	}
+	return true
+}
