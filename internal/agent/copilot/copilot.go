@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -409,67 +410,99 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
-// scanForRecentSession scans Copilot's session state directory for recent session directories.
+// scanForRecentSession scans Copilot's session state directory for a recent
+// session matching projectPath. The scan walks the directory tree (rather
+// than assuming a fixed one-level nesting) because Copilot CLI has changed
+// its on-disk session-state layout across releases; it also tolerates
+// workspace.yaml field-name changes via parseSessionMetaFile.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	entries, err := os.ReadDir(sessionDir)
-	if err != nil {
+	if _, err := os.Stat(sessionDir); err != nil {
 		return nil, nil
 	}
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
+	const maxDepth = 4
+
+	var bestSessionDir string
 	var bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
+	_ = filepath.WalkDir(sessionDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
 		}
 
-		info, err := entry.Info()
+		if d.IsDir() {
+			if path == sessionDir {
+				return nil
+			}
+			rel, relErr := filepath.Rel(sessionDir, path)
+			if relErr == nil && strings.Count(rel, string(filepath.Separator))+1 >= maxDepth {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		if !strings.EqualFold(d.Name(), "workspace.yaml") {
+			return nil
+		}
+
+		info, err := d.Info()
 		if err != nil {
-			continue
+			return nil
 		}
 
 		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
+		entryDir := filepath.Dir(path)
+		// The transcript file may have been updated more recently than
+		// workspace.yaml, which is typically written once at session start.
+		if transcriptInfo, err := os.Stat(GetTranscriptPath(entryDir)); err == nil {
+			if transcriptInfo.ModTime().After(modTime) {
+				modTime = transcriptInfo.ModTime()
+			}
 		}
 
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
+		if now.Sub(modTime) > recentTimeout {
+			return nil
+		}
+
+		meta, err := parseSessionMetaFile(path)
+		if err != nil || meta == nil || meta.CWD == "" {
+			return nil
 		}
 
 		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
+			return nil
 		}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
+		sessionID := meta.ID
+		if sessionID == "" {
+			sessionID = filepath.Base(entryDir)
+		}
+
+		if bestSessionDir == "" || modTime.After(bestModTime) {
+			bestSessionDir = entryDir
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
-	}
 
-	if bestDir == "" {
+		return nil
+	})
+
+	if bestSessionDir == "" {
 		return nil, nil
 	}
 
 	return &agent.SessionInfo{
 		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
+		TranscriptPath: GetTranscriptPath(bestSessionDir),
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
