@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -31,6 +32,18 @@ func GetSessionStateDir() (string, error) {
 		return "", err
 	}
 	return filepath.Join(copilotDir, "session-state"), nil
+}
+
+// GetSessionStoreDBPath returns the path to Copilot's session-store.db SQLite
+// database. As of Copilot CLI 1.0.x, this database (not an events.jsonl file
+// inside the session-state directory) is where turn-by-turn conversation
+// content is persisted.
+func GetSessionStoreDBPath() (string, error) {
+	copilotDir, err := GetCopilotDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(copilotDir, "session-store.db"), nil
 }
 
 // parseSessionMeta reads a workspace.yaml from a Copilot session directory.
@@ -81,4 +94,4 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-
+```

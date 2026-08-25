@@ -1,11 +1,14 @@
+```go
 package copilot
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -150,6 +153,7 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 
 	sessionID := hook.SessionID
 	transcriptPath := hook.TranscriptPath
+	var transcriptData []byte
 
 	// If no session info from generic fields, try CWD-based discovery
 	if sessionID == "" && hook.CWD != "" {
@@ -157,6 +161,7 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 		if err == nil && si != nil {
 			sessionID = si.SessionID
 			transcriptPath = si.TranscriptPath
+			transcriptData = si.TranscriptData
 		}
 	}
 
@@ -165,6 +170,7 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 		TranscriptPath: transcriptPath,
 		ToolName:       toolName,
 		Command:        command,
+		TranscriptData: transcriptData,
 	}, nil
 }
 
@@ -211,19 +217,38 @@ type copilotToolRequest struct {
 	Input json.RawMessage `json:"input,omitempty"`
 }
 
-// ParseTranscript parses a Copilot CLI events.jsonl transcript.
+// ParseTranscript parses a Copilot CLI transcript. This may be the legacy
+// events.jsonl NDJSON format, or a JSON array of turns queried from
+// Copilot's session-store.db SQLite database (see queryTurnsFromStore) —
+// Copilot CLI 1.0.x no longer writes an events.jsonl file per session.
 func (a *Agent) ParseTranscript(r io.Reader) (*agent.Transcript, error) {
-	return parseCopilotTranscript(r)
-}
-
-// ParseTranscriptFile parses a Copilot CLI events.jsonl transcript from a file.
-func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
-	f, err := os.Open(path)
+	data, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = f.Close() }()
-	return parseCopilotTranscript(f)
+	return parseCopilotData(data)
+}
+
+// ParseTranscriptFile parses a Copilot CLI transcript from a file.
+func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return parseCopilotData(data)
+}
+
+// parseCopilotData dispatches to the turns-array parser (data queried from
+// session-store.db) or the legacy NDJSON events.jsonl parser, based on the
+// shape of the data.
+func parseCopilotData(data []byte) (*agent.Transcript, error) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		if transcript, err := parseCopilotTurns(trimmed); err == nil {
+			return transcript, nil
+		}
+	}
+	return parseCopilotTranscript(bytes.NewReader(data))
 }
 
 // DiscoverSession finds an active or recent Copilot CLI session.
@@ -369,6 +394,89 @@ func parseCopilotTranscript(r io.Reader) (*agent.Transcript, error) {
 	return t, nil
 }
 
+// copilotTurn represents a single row queried from Copilot's session-store.db
+// turns table, which holds the actual conversation content — the
+// session-state directory's workspace.yaml has only session metadata
+// (id/cwd/branch/timestamps), no message text.
+type copilotTurn struct {
+	TurnIndex         int    `json:"turn_index"`
+	UserMessage       string `json:"user_message"`
+	AssistantResponse string `json:"assistant_response"`
+	Timestamp         string `json:"timestamp"`
+}
+
+// parseCopilotTurns parses a JSON array of turns (as produced by
+// queryTurnsFromStore) into the common transcript format.
+func parseCopilotTurns(data []byte) (*agent.Transcript, error) {
+	var turns []copilotTurn
+	if err := json.Unmarshal(data, &turns); err != nil {
+		return nil, err
+	}
+
+	var entries []agent.TranscriptEntry
+	for _, t := range turns {
+		if t.UserMessage != "" {
+			entries = append(entries, agent.TranscriptEntry{
+				UUID:      fmt.Sprintf("copilot-turn-%d-user", t.TurnIndex),
+				Type:      agent.MessageTypeUser,
+				Timestamp: t.Timestamp,
+				Message: &agent.Message{
+					Role:    "user",
+					Content: []agent.ContentBlock{{Type: "text", Text: t.UserMessage}},
+				},
+			})
+		}
+		if t.AssistantResponse != "" {
+			entries = append(entries, agent.TranscriptEntry{
+				UUID:      fmt.Sprintf("copilot-turn-%d-assistant", t.TurnIndex),
+				Type:      agent.MessageTypeAssistant,
+				Timestamp: t.Timestamp,
+				Message: &agent.Message{
+					Role:    "assistant",
+					Content: []agent.ContentBlock{{Type: "text", Text: t.AssistantResponse}},
+				},
+			})
+		}
+	}
+
+	tr := &agent.Transcript{Entries: entries}
+	tr.Turns = tr.CountTurns()
+	return tr, nil
+}
+
+// queryTurnsFromStore queries Copilot's session-store.db (SQLite) for the
+// turns belonging to a session, returning them as a JSON array of turn
+// objects. Copilot CLI 1.0.x persists transcript content here rather than
+// in an events.jsonl file under the session-state directory.
+func queryTurnsFromStore(sessionID string) ([]byte, error) {
+	dbPath, err := GetSessionStoreDBPath()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, err
+	}
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		return nil, fmt.Errorf("sqlite3 not available")
+	}
+
+	query := fmt.Sprintf(
+		`SELECT json_group_array(json_object('turn_index', turn_index, 'user_message', user_message, 'assistant_response', assistant_response, 'timestamp', timestamp)) FROM turns WHERE session_id='%s' ORDER BY turn_index;`,
+		sessionID,
+	)
+	cmd := exec.Command("sqlite3", dbPath, query)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	data := bytes.TrimSpace(output)
+	if len(data) == 0 || string(data) == "[]" || string(data) == "[null]" {
+		return nil, fmt.Errorf("no turns found for session %s", sessionID)
+	}
+	return data, nil
+}
+
 // extractCommand extracts the shell command from toolArgs.
 // toolArgs can be a JSON object or a JSON string containing an object.
 func extractCommand(toolName string, toolArgs json.RawMessage) string {
@@ -464,12 +572,22 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		return nil, nil
 	}
 
-	return &agent.SessionInfo{
+	info := &agent.SessionInfo{
 		SessionID:      bestSessionID,
 		TranscriptPath: GetTranscriptPath(bestDir),
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
-	}, nil
+	}
+
+	// Copilot CLI 1.0.x persists conversation content in session-store.db
+	// rather than an events.jsonl file in the session directory; prefer
+	// that when available and fall back to the (likely absent) file path
+	// for older CLI versions.
+	if data, err := queryTurnsFromStore(bestSessionID); err == nil {
+		info.TranscriptData = data
+		info.TranscriptPath = ""
+	}
+
+	return info, nil
 }
-
-
+```
