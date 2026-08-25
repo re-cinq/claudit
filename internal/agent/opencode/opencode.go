@@ -252,6 +252,9 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
+// Sessions may be stored either as a flat <sessionID>.json file, or (in
+// newer OpenCode versions that mirror the per-session message directory
+// layout) as a <sessionID>/ directory containing one or more JSON files.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionDir(projectPath)
 	if err != nil {
@@ -269,22 +272,37 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	var bestModTime time.Time
 
 	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		var sessionID string
+		var modTime time.Time
+
+		switch {
+		case entry.IsDir():
+			// Newer OpenCode versions store one directory per session
+			// (mirroring message storage) instead of a flat <sessionID>.json
+			// file. Use the most recently modified JSON file inside it.
+			latest, ok := latestJSONModTime(filepath.Join(sessionDir, entry.Name()))
+			if !ok {
+				continue
+			}
+			sessionID = entry.Name()
+			modTime = latest
+		case strings.HasSuffix(entry.Name(), ".json"):
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			sessionID = strings.TrimSuffix(entry.Name(), ".json")
+			modTime = info.ModTime()
+		default:
 			continue
 		}
 
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
 		if now.Sub(modTime) > recentTimeout {
 			continue
 		}
 
 		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
 	}
@@ -302,6 +320,33 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
+}
+
+// latestJSONModTime returns the most recent modification time among JSON
+// files directly inside dir, and whether any were found. Used when a
+// session is stored as its own directory rather than a single flat file.
+func latestJSONModTime(dir string) (time.Time, bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return time.Time{}, false
+	}
+
+	var latest time.Time
+	found := false
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if !found || info.ModTime().After(latest) {
+			latest = info.ModTime()
+			found = true
+		}
+	}
+	return latest, found
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -454,7 +499,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +541,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-

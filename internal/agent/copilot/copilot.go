@@ -427,6 +427,17 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestSessionID string
 	var bestModTime time.Time
 
+	// Fallback candidates: recent session dirs whose metadata could not be
+	// confirmed as matching this project (missing/unparseable metadata file,
+	// or a cwd field this Copilot CLI version doesn't use anymore). Used
+	// only when no session dir has a confirmed cwd match and exactly one
+	// such candidate exists, since a schema mismatch shouldn't make an
+	// otherwise-valid single session invisible.
+	var fallbackDir string
+	var fallbackSessionID string
+	var fallbackModTime time.Time
+	fallbackCount := 0
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -442,14 +453,25 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
+		// Check if this session directory has workspace metadata
 		entryPath := filepath.Join(sessionDir, entry.Name())
 		meta, err := parseSessionMeta(entryPath)
 		if err != nil || meta == nil {
+			fallbackCount++
+			fallbackDir = entryPath
+			fallbackSessionID = entry.Name()
+			fallbackModTime = modTime
 			continue
 		}
 
 		if !agent.PathsEqual(meta.CWD, projectPath) {
+			fallbackCount++
+			fallbackDir = entryPath
+			fallbackSessionID = meta.ID
+			if fallbackSessionID == "" {
+				fallbackSessionID = entry.Name()
+			}
+			fallbackModTime = modTime
 			continue
 		}
 
@@ -458,6 +480,12 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			bestSessionID = meta.ID
 			bestModTime = modTime
 		}
+	}
+
+	if bestDir == "" && fallbackCount == 1 {
+		bestDir = fallbackDir
+		bestSessionID = fallbackSessionID
+		bestModTime = fallbackModTime
 	}
 
 	if bestDir == "" {
@@ -471,5 +499,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
