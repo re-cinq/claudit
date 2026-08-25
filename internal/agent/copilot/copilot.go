@@ -442,20 +442,27 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
+		// Check if this session directory has a workspace.yaml whose metadata
+		// references our project path. Field names/nesting for the working
+		// directory have varied across Copilot CLI releases, so MatchesPath
+		// checks every string value found rather than one fixed key.
 		entryPath := filepath.Join(sessionDir, entry.Name())
 		meta, err := parseSessionMeta(entryPath)
 		if err != nil || meta == nil {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		if !meta.MatchesPath(projectPath) {
 			continue
 		}
 
 		if bestDir == "" || modTime.After(bestModTime) {
 			bestDir = entryPath
-			bestSessionID = meta.ID
+			// The session directory name is the session ID by construction
+			// (see WriteSessionFile); this is more reliable than depending
+			// on an "id" field inside workspace.yaml which may be absent
+			// or renamed.
+			bestSessionID = entry.Name()
 			bestModTime = modTime
 		}
 	}
@@ -471,5 +478,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
