@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // GetDataDir returns the OpenCode data directory.
@@ -126,4 +129,59 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// cachedActiveSession is a shiftlog-owned breadcrumb of the most recently
+// observed OpenCode session, refreshed by the shiftlog plugin
+// (.opencode/plugins/shiftlog.js) on every tool call.
+//
+// The plugin only shells out to "shiftlog store" when the tool call is a git
+// commit, so a manual commit (made outside the agent, after it has already
+// exited) has nothing to trigger conversation storage. It also has no
+// reliable way to discover OpenCode's own on-disk session storage, whose
+// location/format has changed across OpenCode versions. This breadcrumb,
+// written directly by the plugin on every tool call and containing the
+// transcript content itself, sidesteps both problems.
+type cachedActiveSession struct {
+	SessionID      string `json:"session_id"`
+	TranscriptData string `json:"transcript_data,omitempty"`
+	ProjectPath    string `json:"project_path"`
+	CapturedAt     string `json:"captured_at"`
+}
+
+func activeSessionCachePath(projectPath string) string {
+	return filepath.Join(projectPath, ".shiftlog", "opencode-active-session.json")
+}
+
+// readCachedSession reads the shiftlog-owned session breadcrumb for
+// projectPath, if any recent one exists.
+func readCachedSession(projectPath string) *agent.SessionInfo {
+	data, err := os.ReadFile(activeSessionCachePath(projectPath))
+	if err != nil {
+		return nil
+	}
+
+	var cached cachedActiveSession
+	if err := json.Unmarshal(data, &cached); err != nil || cached.SessionID == "" {
+		return nil
+	}
+
+	if !agent.PathsEqual(cached.ProjectPath, projectPath) {
+		return nil
+	}
+
+	capturedAt, err := time.Parse(time.RFC3339, cached.CapturedAt)
+	if err != nil || time.Since(capturedAt) > agent.RecentSessionTimeout {
+		return nil
+	}
+
+	info := &agent.SessionInfo{
+		SessionID:   cached.SessionID,
+		StartedAt:   cached.CapturedAt,
+		ProjectPath: projectPath,
+	}
+	if cached.TranscriptData != "" {
+		info.TranscriptData = []byte(cached.TranscriptData)
+	}
+	return info
 }

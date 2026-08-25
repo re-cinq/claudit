@@ -160,6 +160,14 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 		}
 	}
 
+	// Best-effort: snapshot this session into a shiftlog-owned breadcrumb on
+	// every hook call (not just commits), so a later manual commit (made
+	// after Copilot has already exited) can still discover this session even
+	// if Copilot's own session-state directory is no longer scannable by then.
+	if hook.CWD != "" {
+		cacheDiscoveredSession(hook.CWD, sessionID, transcriptPath)
+	}
+
 	return &agent.HookData{
 		SessionID:      sessionID,
 		TranscriptPath: transcriptPath,
@@ -228,6 +236,13 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 
 // DiscoverSession finds an active or recent Copilot CLI session.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	// Prefer the shiftlog-owned breadcrumb refreshed on every hook call. It
+	// survives regardless of what Copilot does with its own session-state
+	// directory after the process exits, which is required for commits made
+	// manually (outside the agent), after Copilot has already finished.
+	if session := readCachedSession(projectPath); session != nil {
+		return session, nil
+	}
 	return scanForRecentSession(projectPath)
 }
 
@@ -471,5 +486,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
