@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -304,7 +305,17 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
+// sqlString escapes a value for safe interpolation into a single-quoted SQLite string literal.
+func sqlString(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
+// Matching is done against both the legacy project_id (derived from the git root commit
+// hash) and the session's recorded directory, since newer OpenCode versions changed how
+// project_id is assigned and no longer reliably line up with GetProjectID's git-based
+// derivation. Matching on directory keeps discovery working across that change while
+// project_id matching preserves compatibility with older versions.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
@@ -316,10 +327,11 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
+	// Find most recent session for this project, matching either the legacy
+	// project_id column or the session's recorded directory field.
 	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
+		`SELECT id FROM session WHERE project_id='%s' OR json_extract(data, '$.directory')='%s' ORDER BY time_updated DESC LIMIT 1;`,
+		sqlString(projectID), sqlString(projectPath),
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
@@ -331,7 +343,7 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
 		`SELECT time_updated FROM session WHERE id='%s';`,
-		sessionID,
+		sqlString(sessionID),
 	)
 	cmd = exec.Command("sqlite3", dbPath, timeQuery)
 	timeOutput, err := cmd.Output()
@@ -356,7 +368,7 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	// Get messages for this session as a JSON array
 	msgQuery := fmt.Sprintf(
 		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
+		sqlString(sessionID),
 	)
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
@@ -497,4 +509,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
