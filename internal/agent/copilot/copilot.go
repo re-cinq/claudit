@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -409,67 +410,109 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
+// copilotSessionCandidate is a discovered session directory (one containing
+// an events.jsonl transcript) found while scanning the session-state tree.
+type copilotSessionCandidate struct {
+	dir       string
+	sessionID string
+	modTime   time.Time
+	cwdMatch  bool
+}
+
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// The scan walks the tree recursively (rather than assuming session
+// directories sit directly under session-state) and treats any directory
+// containing an events.jsonl file as a session, since newer Copilot CLI
+// releases have changed the nesting/layout of this directory before.
+// The events.jsonl file's own mtime is used for recency, since it is
+// updated as the session progresses (unlike the containing directory's
+// mtime, which may only reflect creation time).
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	entries, err := os.ReadDir(sessionDir)
-	if err != nil {
-		return nil, nil
-	}
-
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
+	var candidates []copilotSessionCandidate
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
+	_ = filepath.WalkDir(sessionDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() || d.Name() != "events.jsonl" {
+			return nil
 		}
 
-		info, err := entry.Info()
+		info, err := d.Info()
 		if err != nil {
-			continue
+			return nil
 		}
 
 		modTime := info.ModTime()
 		if now.Sub(modTime) > recentTimeout {
-			continue
+			return nil
 		}
 
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
+		entryDir := filepath.Dir(path)
+		sessionID := filepath.Base(entryDir)
+		cwdMatch := false
+
+		if meta, err := parseSessionMeta(entryDir); err == nil && meta != nil {
+			if meta.ID != "" {
+				sessionID = meta.ID
+			}
+			if meta.CWD != "" {
+				cwdMatch = agent.PathsEqual(meta.CWD, projectPath)
+			}
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
-		}
+		candidates = append(candidates, copilotSessionCandidate{
+			dir:       entryDir,
+			sessionID: sessionID,
+			modTime:   modTime,
+			cwdMatch:  cwdMatch,
+		})
+		return nil
+	})
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
-		}
+	if len(candidates) == 0 {
+		return nil, nil
 	}
 
-	if bestDir == "" {
+	// Prefer the most recent session whose recorded CWD matches this project.
+	best := bestCopilotCandidate(candidates, true)
+	if best == nil {
+		// Fall back to the most recent session overall. Workspace metadata
+		// field names have changed across Copilot CLI releases before, so a
+		// missing/unmatched CWD shouldn't rule out an otherwise-recent session.
+		best = bestCopilotCandidate(candidates, false)
+	}
+
+	if best == nil {
 		return nil, nil
 	}
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
+		SessionID:      best.sessionID,
+		TranscriptPath: GetTranscriptPath(best.dir),
+		StartedAt:      best.modTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
 
-
+// bestCopilotCandidate returns the most recently modified candidate. When
+// requireCWDMatch is true, only candidates with a matching recorded CWD are
+// considered.
+func bestCopilotCandidate(candidates []copilotSessionCandidate, requireCWDMatch bool) *copilotSessionCandidate {
+	var best *copilotSessionCandidate
+	for i := range candidates {
+		c := &candidates[i]
+		if requireCWDMatch && !c.cwdMatch {
+			continue
+		}
+		if best == nil || c.modTime.After(best.modTime) {
+			best = c
+		}
+	}
+	return best
+}
