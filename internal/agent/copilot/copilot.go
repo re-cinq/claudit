@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -409,8 +410,26 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
-// scanForRecentSession scans Copilot's session state directory for recent session directories.
+// scanForRecentSession scans Copilot's data directory for a recent session
+// matching projectPath. It first checks the expected session-state directory
+// (fast path), then falls back to a recursive search under the Copilot data
+// directory in case a CLI update relocated or restructured session storage.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
+	if info, err := scanSessionStateDir(projectPath); err == nil && info != nil {
+		return info, nil
+	}
+
+	copilotDir, err := GetCopilotDir()
+	if err != nil {
+		return nil, nil
+	}
+
+	return scanForWorkspaceFiles(copilotDir, projectPath)
+}
+
+// scanSessionStateDir scans the expected session-state directory for
+// session subdirectories matching projectPath.
+func scanSessionStateDir(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
 		return nil, nil
@@ -421,40 +440,67 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		return nil, nil
 	}
 
+	var dirs []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			dirs = append(dirs, filepath.Join(sessionDir, entry.Name()))
+		}
+	}
+
+	return bestMatchingSession(dirs, projectPath)
+}
+
+// scanForWorkspaceFiles recursively searches root for workspace.yaml files
+// and returns the most recent one matching projectPath. This is a fallback
+// for when the session-state directory layout has changed.
+func scanForWorkspaceFiles(root, projectPath string) (*agent.SessionInfo, error) {
+	var dirs []string
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		if info.Name() == "workspace.yaml" {
+			dirs = append(dirs, filepath.Dir(path))
+		}
+		return nil
+	})
+
+	return bestMatchingSession(dirs, projectPath)
+}
+
+// bestMatchingSession picks the most recently modified session directory
+// (by its workspace.yaml mtime) among dirs whose recorded cwd or git_root
+// matches projectPath and is within the recency window.
+func bestMatchingSession(dirs []string, projectPath string) (*agent.SessionInfo, error) {
 	now := time.Now()
-	recentTimeout := agent.RecentSessionTimeout
 	var bestDir string
 	var bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-
-		info, err := entry.Info()
+	for _, dir := range dirs {
+		info, err := os.Stat(filepath.Join(dir, "workspace.yaml"))
 		if err != nil {
 			continue
 		}
 
 		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
+		meta, err := parseSessionMeta(dir)
 		if err != nil || meta == nil {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		matches := agent.PathsEqual(meta.CWD, projectPath) ||
+			(meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath))
+		if !matches {
 			continue
 		}
 
 		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
+			bestDir = dir
 			bestSessionID = meta.ID
 			bestModTime = modTime
 		}
@@ -464,12 +510,16 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		return nil, nil
 	}
 
+	sessionID := bestSessionID
+	if sessionID == "" {
+		sessionID = filepath.Base(bestDir)
+	}
+
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
+		SessionID:      sessionID,
 		TranscriptPath: GetTranscriptPath(bestDir),
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
