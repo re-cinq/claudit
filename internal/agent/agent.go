@@ -1,3 +1,4 @@
+```go
 package agent
 
 import (
@@ -83,6 +84,8 @@ func NormalizeRole(role string) MessageType {
 		return MessageTypeAssistant
 	case "system":
 		return MessageTypeSystem
+	case "tool":
+		return MessageTypeUser
 	default:
 		return ""
 	}
@@ -236,3 +239,4 @@ type Agent interface {
 	// Rendering: map tool names for display
 	ToolAliases() map[string]string
 }
+```
