@@ -427,6 +427,17 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestSessionID string
 	var bestModTime time.Time
 
+	// fallbackDir tracks the single most recently modified session directory
+	// seen, regardless of whether its workspace.yaml could be parsed or its
+	// cwd matched. Copilot CLI has changed workspace.yaml's field names
+	// across releases; when strict metadata matching finds nothing but there
+	// is exactly one unambiguous recent session, we use it rather than
+	// reporting "no active session found".
+	var fallbackDir string
+	var fallbackSessionID string
+	var fallbackModTime time.Time
+	candidateCount := 0
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -442,22 +453,44 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
+		candidateCount++
+
+		if fallbackDir == "" || modTime.After(fallbackModTime) {
+			fallbackDir = entryPath
+			fallbackSessionID = entry.Name()
+			fallbackModTime = modTime
+		}
+
+		// Check if this session directory has a workspace.yaml
 		meta, err := parseSessionMeta(entryPath)
 		if err != nil || meta == nil {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		sessionID := meta.ID
+		if sessionID == "" {
+			sessionID = entry.Name()
+		}
+		if sessionID != "" {
+			fallbackSessionID = sessionID
+		}
+
+		if meta.CWD == "" || !agent.PathsEqual(meta.CWD, projectPath) {
 			continue
 		}
 
 		if bestDir == "" || modTime.After(bestModTime) {
 			bestDir = entryPath
-			bestSessionID = meta.ID
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
+	}
+
+	if bestDir == "" && candidateCount == 1 {
+		bestDir = fallbackDir
+		bestSessionID = fallbackSessionID
+		bestModTime = fallbackModTime
 	}
 
 	if bestDir == "" {
@@ -471,5 +504,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
