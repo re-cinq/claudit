@@ -410,6 +410,20 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// Copilot creates a session directory once and then appends to events.jsonl
+// as the session progresses; on Linux/macOS a directory's own mtime only
+// changes when entries are added or removed, not when an existing file's
+// contents change, so the directory's mtime alone can understate how recent
+// a session actually is. recentModTime() also considers the transcript
+// file's mtime so an actively-updated session isn't treated as stale once
+// the agent process (and thus the hook invoking this scan) exits.
+//
+// Newer Copilot CLI releases may also omit or relocate workspace.yaml, or
+// lag in writing its "cwd" field. If no directory's metadata matches
+// projectPath exactly, fall back to the most recently touched session
+// directory that has a transcript, so a session isn't missed just because
+// its metadata couldn't be matched.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -427,23 +441,32 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestSessionID string
 	var bestModTime time.Time
 
+	var fallbackDir string
+	var fallbackSessionID string
+	var fallbackModTime time.Time
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
 
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
+		entryPath := filepath.Join(sessionDir, entry.Name())
+		modTime := recentModTime(entry, entryPath)
 		if now.Sub(modTime) > recentTimeout {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
+		if _, err := os.Stat(GetTranscriptPath(entryPath)); err != nil {
+			continue // no transcript yet, not a usable session
+		}
+
+		if fallbackDir == "" || modTime.After(fallbackModTime) {
+			fallbackDir = entryPath
+			fallbackSessionID = entry.Name()
+			fallbackModTime = modTime
+		}
+
+		// Check if this session directory has a workspace.yaml matching projectPath
 		meta, err := parseSessionMeta(entryPath)
 		if err != nil || meta == nil {
 			continue
@@ -453,23 +476,51 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
+		sessionID := meta.ID
+		if sessionID == "" {
+			sessionID = entry.Name()
+		}
+
 		if bestDir == "" || modTime.After(bestModTime) {
 			bestDir = entryPath
-			bestSessionID = meta.ID
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
 	}
 
-	if bestDir == "" {
-		return nil, nil
+	if bestDir != "" {
+		return &agent.SessionInfo{
+			SessionID:      bestSessionID,
+			TranscriptPath: GetTranscriptPath(bestDir),
+			StartedAt:      bestModTime.Format(time.RFC3339),
+			ProjectPath:    projectPath,
+		}, nil
 	}
 
-	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
-		ProjectPath:    projectPath,
-	}, nil
+	if fallbackDir != "" {
+		return &agent.SessionInfo{
+			SessionID:      fallbackSessionID,
+			TranscriptPath: GetTranscriptPath(fallbackDir),
+			StartedAt:      fallbackModTime.Format(time.RFC3339),
+			ProjectPath:    projectPath,
+		}, nil
+	}
+
+	return nil, nil
 }
 
-
+// recentModTime returns the most recent modification time among a session
+// directory entry and its transcript file (see scanForRecentSession for why
+// the directory's own mtime isn't sufficient on its own).
+func recentModTime(entry os.DirEntry, entryPath string) time.Time {
+	var best time.Time
+	if info, err := entry.Info(); err == nil {
+		best = info.ModTime()
+	}
+	if info, err := os.Stat(GetTranscriptPath(entryPath)); err == nil {
+		if info.ModTime().After(best) {
+			best = info.ModTime()
+		}
+	}
+	return best
+}
