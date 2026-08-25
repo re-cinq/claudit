@@ -304,6 +304,28 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
+// querySQLiteSessionID finds the most recent session id for a project.
+// It prefers ordering by time_updated, but some OpenCode versions have
+// dropped or renamed that column; if the query errors (e.g. "no such
+// column"), retry ordering by rowid (insertion order) instead of treating
+// the failure as "no session found".
+func querySQLiteSessionID(dbPath, projectID string) string {
+	for _, orderBy := range []string{"time_updated DESC", "rowid DESC"} {
+		sessionQuery := fmt.Sprintf(
+			`SELECT id FROM session WHERE project_id='%s' ORDER BY %s LIMIT 1;`,
+			projectID, orderBy,
+		)
+		cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
+		sessionOutput, err := cmd.Output()
+		if err == nil {
+			if sessionID := strings.TrimSpace(string(sessionOutput)); sessionID != "" {
+				return sessionID
+			}
+		}
+	}
+	return ""
+}
+
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
@@ -317,23 +339,17 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	}
 
 	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
-	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+	sessionID := querySQLiteSessionID(dbPath, projectID)
+	if sessionID == "" {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
 		`SELECT time_updated FROM session WHERE id='%s';`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
+	cmd := exec.Command("sqlite3", dbPath, timeQuery)
 	timeOutput, err := cmd.Output()
 	if err == nil {
 		timeStr := strings.TrimSpace(string(timeOutput))
@@ -352,6 +368,8 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		}
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
+	// If the time query itself failed (e.g. schema mismatch), proceed anyway
+	// rather than treating a broken recency check as "no session".
 
 	// Get messages for this session as a JSON array
 	msgQuery := fmt.Sprintf(
@@ -497,4 +515,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
