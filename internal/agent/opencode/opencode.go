@@ -229,26 +229,51 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 	return &agent.Transcript{Entries: entries}, nil
 }
 
+// sessionDiscoveryRetries and sessionDiscoveryRetryDelay bound how long
+// DiscoverSession waits for OpenCode to finish persisting session/message
+// state to disk. Newer OpenCode releases write that state asynchronously
+// after the CLI process exits, so a manual commit made right after the run
+// can otherwise race an as-yet-incomplete on-disk (or SQLite) state.
+const (
+	sessionDiscoveryRetries    = 6
+	sessionDiscoveryRetryDelay = 500 * time.Millisecond
+)
+
 // DiscoverSession finds an active or recent OpenCode session.
 // It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
-	session, err := a.discoverFromFlatFiles(projectPath)
-	if err != nil {
-		return nil, err
-	}
-	if session != nil {
-		return session, nil
-	}
-
-	// Fall back to SQLite (OpenCode v1.2+)
-	dataDir, err := GetDataDir()
-	if err != nil {
-		return nil, nil
-	}
-
+	dataDir, dataDirErr := GetDataDir()
 	projectID := GetProjectID(projectPath)
-	return discoverFromSQLite(dataDir, projectID, projectPath)
+
+	for attempt := 0; attempt < sessionDiscoveryRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(sessionDiscoveryRetryDelay)
+		}
+
+		// Try flat file storage first (pre-v1.2 OpenCode)
+		session, err := a.discoverFromFlatFiles(projectPath)
+		if err != nil {
+			return nil, err
+		}
+		if session != nil {
+			return session, nil
+		}
+
+		// Fall back to SQLite (OpenCode v1.2+)
+		if dataDirErr != nil {
+			continue
+		}
+
+		session, err = discoverFromSQLite(dataDir, projectID, projectPath)
+		if err != nil {
+			return nil, err
+		}
+		if session != nil {
+			return session, nil
+		}
+	}
+
+	return nil, nil
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -454,7 +479,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +521,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-

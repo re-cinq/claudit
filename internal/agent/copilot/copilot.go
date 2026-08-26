@@ -226,9 +226,32 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 	return parseCopilotTranscript(f)
 }
 
+// sessionDiscoveryRetries and sessionDiscoveryRetryDelay bound how long
+// DiscoverSession waits for Copilot CLI to finish writing session-state to
+// disk. Newer Copilot CLI releases flush workspace.yaml/events.jsonl
+// asynchronously after the process exits, so a manual commit made right
+// after the CLI returns can otherwise race an as-yet-incomplete (or empty)
+// session-state directory.
+const (
+	sessionDiscoveryRetries    = 6
+	sessionDiscoveryRetryDelay = 500 * time.Millisecond
+)
+
 // DiscoverSession finds an active or recent Copilot CLI session.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	return scanForRecentSession(projectPath)
+	for attempt := 0; attempt < sessionDiscoveryRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(sessionDiscoveryRetryDelay)
+		}
+		session, err := scanForRecentSession(projectPath)
+		if err != nil {
+			return nil, err
+		}
+		if session != nil {
+			return session, nil
+		}
+	}
+	return nil, nil
 }
 
 // RestoreSession writes a transcript to Copilot CLI's expected location.
@@ -471,5 +494,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
