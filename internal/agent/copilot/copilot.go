@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -409,67 +410,91 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
+// copilotSessionCandidate is a workspace.yaml-backed session directory found
+// while scanning Copilot's session state tree.
+type copilotSessionCandidate struct {
+	dir       string
+	sessionID string
+	modTime   time.Time
+}
+
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// Copilot CLI has changed how deeply session directories are nested under
+// session-state/ across versions (flat <session-state>/<id>/ vs nested
+// <session-state>/<workspace>/<id>/), and the workspace.yaml metadata fields
+// used to identify the originating project have not always been reliably
+// populated. To stay compatible across versions this walks the whole tree
+// looking for workspace.yaml files at any depth, and falls back to the most
+// recently modified session when none of the discovered metadata can be
+// matched to projectPath.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	entries, err := os.ReadDir(sessionDir)
-	if err != nil {
-		return nil, nil
-	}
-
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
+	var bestMatched *copilotSessionCandidate
+	var bestAny *copilotSessionCandidate
+
+	_ = filepath.WalkDir(sessionDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d == nil {
+			return nil // skip unreadable entries rather than aborting the whole walk
+		}
+		if d.IsDir() || d.Name() != "workspace.yaml" {
+			return nil
 		}
 
-		info, err := entry.Info()
+		info, err := d.Info()
 		if err != nil {
-			continue
+			return nil
 		}
 
 		modTime := info.ModTime()
 		if now.Sub(modTime) > recentTimeout {
-			continue
+			return nil
 		}
 
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
+		entryPath := filepath.Dir(path)
 		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
+		if err != nil || meta == nil || meta.ID == "" {
+			return nil
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
+		candidate := &copilotSessionCandidate{dir: entryPath, sessionID: meta.ID, modTime: modTime}
+
+		if bestAny == nil || modTime.After(bestAny.modTime) {
+			bestAny = candidate
 		}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+		matches := agent.PathsEqual(meta.CWD, projectPath) ||
+			(meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath))
+		if matches && (bestMatched == nil || modTime.After(bestMatched.modTime)) {
+			bestMatched = candidate
 		}
+
+		return nil
+	})
+
+	best := bestMatched
+	if best == nil {
+		// No session's recorded workspace matched projectPath, which can
+		// happen if the metadata schema changed. Recency alone is still a
+		// reasonable signal in the common case of a single active session.
+		best = bestAny
 	}
 
-	if bestDir == "" {
+	if best == nil {
 		return nil, nil
 	}
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
+		SessionID:      best.sessionID,
+		TranscriptPath: GetTranscriptPath(best.dir),
+		StartedAt:      best.modTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
