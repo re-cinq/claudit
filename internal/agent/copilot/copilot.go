@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -421,6 +422,12 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		return nil, nil
 	}
 
+	// Copilot CLI's workspace.yaml doesn't reliably report the exact
+	// working directory across versions; some versions only populate
+	// git_root. Resolve the project's git root once so we can match on
+	// either field.
+	projectGitRoot := gitRootOf(projectPath)
+
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
 	var bestDir string
@@ -449,7 +456,11 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		matches := meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)
+		if !matches && meta.GitRoot != "" && projectGitRoot != "" {
+			matches = agent.PathsEqual(meta.GitRoot, projectGitRoot)
+		}
+		if !matches {
 			continue
 		}
 
@@ -472,4 +483,13 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	}, nil
 }
 
-
+// gitRootOf returns the git repository root containing path, or "" if it
+// cannot be determined (e.g. path is not inside a git repository).
+func gitRootOf(path string) string {
+	cmd := exec.Command("git", "-C", path, "rev-parse", "--show-toplevel")
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
