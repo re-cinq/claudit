@@ -409,6 +409,21 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
+// sessionMatchesProject reports whether a discovered Copilot session belongs to
+// the given project. Copilot CLI has historically reported the working directory
+// via the "cwd" field, but newer releases may omit it (or report it inconsistently
+// for sessions started via wrapper scripts) while populating "git_root" instead.
+// Match on either field so discovery keeps working across that drift.
+func sessionMatchesProject(meta *sessionMeta, projectPath string) bool {
+	if meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath) {
+		return true
+	}
+	if meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath) {
+		return true
+	}
+	return false
+}
+
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
@@ -449,7 +464,7 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		if !sessionMatchesProject(meta, projectPath) {
 			continue
 		}
 
@@ -471,5 +486,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
