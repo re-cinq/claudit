@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -353,10 +354,14 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
 
-	// Get messages for this session as a JSON array
+	// Get messages for this session as a JSON array.
+	// The message table's foreign-key and ordering column names have
+	// changed across OpenCode versions, so resolve them from the actual
+	// schema instead of assuming fixed names.
+	sessionCol, timeCol := resolveMessageColumns(dbPath)
 	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
+		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE %s='%s' ORDER BY %s;`,
+		sessionCol, sessionID, timeCol,
 	)
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
@@ -377,6 +382,44 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// resolveMessageColumns inspects the "message" table schema and returns the
+// column names for the session foreign key and the creation-time ordering
+// column. OpenCode has renamed these columns across releases; introspecting
+// via PRAGMA table_info keeps discovery working without tracking exact
+// version-to-schema mappings. Falls back to the historical column names
+// ("session_id", "time_created") if introspection fails or finds no match.
+func resolveMessageColumns(dbPath string) (sessionCol, timeCol string) {
+	sessionCol, timeCol = "session_id", "time_created"
+
+	cmd := exec.Command("sqlite3", dbPath, "PRAGMA table_info(message);")
+	output, err := cmd.Output()
+	if err != nil {
+		return sessionCol, timeCol
+	}
+
+	foundSessionCol := false
+	foundTimeCol := false
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		fields := strings.Split(line, "|")
+		if len(fields) < 2 {
+			continue
+		}
+		name := fields[1]
+		lower := strings.ToLower(name)
+
+		if strings.Contains(lower, "session") && !foundSessionCol {
+			sessionCol = name
+			foundSessionCol = true
+		}
+		if strings.Contains(lower, "created") && !foundTimeCol {
+			timeCol = name
+			foundTimeCol = true
+		}
+	}
+
+	return sessionCol, timeCol
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -454,7 +497,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +539,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
