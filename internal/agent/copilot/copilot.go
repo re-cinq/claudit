@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -409,56 +410,77 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
-// scanForRecentSession scans Copilot's session state directory for recent session directories.
+// scanForRecentSession scans Copilot's session-state directory for a recent
+// session matching projectPath.
+//
+// Newer Copilot CLI releases have been observed to change how session-state
+// is laid out on disk (e.g. bucketing sessions under extra intermediate
+// directories rather than storing them directly under
+// session-state/<sessionID>/), so this walks the tree instead of assuming a
+// single fixed depth. A session is matched by either its recorded working
+// directory or its git root, since the directory the CLI was launched from
+// may be a subdirectory of the repo root rather than the root itself.
+// Recency is derived from the session's own files (workspace.yaml /
+// events.jsonl) since appending to a file does not necessarily bump its
+// parent directory's mtime.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	entries, err := os.ReadDir(sessionDir)
-	if err != nil {
+	if _, err := os.Stat(sessionDir); err != nil {
 		return nil, nil
 	}
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
+
+	const maxDepth = 4
+	rootDepth := strings.Count(filepath.Clean(sessionDir), string(filepath.Separator))
+
 	var bestDir string
 	var bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-
-		info, err := entry.Info()
+	_ = filepath.WalkDir(sessionDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			continue
+			return nil
 		}
 
-		modTime := info.ModTime()
+		if d.IsDir() {
+			if path != sessionDir && strings.Count(filepath.Clean(path), string(filepath.Separator))-rootDepth > maxDepth {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		if d.Name() != "workspace.yaml" {
+			return nil
+		}
+
+		entryDir := filepath.Dir(path)
+		meta, err := parseSessionMeta(entryDir)
+		if err != nil || meta == nil || meta.ID == "" {
+			return nil
+		}
+
+		if !agent.PathsEqual(meta.CWD, projectPath) && !agent.PathsEqual(meta.GitRoot, projectPath) {
+			return nil
+		}
+
+		modTime := sessionActivityTime(entryDir)
 		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
-
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
-		}
-
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
+			return nil
 		}
 
 		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
+			bestDir = entryDir
 			bestSessionID = meta.ID
 			bestModTime = modTime
 		}
-	}
+		return nil
+	})
 
 	if bestDir == "" {
 		return nil, nil
@@ -472,4 +494,22 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	}, nil
 }
 
-
+// sessionActivityTime returns the most recent modification time among a
+// Copilot session directory's known files, falling back to the directory's
+// own mtime if neither file is present.
+func sessionActivityTime(sessionDir string) time.Time {
+	var best time.Time
+	for _, name := range []string{"workspace.yaml", "events.jsonl"} {
+		if info, err := os.Stat(filepath.Join(sessionDir, name)); err == nil {
+			if info.ModTime().After(best) {
+				best = info.ModTime()
+			}
+		}
+	}
+	if best.IsZero() {
+		if info, err := os.Stat(sessionDir); err == nil {
+			best = info.ModTime()
+		}
+	}
+	return best
+}
