@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -7,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -229,26 +231,45 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 	return &agent.Transcript{Entries: entries}, nil
 }
 
+// discoverSessionMaxAttempts and discoverSessionRetryDelay bound the retry
+// window used by DiscoverSession below.
+const (
+	discoverSessionMaxAttempts = 10
+	discoverSessionRetryDelay  = 200 * time.Millisecond
+)
+
 // DiscoverSession finds an active or recent OpenCode session.
 // It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+//
+// Unlike the plugin-hook path (which reads session/message data inline from
+// the live OpenCode process via its JS SDK), this method is invoked by the
+// post-commit git hook only after the OpenCode process has already exited.
+// Newer OpenCode releases can finish persisting session/message storage to
+// disk a short moment after the process exits, so a single scan can lose
+// that race. Retry briefly to give the CLI's final write a chance to land.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
-	session, err := a.discoverFromFlatFiles(projectPath)
-	if err != nil {
-		return nil, err
-	}
-	if session != nil {
-		return session, nil
-	}
+	for attempt := 0; attempt < discoverSessionMaxAttempts; attempt++ {
+		session, err := a.discoverFromFlatFiles(projectPath)
+		if err != nil {
+			return nil, err
+		}
+		if session != nil {
+			return session, nil
+		}
 
-	// Fall back to SQLite (OpenCode v1.2+)
-	dataDir, err := GetDataDir()
-	if err != nil {
-		return nil, nil
-	}
+		// Fall back to SQLite (OpenCode v1.2+)
+		if dataDir, err := GetDataDir(); err == nil {
+			projectID := GetProjectID(projectPath)
+			if sqliteSession, err := discoverFromSQLite(dataDir, projectID, projectPath); err == nil && sqliteSession != nil {
+				return sqliteSession, nil
+			}
+		}
 
-	projectID := GetProjectID(projectPath)
-	return discoverFromSQLite(dataDir, projectID, projectPath)
+		if attempt < discoverSessionMaxAttempts-1 {
+			time.Sleep(discoverSessionRetryDelay)
+		}
+	}
+	return nil, nil
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -349,14 +370,30 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 			if time.Since(t) > agent.RecentSessionTimeout {
 				return nil, nil
 			}
+		} else if millis, err := strconv.ParseInt(timeStr, 10, 64); err == nil {
+			// OpenCode may store time_updated as a Unix epoch (ms or s).
+			t := time.UnixMilli(millis)
+			if millis < 1e12 {
+				t = time.Unix(millis, 0)
+			}
+			if time.Since(t) > agent.RecentSessionTimeout {
+				return nil, nil
+			}
 		}
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
 
-	// Get messages for this session as a JSON array
+	// Get messages for this session as a JSON array. Column names for the
+	// message table are looked up dynamically since they aren't guaranteed
+	// to match the session table's naming (project_id/time_updated).
+	sessionCol, timeCol, err := messageTableColumns(dbPath)
+	if err != nil {
+		return nil, nil
+	}
+
 	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
+		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE %s='%s' ORDER BY %s;`,
+		sessionCol, sessionID, timeCol,
 	)
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
@@ -377,6 +414,49 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// messageTableColumns inspects the "message" table schema and returns the
+// column names to use for filtering by session and ordering by creation
+// time. OpenCode's SQLite schema has changed column naming between
+// versions (e.g. session_id vs sessionID), so we resolve them dynamically
+// instead of hardcoding names that may no longer match.
+func messageTableColumns(dbPath string) (sessionCol, timeCol string, err error) {
+	cmd := exec.Command("sqlite3", dbPath, "PRAGMA table_info(message);")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", "", err
+	}
+
+	sessionCandidates := []string{"session_id", "sessionID", "sessionId", "session"}
+	timeCandidates := []string{"time_created", "timeCreated", "created_at", "createdAt", "time"}
+
+	var columns []string
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		fields := strings.Split(line, "|")
+		if len(fields) >= 2 {
+			columns = append(columns, fields[1])
+		}
+	}
+
+	sessionCol = firstMatchingColumn(columns, sessionCandidates)
+	timeCol = firstMatchingColumn(columns, timeCandidates)
+	if sessionCol == "" || timeCol == "" {
+		return "", "", fmt.Errorf("could not resolve message table columns (have: %v)", columns)
+	}
+	return sessionCol, timeCol, nil
+}
+
+// firstMatchingColumn returns the first candidate present in columns, or "".
+func firstMatchingColumn(columns, candidates []string) string {
+	for _, c := range candidates {
+		for _, col := range columns {
+			if col == c {
+				return c
+			}
+		}
+	}
+	return ""
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -454,7 +534,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +576,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```

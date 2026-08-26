@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -226,9 +227,36 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 	return parseCopilotTranscript(f)
 }
 
+// discoverSessionMaxAttempts and discoverSessionRetryDelay bound the retry
+// window used by DiscoverSession below.
+const (
+	discoverSessionMaxAttempts = 10
+	discoverSessionRetryDelay  = 200 * time.Millisecond
+)
+
 // DiscoverSession finds an active or recent Copilot CLI session.
+//
+// Unlike the hook-driven path (which scans session-state while the Copilot
+// process is still alive, immediately after it writes state for a tool
+// call), this method is invoked by the post-commit git hook only after the
+// Copilot process has already exited. Newer Copilot CLI releases can finish
+// flushing session-state to disk a short moment after the process exits, so
+// a single scan can lose that race. Retry briefly to give the CLI's final
+// write a chance to land before giving up.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	return scanForRecentSession(projectPath)
+	for attempt := 0; attempt < discoverSessionMaxAttempts; attempt++ {
+		info, err := scanForRecentSession(projectPath)
+		if err != nil {
+			return nil, err
+		}
+		if info != nil {
+			return info, nil
+		}
+		if attempt < discoverSessionMaxAttempts-1 {
+			time.Sleep(discoverSessionRetryDelay)
+		}
+	}
+	return nil, nil
 }
 
 // RestoreSession writes a transcript to Copilot CLI's expected location.
@@ -471,5 +499,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
