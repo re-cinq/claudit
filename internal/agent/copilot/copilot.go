@@ -423,9 +423,16 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
+
+	// Track the best project-matched session, and separately the most
+	// recent session overall as a fallback for Copilot CLI versions that
+	// no longer populate the fields we match against.
+	var bestDir, bestSessionID string
 	var bestModTime time.Time
+	matchedProject := false
+
+	var fallbackDir, fallbackSessionID string
+	var fallbackModTime time.Time
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -449,15 +456,35 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		if fallbackDir == "" || modTime.After(fallbackModTime) {
+			fallbackDir = entryPath
+			fallbackSessionID = meta.ID
+			fallbackModTime = modTime
+		}
+
+		// Match on either cwd or git_root: different Copilot CLI versions
+		// have been observed to populate one field but leave the other empty.
+		projectMatches := (meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)) ||
+			(meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath))
+		if !projectMatches {
 			continue
 		}
 
+		matchedProject = true
 		if bestDir == "" || modTime.After(bestModTime) {
 			bestDir = entryPath
 			bestSessionID = meta.ID
 			bestModTime = modTime
 		}
+	}
+
+	if !matchedProject {
+		// No session directory matched the project path directly (e.g. the
+		// upstream metadata format changed). Fall back to the most recent
+		// session overall rather than reporting none found.
+		bestDir = fallbackDir
+		bestSessionID = fallbackSessionID
+		bestModTime = fallbackModTime
 	}
 
 	if bestDir == "" {
@@ -471,5 +498,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
