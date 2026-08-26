@@ -1,3 +1,4 @@
+```go
 package agent
 
 import (
@@ -204,6 +205,86 @@ type SessionInfo struct {
 	TranscriptData []byte // inline transcript data (e.g. from SQLite discovery)
 }
 
+// activeSessionMarkerPath is where WriteActiveSessionMarker/ReadActiveSessionMarker
+// persist a live pointer to the most recently observed session for a project.
+const activeSessionMarkerPath = ".shiftlog/active-session.json"
+
+// activeSessionMarker is the on-disk representation written by WriteActiveSessionMarker.
+type activeSessionMarker struct {
+	SessionID      string `json:"session_id"`
+	TranscriptPath string `json:"transcript_path,omitempty"`
+	TranscriptData []byte `json:"transcript_data,omitempty"`
+	StartedAt      string `json:"started_at"`
+	ProjectPath    string `json:"project_path"`
+}
+
+// WriteActiveSessionMarker persists a lightweight pointer to a session that was
+// just observed live (e.g. via a postToolUse hook). Some agent CLIs relocate or
+// clean up their own on-disk session state once the process exits, which makes
+// scanning for it after the fact (e.g. from a post-commit hook after a manual
+// commit) unreliable. Recording what we saw while the session was still active
+// lets DiscoverSession find it later regardless of the external CLI's storage
+// lifecycle.
+func WriteActiveSessionMarker(projectPath string, info *SessionInfo) error {
+	if projectPath == "" || info == nil || info.SessionID == "" {
+		return nil
+	}
+
+	dir := filepath.Join(projectPath, filepath.Dir(activeSessionMarkerPath))
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+
+	marker := activeSessionMarker{
+		SessionID:      info.SessionID,
+		TranscriptPath: info.TranscriptPath,
+		TranscriptData: info.TranscriptData,
+		StartedAt:      info.StartedAt,
+		ProjectPath:    projectPath,
+	}
+
+	data, err := json.Marshal(marker)
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(filepath.Join(projectPath, activeSessionMarkerPath), data, 0600)
+}
+
+// ReadActiveSessionMarker reads back a marker written by WriteActiveSessionMarker.
+// It returns (nil, nil) if no marker exists, it doesn't match projectPath, or it
+// is older than RecentSessionTimeout.
+func ReadActiveSessionMarker(projectPath string) (*SessionInfo, error) {
+	path := filepath.Join(projectPath, activeSessionMarkerPath)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil
+	}
+
+	var marker activeSessionMarker
+	if err := json.Unmarshal(data, &marker); err != nil {
+		return nil, nil
+	}
+
+	if !PathsEqual(marker.ProjectPath, projectPath) {
+		return nil, nil
+	}
+
+	info, err := os.Stat(path)
+	if err != nil || time.Since(info.ModTime()) > RecentSessionTimeout {
+		return nil, nil
+	}
+
+	return &SessionInfo{
+		SessionID:      marker.SessionID,
+		TranscriptPath: marker.TranscriptPath,
+		TranscriptData: marker.TranscriptData,
+		StartedAt:      marker.StartedAt,
+		ProjectPath:    marker.ProjectPath,
+	}, nil
+}
+
 // Agent defines the interface that each coding agent CLI must implement.
 type Agent interface {
 	// Identity
@@ -236,3 +317,4 @@ type Agent interface {
 	// Rendering: map tool names for display
 	ToolAliases() map[string]string
 }
+```

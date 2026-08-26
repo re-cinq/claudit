@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -160,6 +161,21 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 		}
 	}
 
+	// Record a live pointer to this session. Copilot CLI's own session-state
+	// directory is only reliably scannable while the process is still running
+	// (e.g. mid-execution, when this hook fires); by the time a later manual
+	// git commit triggers the post-commit hook, the CLI has already exited and
+	// its on-disk session state may no longer be there or matchable. Persisting
+	// what we observed here lets DiscoverSession find it later regardless.
+	if hook.CWD != "" && sessionID != "" {
+		_ = agent.WriteActiveSessionMarker(hook.CWD, &agent.SessionInfo{
+			SessionID:      sessionID,
+			TranscriptPath: transcriptPath,
+			StartedAt:      time.Now().Format(time.RFC3339),
+			ProjectPath:    hook.CWD,
+		})
+	}
+
 	return &agent.HookData{
 		SessionID:      sessionID,
 		TranscriptPath: transcriptPath,
@@ -228,6 +244,13 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 
 // DiscoverSession finds an active or recent Copilot CLI session.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	// Prefer the live pointer recorded by ParseHookInput: Copilot's own
+	// session-state directory may no longer exist or match by the time this
+	// runs from a post-commit hook (i.e. well after the CLI process exited).
+	if info, err := agent.ReadActiveSessionMarker(projectPath); err == nil && info != nil {
+		return info, nil
+	}
+
 	return scanForRecentSession(projectPath)
 }
 
@@ -471,5 +494,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```

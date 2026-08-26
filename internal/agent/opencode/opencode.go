@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -81,6 +82,23 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 	var transcriptData []byte
 	if hook.TranscriptData != "" {
 		transcriptData = []byte(hook.TranscriptData)
+	}
+
+	// Record a live pointer to this session. The plugin now reports every tool
+	// call (not just detected git-commit commands), so this fires early enough
+	// to capture the session before the CLI process exits. OpenCode's own
+	// on-disk session storage (flat files pre-v1.2, SQLite v1.2+) is not
+	// reliably scannable after the fact from a post-commit hook, since by then
+	// the process has already exited; this marker lets DiscoverSession find
+	// the session regardless of that external storage's state.
+	if hook.ProjectDir != "" && hook.SessionID != "" {
+		_ = agent.WriteActiveSessionMarker(hook.ProjectDir, &agent.SessionInfo{
+			SessionID:      hook.SessionID,
+			TranscriptPath: transcriptPath,
+			TranscriptData: transcriptData,
+			StartedAt:      time.Now().Format(time.RFC3339),
+			ProjectPath:    hook.ProjectDir,
+		})
 	}
 
 	return &agent.HookData{
@@ -230,8 +248,17 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first checks the live session marker recorded by ParseHookInput, then
+// tries flat file storage (pre-v1.2 OpenCode), then falls back to SQLite
+// (v1.2+).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	// Prefer the live pointer recorded by ParseHookInput: OpenCode's own
+	// session storage may no longer be scannable/matchable by the time this
+	// runs from a post-commit hook, well after the CLI process exited.
+	if info, err := agent.ReadActiveSessionMarker(projectPath); err == nil && info != nil {
+		return info, nil
+	}
+
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
@@ -454,7 +481,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +523,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
