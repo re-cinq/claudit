@@ -63,6 +63,27 @@ func GetSessionDir(projectPath string) (string, error) {
 	return filepath.Join(dataDir, "storage", "session", projectID), nil
 }
 
+// listProjectSessionDirs returns every project-ID directory under
+// storage/session, each of which may contain sessions for a different
+// project. Used as a fallback when the project ID shiftlog reconstructs via
+// GetProjectID doesn't match OpenCode's own internal project ID (e.g. after
+// an OpenCode CLI release changes how it computes that ID).
+func listProjectSessionDirs(dataDir string) ([]string, error) {
+	root := filepath.Join(dataDir, "storage", "session")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, err
+	}
+
+	var dirs []string
+	for _, e := range entries {
+		if e.IsDir() {
+			dirs = append(dirs, filepath.Join(root, e.Name()))
+		}
+	}
+	return dirs, nil
+}
+
 // GetMessageDir returns the message storage directory for a session.
 func GetMessageDir(sessionID string) (string, error) {
 	dataDir, err := GetDataDir()
