@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -316,10 +317,17 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
+	// Find most recent session for this project. OpenCode has changed how it derives
+	// project identifiers across versions (e.g. from a git root commit hash to some
+	// other path-derived id), so a locally recomputed projectID may no longer match
+	// what a newer CLI version wrote to the database. As a fallback, also match
+	// sessions whose stored data embeds the project's working directory, which is
+	// far more stable across versions than a re-derived identifier.
+	escapedProjectID := strings.ReplaceAll(projectID, "'", "''")
+	escapedPath := strings.ReplaceAll(projectPath, "'", "''")
 	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
+		`SELECT id FROM session WHERE project_id='%s' OR data LIKE '%%%s%%' ORDER BY time_updated DESC LIMIT 1;`,
+		escapedProjectID, escapedPath,
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
@@ -454,7 +462,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +504,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```

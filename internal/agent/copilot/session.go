@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -33,7 +34,21 @@ func GetSessionStateDir() (string, error) {
 	return filepath.Join(copilotDir, "session-state"), nil
 }
 
+// firstStringField returns the first non-empty string value found in raw for the given keys.
+func firstStringField(raw map[string]interface{}, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := raw[k].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // parseSessionMeta reads a workspace.yaml from a Copilot session directory.
+// Different Copilot CLI releases have used different field names for the same
+// data (e.g. workingDirectory/directory instead of cwd), so in addition to the
+// canonical struct tags we fall back to a handful of known aliases, and fall
+// back to the directory name for the session ID if it isn't present at all.
 func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 	path := filepath.Join(sessionDir, "workspace.yaml")
 	data, err := os.ReadFile(path)
@@ -44,6 +59,25 @@ func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 	var meta sessionMeta
 	if err := yaml.Unmarshal(data, &meta); err != nil {
 		return nil, err
+	}
+
+	if meta.ID == "" || meta.CWD == "" || meta.GitRoot == "" {
+		var raw map[string]interface{}
+		if err := yaml.Unmarshal(data, &raw); err == nil {
+			if meta.ID == "" {
+				meta.ID = firstStringField(raw, "id", "sessionId", "session_id", "sessionID")
+			}
+			if meta.CWD == "" {
+				meta.CWD = firstStringField(raw, "cwd", "workingDirectory", "working_dir", "directory", "path")
+			}
+			if meta.GitRoot == "" {
+				meta.GitRoot = firstStringField(raw, "git_root", "gitRoot", "repoRoot", "repo_root")
+			}
+		}
+	}
+
+	if meta.ID == "" {
+		meta.ID = filepath.Base(sessionDir)
 	}
 
 	return &meta, nil
@@ -81,4 +115,4 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-
+```
