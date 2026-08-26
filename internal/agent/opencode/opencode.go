@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -258,9 +260,32 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		return nil, nil
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
+	if info := scanSessionDirByName(sessionDir); info != nil {
+		info.ProjectPath = projectPath
+		return info, nil
+	}
+
+	// Fall back to scanning every project subdirectory under
+	// storage/session and matching by the session file's own "directory"
+	// field. Newer OpenCode releases have changed how the project
+	// subdirectory name is derived, so the name shiftlog computes via
+	// GetProjectID may no longer match the real directory on disk even
+	// though the session file itself still records the working directory.
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
+	}
+
+	return scanAllSessionDirsByContent(dataDir, projectPath), nil
+}
+
+// scanSessionDirByName scans a single project-scoped session directory
+// (dataDir/storage/session/<projectID>) for the most recently modified
+// session file, purely by file name/mtime.
+func scanSessionDirByName(sessionDir string) *agent.SessionInfo {
+	dirEntries, err := os.ReadDir(sessionDir)
+	if err != nil {
+		return nil
 	}
 
 	now := time.Now()
@@ -290,10 +315,78 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}
 
 	if bestSessionID == "" {
-		return nil, nil
+		return nil
 	}
 
-	// The transcript path for OpenCode is the message directory
+	msgDir, _ := GetMessageDir(bestSessionID)
+
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: msgDir,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+	}
+}
+
+// scanAllSessionDirsByContent walks dataDir/storage/session looking for
+// session JSON files whose own "directory" field matches projectPath,
+// regardless of which subdirectory they live under. This tolerates OpenCode
+// versions that partition sessions by a project ID scheme different from
+// shiftlog's own GetProjectID.
+func scanAllSessionDirsByContent(dataDir, projectPath string) *agent.SessionInfo {
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+
+	now := time.Now()
+	recentTimeout := agent.RecentSessionTimeout
+	var bestSessionID string
+	var bestModTime time.Time
+
+	_ = filepath.WalkDir(sessionRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // skip unreadable entries rather than aborting the walk
+		}
+		if d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > recentTimeout {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		var si sessionInfo
+		if err := json.Unmarshal(data, &si); err != nil {
+			return nil
+		}
+
+		if si.Directory == "" || !agent.PathsEqual(si.Directory, projectPath) {
+			return nil
+		}
+
+		if bestSessionID == "" || modTime.After(bestModTime) {
+			sessionID := si.ID
+			if sessionID == "" {
+				sessionID = strings.TrimSuffix(d.Name(), ".json")
+			}
+			bestSessionID = sessionID
+			bestModTime = modTime
+		}
+		return nil
+	})
+
+	if bestSessionID == "" {
+		return nil
+	}
+
 	msgDir, _ := GetMessageDir(bestSessionID)
 
 	return &agent.SessionInfo{
@@ -301,7 +394,7 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 		TranscriptPath: msgDir,
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
-	}, nil
+	}
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
@@ -454,7 +547,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +589,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
