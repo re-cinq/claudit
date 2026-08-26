@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -20,7 +21,7 @@ func init() {
 // Agent implements the agent.Agent interface for GitHub Copilot CLI.
 type Agent struct{}
 
-func (a *Agent) Name() agent.Name   { return agent.Copilot }
+func (a *Agent) Name() agent.Name    { return agent.Copilot }
 func (a *Agent) DisplayName() string { return "Copilot CLI" }
 
 // ConfigureHooks sets up Copilot CLI hooks in .github/hooks/shiftlog.json.
@@ -119,10 +120,10 @@ func (a *Agent) DiagnoseHooks(repoRoot string) []agent.DiagnosticCheck {
 func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 	var hook struct {
 		// Generic format fields
-		SessionID      string `json:"session_id"`
-		TranscriptPath string `json:"transcript_path"`
+		SessionID       string `json:"session_id"`
+		TranscriptPath  string `json:"transcript_path"`
 		GenericToolName string `json:"tool_name"`
-		ToolInput      struct {
+		ToolInput       struct {
 			Command string `json:"command"`
 		} `json:"tool_input"`
 
@@ -410,6 +411,9 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+// Copilot CLI's workspace metadata format (filename and field names) has changed across
+// versions, so a session directory that has no recognizable metadata is still considered a
+// candidate: if it's the only recent session around, it's used anyway rather than dropped.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -423,9 +427,14 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
+
+	type candidate struct {
+		dir      string
+		id       string
+		modTime  time.Time
+		cwdMatch bool
+	}
+	var candidates []candidate
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -442,34 +451,56 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
+		if findTranscriptPath(entryPath) == "" {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
+		sessionID := entry.Name()
+		cwdMatch := false
+		if meta, err := parseSessionMeta(entryPath); err == nil && meta != nil {
+			if meta.ID != "" {
+				sessionID = meta.ID
+			}
+			cwdMatch = meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)
 		}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+		candidates = append(candidates, candidate{dir: entryPath, id: sessionID, modTime: modTime, cwdMatch: cwdMatch})
+	}
+
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	// Prefer the most recent session whose recorded cwd matches this project.
+	var best *candidate
+	for i := range candidates {
+		c := &candidates[i]
+		if !c.cwdMatch {
+			continue
+		}
+		if best == nil || c.modTime.After(best.modTime) {
+			best = c
 		}
 	}
 
-	if bestDir == "" {
+	// If none declared a matching cwd (e.g. the metadata format changed and we
+	// couldn't read it) but there's exactly one recent session, use it anyway -
+	// there's no ambiguity to worry about, and it's better to try than to
+	// silently drop the note.
+	if best == nil && len(candidates) == 1 {
+		best = &candidates[0]
+	}
+
+	if best == nil {
 		return nil, nil
 	}
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
+		SessionID:      best.id,
+		TranscriptPath: findTranscriptPath(best.dir),
+		StartedAt:      best.modTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
