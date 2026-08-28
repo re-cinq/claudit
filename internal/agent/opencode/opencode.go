@@ -231,24 +231,47 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 
 // DiscoverSession finds an active or recent OpenCode session.
 // It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+//
+// OpenCode CLI versions from ~1.15 onward keep a background server process
+// alive after the foreground `opencode run` invocation exits, and that
+// server can finish persisting the session/messages a moment after our
+// process-level wait returns. When invoked from the post-commit hook
+// (manual discovery), there is no other synchronization point, so we retry
+// briefly instead of failing on the first empty result.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
-	session, err := a.discoverFromFlatFiles(projectPath)
-	if err != nil {
-		return nil, err
-	}
-	if session != nil {
-		return session, nil
+	const maxAttempts = 5
+	const retryDelay = 500 * time.Millisecond
+
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(retryDelay)
+		}
+
+		// Try flat file storage first (pre-v1.2 OpenCode)
+		session, err := a.discoverFromFlatFiles(projectPath)
+		if err != nil {
+			lastErr = err
+		} else if session != nil {
+			return session, nil
+		}
+
+		// Fall back to SQLite (OpenCode v1.2+)
+		dataDir, err := GetDataDir()
+		if err != nil {
+			return nil, nil
+		}
+
+		projectID := GetProjectID(projectPath)
+		session, err = discoverFromSQLite(dataDir, projectID, projectPath)
+		if err != nil {
+			lastErr = err
+		} else if session != nil {
+			return session, nil
+		}
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
-	dataDir, err := GetDataDir()
-	if err != nil {
-		return nil, nil
-	}
-
-	projectID := GetProjectID(projectPath)
-	return discoverFromSQLite(dataDir, projectID, projectPath)
+	return nil, lastErr
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -497,4 +520,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
