@@ -33,7 +33,13 @@ func GetSessionStateDir() (string, error) {
 	return filepath.Join(copilotDir, "session-state"), nil
 }
 
+// cwdKeys lists the YAML keys that have been used across Copilot CLI versions
+// to record a session's working directory in workspace.yaml.
+var cwdKeys = []string{"cwd", "workspace", "workspace_path", "workspaceDir", "directory", "path"}
+
 // parseSessionMeta reads a workspace.yaml from a Copilot session directory.
+// The working directory is looked up under several known key names since
+// Copilot CLI has renamed this field across releases.
 func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 	path := filepath.Join(sessionDir, "workspace.yaml")
 	data, err := os.ReadFile(path)
@@ -41,12 +47,26 @@ func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 		return nil, err
 	}
 
-	var meta sessionMeta
-	if err := yaml.Unmarshal(data, &meta); err != nil {
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, err
 	}
 
-	return &meta, nil
+	meta := &sessionMeta{}
+	if id, ok := raw["id"].(string); ok {
+		meta.ID = id
+	}
+	for _, key := range cwdKeys {
+		if v, ok := raw[key].(string); ok && v != "" {
+			meta.CWD = v
+			break
+		}
+	}
+	if gitRoot, ok := raw["git_root"].(string); ok {
+		meta.GitRoot = gitRoot
+	}
+
+	return meta, nil
 }
 
 // GetTranscriptPath returns the path to the events.jsonl transcript within a session directory.
@@ -81,4 +101,3 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-

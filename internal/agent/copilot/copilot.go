@@ -410,6 +410,9 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+// It prefers a session whose recorded working directory matches projectPath, but falls back to
+// the most recently modified session lacking a resolvable CWD. The fallback compensates for
+// Copilot CLI releases that changed or omitted the workspace.yaml field this discovery relies on.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -423,9 +426,10 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
+
+	var bestDir, bestSessionID string
 	var bestModTime time.Time
+	var bestMatched bool
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -445,18 +449,25 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
 		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
+		if err != nil || meta == nil || meta.ID == "" {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		matched := meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)
+		// A session that explicitly records a different project's CWD is
+		// never a candidate. Sessions with no usable CWD (e.g. a renamed or
+		// missing workspace.yaml field in newer Copilot CLI releases) remain
+		// eligible below as a recency-based fallback.
+		if meta.CWD != "" && !matched {
 			continue
 		}
 
-		if bestDir == "" || modTime.After(bestModTime) {
+		better := bestDir == "" || (matched && !bestMatched) || (matched == bestMatched && modTime.After(bestModTime))
+		if better {
 			bestDir = entryPath
 			bestSessionID = meta.ID
 			bestModTime = modTime
+			bestMatched = matched
 		}
 	}
 
@@ -471,5 +482,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
