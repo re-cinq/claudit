@@ -231,24 +231,37 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 
 // DiscoverSession finds an active or recent OpenCode session.
 // It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// Newer OpenCode releases persist session/message data to disk asynchronously
+// in the background, so data from a session that just ended may not be
+// visible on disk yet. Retry briefly before giving up, since callers such as
+// the post-commit hook run synchronously right after the triggering event.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
-	session, err := a.discoverFromFlatFiles(projectPath)
-	if err != nil {
-		return nil, err
-	}
-	if session != nil {
-		return session, nil
+	const maxAttempts = 5
+	const retryDelay = 400 * time.Millisecond
+
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		session, err := a.discoverFromFlatFiles(projectPath)
+		if err != nil {
+			lastErr = err
+		} else if session != nil {
+			return session, nil
+		} else if dataDir, derr := GetDataDir(); derr == nil {
+			projectID := GetProjectID(projectPath)
+			sqliteSession, serr := discoverFromSQLite(dataDir, projectID, projectPath)
+			if serr != nil {
+				lastErr = serr
+			} else if sqliteSession != nil {
+				return sqliteSession, nil
+			}
+		}
+
+		if attempt < maxAttempts-1 {
+			time.Sleep(retryDelay)
+		}
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
-	dataDir, err := GetDataDir()
-	if err != nil {
-		return nil, nil
-	}
-
-	projectID := GetProjectID(projectPath)
-	return discoverFromSQLite(dataDir, projectID, projectPath)
+	return nil, lastErr
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -353,20 +366,50 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
 
-	// Get messages for this session as a JSON array
+	// Get messages for this session. Build the transcript array in Go rather
+	// than relying on SQLite JSON1 functions (json_patch/json_group_array),
+	// which are not guaranteed to be compiled into every sqlite3 build.
 	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
+		`SELECT id, data FROM message WHERE session_id='%s' ORDER BY time_created;`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, msgQuery)
+	cmd = exec.Command("sqlite3", "-json", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
 	if err != nil {
 		return nil, nil
 	}
 
-	transcriptData := []byte(strings.TrimSpace(string(msgOutput)))
-	// sqlite3 returns "[null]" when no rows match
-	if string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
+	var rows []struct {
+		ID   string          `json:"id"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(msgOutput, &rows); err != nil || len(rows) == 0 {
+		return nil, nil
+	}
+
+	messages := make([]json.RawMessage, 0, len(rows))
+	for _, row := range rows {
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(row.Data, &obj); err != nil {
+			continue
+		}
+		idJSON, err := json.Marshal(row.ID)
+		if err != nil {
+			continue
+		}
+		obj["id"] = idJSON
+		merged, err := json.Marshal(obj)
+		if err != nil {
+			continue
+		}
+		messages = append(messages, merged)
+	}
+	if len(messages) == 0 {
+		return nil, nil
+	}
+
+	transcriptData, err := json.Marshal(messages)
+	if err != nil {
 		return nil, nil
 	}
 
@@ -454,7 +497,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +539,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
