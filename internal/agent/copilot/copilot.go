@@ -427,6 +427,16 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestSessionID string
 	var bestModTime time.Time
 
+	// fallback tracks the most recently modified session directory within the
+	// timeout window, regardless of whether its recorded cwd/git_root matched
+	// projectPath. Newer Copilot CLI releases have changed which of those
+	// fields workspace.yaml actually populates, so if exactly one recent
+	// session exists we use it even when neither field lines up.
+	var fallbackDir string
+	var fallbackSessionID string
+	var fallbackModTime time.Time
+	fallbackCount := 0
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -449,7 +459,14 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		fallbackCount++
+		if fallbackDir == "" || modTime.After(fallbackModTime) {
+			fallbackDir = entryPath
+			fallbackSessionID = meta.ID
+			fallbackModTime = modTime
+		}
+
+		if !agent.PathsEqual(meta.CWD, projectPath) && !agent.PathsEqual(meta.GitRoot, projectPath) {
 			continue
 		}
 
@@ -458,6 +475,12 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			bestSessionID = meta.ID
 			bestModTime = modTime
 		}
+	}
+
+	if bestDir == "" && fallbackCount == 1 {
+		bestDir = fallbackDir
+		bestSessionID = fallbackSessionID
+		bestModTime = fallbackModTime
 	}
 
 	if bestDir == "" {
@@ -471,5 +494,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
