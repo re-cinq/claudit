@@ -410,6 +410,10 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+// Sessions whose workspace.yaml records a matching cwd are preferred. If none match (e.g. the
+// installed CLI's workspace metadata format doesn't expose a usable/matching cwd), the most
+// recently modified session within the timeout window is used as a fallback so discovery still
+// succeeds for the common case of a single recent session.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -423,9 +427,12 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
+
+	var bestDir, bestSessionID string
 	var bestModTime time.Time
+
+	var fallbackDir, fallbackSessionID string
+	var fallbackModTime time.Time
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -442,34 +449,46 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
+		sessionID := entry.Name()
+
+		meta, metaErr := parseSessionMeta(entryPath)
+		if metaErr == nil && meta != nil && meta.ID != "" {
+			sessionID = meta.ID
+		}
+
+		if metaErr == nil && meta != nil && meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath) {
+			if bestDir == "" || modTime.After(bestModTime) {
+				bestDir = entryPath
+				bestSessionID = sessionID
+				bestModTime = modTime
+			}
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
-		}
-
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+		// Fallback candidate: most recent session regardless of recorded cwd.
+		// Used when workspace.yaml is missing, unparseable, or its cwd field
+		// doesn't match what we expect (e.g. a Copilot CLI version change).
+		if fallbackDir == "" || modTime.After(fallbackModTime) {
+			fallbackDir = entryPath
+			fallbackSessionID = sessionID
+			fallbackModTime = modTime
 		}
 	}
 
-	if bestDir == "" {
+	resultDir, resultSessionID, resultModTime := bestDir, bestSessionID, bestModTime
+	if resultDir == "" {
+		resultDir, resultSessionID, resultModTime = fallbackDir, fallbackSessionID, fallbackModTime
+	}
+
+	if resultDir == "" {
 		return nil, nil
 	}
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
+		SessionID:      resultSessionID,
+		TranscriptPath: GetTranscriptPath(resultDir),
+		StartedAt:      resultModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
