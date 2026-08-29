@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -432,24 +433,20 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
-
-		// Check if this session directory has a workspace.yaml
+		// Check if this session directory has workspace metadata that
+		// matches the project we're looking for.
 		entryPath := filepath.Join(sessionDir, entry.Name())
 		meta, err := parseSessionMeta(entryPath)
 		if err != nil || meta == nil {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		if !agent.PathsEqual(meta.CWD, projectPath) && !agent.PathsEqual(meta.GitRoot, projectPath) {
+			continue
+		}
+
+		modTime := recentSessionModTime(entryPath, entry)
+		if now.Sub(modTime) > recentTimeout {
 			continue
 		}
 
@@ -472,4 +469,19 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	}, nil
 }
 
-
+// recentSessionModTime returns the most recent modification time observed
+// for a session, preferring the transcript file's mtime — which is updated
+// as the session progresses — over the session directory's own mtime, since
+// most filesystems only update a directory's mtime when its entries are
+// added/removed/renamed, not when a file inside it is written to.
+func recentSessionModTime(sessionDir string, dirEntry os.DirEntry) time.Time {
+	var best time.Time
+	if info, err := dirEntry.Info(); err == nil {
+		best = info.ModTime()
+	}
+	if info, err := os.Stat(GetTranscriptPath(sessionDir)); err == nil && info.ModTime().After(best) {
+		best = info.ModTime()
+	}
+	return best
+}
+```
