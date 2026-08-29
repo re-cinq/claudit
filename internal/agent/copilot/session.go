@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -33,6 +34,40 @@ func GetSessionStateDir() (string, error) {
 	return filepath.Join(copilotDir, "session-state"), nil
 }
 
+// workingDirKeys are field names (case-insensitive) that plausibly hold a
+// session's working directory across Copilot CLI versions. Copilot CLI is an
+// unpinned, actively evolving dependency, so the workspace.yaml schema can
+// shift field names/nesting between releases.
+var workingDirKeys = []string{"cwd", "workingdirectory", "working_directory", "dir", "directory", "workdir", "workspace"}
+
+// findWorkingDirValue recursively searches a generically-decoded YAML
+// document for a string value under a plausible working-directory key.
+func findWorkingDirValue(node interface{}) string {
+	m, ok := node.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+
+	for _, key := range workingDirKeys {
+		for k, val := range m {
+			if !strings.EqualFold(k, key) {
+				continue
+			}
+			if s, ok := val.(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+
+	for _, val := range m {
+		if s := findWorkingDirValue(val); s != "" {
+			return s
+		}
+	}
+
+	return ""
+}
+
 // parseSessionMeta reads a workspace.yaml from a Copilot session directory.
 func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 	path := filepath.Join(sessionDir, "workspace.yaml")
@@ -44,6 +79,16 @@ func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 	var meta sessionMeta
 	if err := yaml.Unmarshal(data, &meta); err != nil {
 		return nil, err
+	}
+
+	if meta.CWD == "" {
+		// Newer/older Copilot CLI releases may rename or nest the
+		// working-directory field. Fall back to a generic scan instead of
+		// requiring an exact top-level "cwd" key.
+		var generic interface{}
+		if err := yaml.Unmarshal(data, &generic); err == nil {
+			meta.CWD = findWorkingDirValue(generic)
+		}
 	}
 
 	return &meta, nil
@@ -81,4 +126,3 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-
