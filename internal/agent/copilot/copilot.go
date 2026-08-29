@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -449,7 +450,14 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		// Match on cwd when present; some Copilot CLI versions instead (or
+		// additionally) record the repository root as git_root, so fall
+		// back to that when cwd doesn't match or wasn't written.
+		matched := meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)
+		if !matched && meta.GitRoot != "" {
+			matched = agent.PathsEqual(meta.GitRoot, projectPath)
+		}
+		if !matched {
 			continue
 		}
 
@@ -471,5 +479,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
