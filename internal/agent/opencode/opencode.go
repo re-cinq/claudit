@@ -323,10 +323,25 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
-		return nil, nil
-	}
 	sessionID := strings.TrimSpace(string(sessionOutput))
+
+	if err != nil || sessionID == "" {
+		// The project_id shiftlog computes (root commit hash) is a best-effort
+		// replica of OpenCode's own internal scheme, which has drifted across
+		// releases. Fall back to matching on the session's recorded working
+		// directory, which is a stable, directly-comparable absolute path.
+		escapedPath := strings.ReplaceAll(projectPath, "'", "''")
+		dirQuery := fmt.Sprintf(
+			`SELECT id FROM session WHERE directory='%s' ORDER BY time_updated DESC LIMIT 1;`,
+			escapedPath,
+		)
+		cmd = exec.Command("sqlite3", "-separator", "\t", dbPath, dirQuery)
+		dirOutput, dirErr := cmd.Output()
+		sessionID = strings.TrimSpace(string(dirOutput))
+		if dirErr != nil || sessionID == "" {
+			return nil, nil
+		}
+	}
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
@@ -454,7 +469,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +511,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
