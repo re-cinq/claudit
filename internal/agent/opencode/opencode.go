@@ -304,6 +304,17 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
+// querySQLiteSessionID runs a single-column sqlite3 query against dbPath and
+// returns the trimmed result, or "" if the query fails or matches no rows.
+func querySQLiteSessionID(dbPath, query string) string {
+	cmd := exec.Command("sqlite3", dbPath, query)
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
@@ -316,24 +327,34 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
+	// Find most recent session for this project, matching on project_id first.
+	sessionID := querySQLiteSessionID(dbPath, fmt.Sprintf(
 		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
 		projectID,
-	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+	))
+
+	// The project_id derivation is internal to OpenCode and has changed
+	// across versions before; if it no longer matches, fall back to matching
+	// on the recorded working directory, which is a stable, version-independent
+	// value (the absolute project path we asked OpenCode to run in).
+	if sessionID == "" {
+		escapedPath := strings.ReplaceAll(projectPath, "'", "''")
+		sessionID = querySQLiteSessionID(dbPath, fmt.Sprintf(
+			`SELECT id FROM session WHERE directory='%s' ORDER BY time_updated DESC LIMIT 1;`,
+			escapedPath,
+		))
+	}
+
+	if sessionID == "" {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
 		`SELECT time_updated FROM session WHERE id='%s';`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
+	cmd := exec.Command("sqlite3", dbPath, timeQuery)
 	timeOutput, err := cmd.Output()
 	if err == nil {
 		timeStr := strings.TrimSpace(string(timeOutput))
@@ -454,7 +475,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +517,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
