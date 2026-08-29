@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -304,6 +305,12 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
+// sqliteMessageRow represents a raw message row read from OpenCode's SQLite database.
+type sqliteMessageRow struct {
+	ID   string          `json:"id"`
+	Data json.RawMessage `json:"data"`
+}
+
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
@@ -353,20 +360,42 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
 
-	// Get messages for this session as a JSON array
+	// Read messages for this session as raw (id, data) rows and merge the id
+	// into each row's data ourselves, rather than relying on SQLite's
+	// json_patch(). json_patch() errors out the *entire* query — silently
+	// dropping the session from manual discovery — if any single row's data
+	// isn't a plain JSON object, which newer OpenCode releases can produce
+	// (and which sqlite3's own -json mode also represents as an encoded
+	// string rather than a nested object for TEXT columns).
 	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
+		`SELECT id, data FROM message WHERE session_id='%s' ORDER BY time_created;`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, msgQuery)
+	cmd = exec.Command("sqlite3", "-json", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
 	if err != nil {
 		return nil, nil
 	}
 
-	transcriptData := []byte(strings.TrimSpace(string(msgOutput)))
-	// sqlite3 returns "[null]" when no rows match
-	if string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
+	var rows []sqliteMessageRow
+	if err := json.Unmarshal(msgOutput, &rows); err != nil || len(rows) == 0 {
+		return nil, nil
+	}
+
+	messages := make([]json.RawMessage, 0, len(rows))
+	for _, row := range rows {
+		merged, ok := mergeMessageID(row.ID, row.Data)
+		if !ok {
+			continue
+		}
+		messages = append(messages, merged)
+	}
+	if len(messages) == 0 {
+		return nil, nil
+	}
+
+	transcriptData, err := json.Marshal(messages)
+	if err != nil {
 		return nil, nil
 	}
 
@@ -377,6 +406,34 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// mergeMessageID inserts a message's id into its data payload. The data
+// column comes back from `sqlite3 -json` either as a JSON object (when
+// SQLite recognizes the column as JSON) or as a JSON-encoded string (when
+// it's stored as TEXT), so both shapes are handled. Rows that don't decode
+// to an object either way are skipped rather than failing the whole batch.
+func mergeMessageID(id string, data json.RawMessage) (json.RawMessage, bool) {
+	obj := map[string]interface{}{}
+
+	if err := json.Unmarshal(data, &obj); err != nil {
+		// data may be a JSON string containing an encoded object
+		var inner string
+		if err := json.Unmarshal(data, &inner); err != nil {
+			return nil, false
+		}
+		if err := json.Unmarshal([]byte(inner), &obj); err != nil {
+			return nil, false
+		}
+	}
+
+	obj["id"] = id
+
+	merged, err := json.Marshal(obj)
+	if err != nil {
+		return nil, false
+	}
+	return merged, true
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -454,7 +511,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +553,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
