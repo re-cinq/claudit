@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -449,7 +450,13 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		// Match on the session's working directory, falling back to its
+		// git root. Newer Copilot CLI releases don't always populate `cwd`
+		// with the repo root (or omit it entirely), but reliably record
+		// `git_root` for sessions started inside a git repository.
+		cwdMatch := meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)
+		gitRootMatch := meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath)
+		if !cwdMatch && !gitRootMatch {
 			continue
 		}
 
@@ -471,5 +478,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
