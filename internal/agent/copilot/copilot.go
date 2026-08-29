@@ -410,6 +410,13 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// Newer Copilot CLI releases have been observed to omit or rename fields in
+// workspace.yaml (or omit the file entirely), so an exact metadata match is
+// treated as best-effort rather than mandatory: any session directory whose
+// cwd can't be confirmed still counts as a candidate, and if nothing matches
+// by metadata at all we fall back to the most recently modified directory
+// that has a transcript file, within the recent-session window.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -423,9 +430,12 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
+
+	var bestDir, bestSessionID string
 	var bestModTime time.Time
+
+	var fallbackDir, fallbackSessionID string
+	var fallbackModTime time.Time
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -442,22 +452,48 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
+
+		// Track the most recently modified session directory that has a
+		// transcript, regardless of whether its metadata could be parsed.
+		// This is the fallback used when workspace.yaml is missing or its
+		// schema has changed underneath us.
+		if _, statErr := os.Stat(GetTranscriptPath(entryPath)); statErr == nil {
+			if fallbackDir == "" || modTime.After(fallbackModTime) {
+				fallbackDir = entryPath
+				fallbackSessionID = entry.Name()
+				fallbackModTime = modTime
+			}
+		}
+
 		meta, err := parseSessionMeta(entryPath)
 		if err != nil || meta == nil {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		// Only reject on a CWD mismatch when the field was actually present;
+		// an empty value means the field is missing/renamed in this version
+		// of Copilot CLI, so it shouldn't be treated as a hard mismatch.
+		if meta.CWD != "" && !agent.PathsEqual(meta.CWD, projectPath) {
 			continue
+		}
+
+		sessionID := meta.ID
+		if sessionID == "" {
+			sessionID = entry.Name()
 		}
 
 		if bestDir == "" || modTime.After(bestModTime) {
 			bestDir = entryPath
-			bestSessionID = meta.ID
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
+	}
+
+	if bestDir == "" {
+		bestDir = fallbackDir
+		bestSessionID = fallbackSessionID
+		bestModTime = fallbackModTime
 	}
 
 	if bestDir == "" {
@@ -471,5 +507,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
