@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -160,6 +161,16 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 		}
 	}
 
+	// Cache the live-discovered session pointer. Copilot's own session-state
+	// directory is not guaranteed to still be present once the CLI process
+	// (particularly a non-interactive `-p` invocation) has exited, so
+	// shiftlog captures the session here while this hook callback is firing
+	// live, and consults the cache later during manual (post-commit hook)
+	// session discovery.
+	if hook.CWD != "" && sessionID != "" && transcriptPath != "" {
+		CacheSession(hook.CWD, sessionID, transcriptPath)
+	}
+
 	return &agent.HookData{
 		SessionID:      sessionID,
 		TranscriptPath: transcriptPath,
@@ -228,6 +239,13 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 
 // DiscoverSession finds an active or recent Copilot CLI session.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	// Prefer shiftlog's own cache of a live-discovered session: Copilot's
+	// ~/.copilot/session-state directory is not guaranteed to still exist
+	// once a non-interactive (`-p`) session has exited, so the postToolUse
+	// hook already captured a pointer to it while the process was running.
+	if si := ReadCachedSession(projectPath); si != nil {
+		return si, nil
+	}
 	return scanForRecentSession(projectPath)
 }
 
@@ -471,5 +489,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```

@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -81,6 +82,16 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 	var transcriptData []byte
 	if hook.TranscriptData != "" {
 		transcriptData = []byte(hook.TranscriptData)
+	}
+
+	// Cache the live-discovered session pointer. OpenCode's own on-disk
+	// session storage is not guaranteed to be discoverable after a
+	// non-interactive ("opencode run") invocation exits, so shiftlog
+	// captures the session here (sourced from the stable SDK client API)
+	// while this hook callback is firing live, and consults the cache later
+	// during manual (post-commit hook) session discovery.
+	if hook.ProjectDir != "" && hook.SessionID != "" {
+		CacheSession(hook.ProjectDir, hook.SessionID, transcriptData)
 	}
 
 	return &agent.HookData{
@@ -230,8 +241,17 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first checks shiftlog's own cache of a live-discovered session, then
+// tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	// Prefer shiftlog's own cache: OpenCode's on-disk session storage is not
+	// guaranteed to be discoverable once a non-interactive ("opencode run")
+	// session has exited, but the plugin already captured a pointer to it
+	// (via the SDK client) while the process was running.
+	if si := ReadCachedSession(projectPath); si != nil {
+		return si, nil
+	}
+
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
@@ -454,7 +474,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +516,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
