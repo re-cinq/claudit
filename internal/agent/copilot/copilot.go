@@ -410,6 +410,12 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// It prefers an exact match on the session's cwd (from workspace.yaml), but
+// falls back to the single most recently modified session directory when
+// none of the candidates expose a usable cwd field. This tolerates the
+// Copilot CLI changing its session metadata schema (field renamed/removed)
+// across versions without silently losing session discovery entirely.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -427,6 +433,11 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestSessionID string
 	var bestModTime time.Time
 
+	var fallbackDir string
+	var fallbackSessionID string
+	var fallbackModTime time.Time
+	sawUsableCWD := false
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -442,34 +453,64 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
+		// The session directory name is the session ID by construction
+		// (see WriteSessionFile), so it's a reliable identifier even if
+		// workspace.yaml's own "id" field is missing or renamed.
+		sessionID := entry.Name()
+
+		// Track the most recently modified session directory regardless of
+		// whether workspace.yaml parses or exposes a usable cwd, as a
+		// last-resort fallback below.
+		if fallbackDir == "" || modTime.After(fallbackModTime) {
+			fallbackDir = entryPath
+			fallbackSessionID = sessionID
+			fallbackModTime = modTime
+		}
+
+		// Check if this session directory has a workspace.yaml
 		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
+		if err != nil || meta == nil || meta.CWD == "" {
 			continue
 		}
+		sawUsableCWD = true
 
 		if !agent.PathsEqual(meta.CWD, projectPath) {
 			continue
 		}
 
+		if meta.ID != "" {
+			sessionID = meta.ID
+		}
+
 		if bestDir == "" || modTime.After(bestModTime) {
 			bestDir = entryPath
-			bestSessionID = meta.ID
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
 	}
 
-	if bestDir == "" {
-		return nil, nil
+	if bestDir != "" {
+		return &agent.SessionInfo{
+			SessionID:      bestSessionID,
+			TranscriptPath: GetTranscriptPath(bestDir),
+			StartedAt:      bestModTime.Format(time.RFC3339),
+			ProjectPath:    projectPath,
+		}, nil
 	}
 
-	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
-		ProjectPath:    projectPath,
-	}, nil
+	// None of the recent sessions had a usable cwd field to match against.
+	// Rather than assume a real multi-project conflict, treat this as a
+	// possible metadata schema change and fall back to the single most
+	// recently modified session as a best effort.
+	if !sawUsableCWD && fallbackDir != "" {
+		return &agent.SessionInfo{
+			SessionID:      fallbackSessionID,
+			TranscriptPath: GetTranscriptPath(fallbackDir),
+			StartedAt:      fallbackModTime.Format(time.RFC3339),
+			ProjectPath:    projectPath,
+		}, nil
+	}
+
+	return nil, nil
 }
-
-
