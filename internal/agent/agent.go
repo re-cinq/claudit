@@ -33,6 +33,38 @@ func PathsEqual(a, b string) bool {
 	return ra == rb
 }
 
+// FindStringField searches a decoded JSON/YAML value (maps/slices, as produced
+// by encoding/json or yaml.v3 unmarshaling into interface{}) up to maxDepth
+// levels of nesting for a non-empty string value under any of the given key
+// names. Coding agent CLIs periodically rename or restructure their on-disk
+// session metadata across releases; session discovery fallbacks use this to
+// tolerate that drift instead of assuming one fixed field name or shape.
+func FindStringField(v interface{}, keys []string, maxDepth int) string {
+	if maxDepth < 0 {
+		return ""
+	}
+	switch val := v.(type) {
+	case map[string]interface{}:
+		for _, k := range keys {
+			if s, ok := val[k].(string); ok && s != "" {
+				return s
+			}
+		}
+		for _, nested := range val {
+			if s := FindStringField(nested, keys, maxDepth-1); s != "" {
+				return s
+			}
+		}
+	case []interface{}:
+		for _, item := range val {
+			if s := FindStringField(item, keys, maxDepth-1); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
 // HasNestedHookCommand checks if a nested hook config (used by Claude/Gemini)
 // contains a specific command string. The structure is: [{hooks: [{command: "..."}]}].
 func HasNestedHookCommand(hookConfig interface{}, command string) bool {

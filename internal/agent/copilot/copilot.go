@@ -409,16 +409,29 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
-// scanForRecentSession scans Copilot's session state directory for recent session directories.
+// scanForRecentSession finds the most recently active Copilot CLI session for
+// projectPath. It first tries Copilot's originally-documented session-state
+// layout (session-state/<sessionID>/workspace.yaml), then falls back to a
+// generic scan that tolerates Copilot CLI changing its on-disk session
+// metadata format across releases.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
+	if session := scanKnownLayout(projectPath); session != nil {
+		return session, nil
+	}
+	return scanGenericSession(projectPath)
+}
+
+// scanKnownLayout scans Copilot's originally-documented session-state
+// directory layout for a recent session matching projectPath.
+func scanKnownLayout(projectPath string) *agent.SessionInfo {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
-		return nil, nil
+		return nil
 	}
 
 	entries, err := os.ReadDir(sessionDir)
 	if err != nil {
-		return nil, nil
+		return nil
 	}
 
 	now := time.Now()
@@ -461,7 +474,7 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	}
 
 	if bestDir == "" {
-		return nil, nil
+		return nil
 	}
 
 	return &agent.SessionInfo{
@@ -469,7 +482,5 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		TranscriptPath: GetTranscriptPath(bestDir),
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
-	}, nil
+	}
 }
-
-
