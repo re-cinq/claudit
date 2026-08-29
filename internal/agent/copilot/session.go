@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -81,4 +82,4 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-
+```
