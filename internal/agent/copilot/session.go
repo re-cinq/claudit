@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -10,9 +11,33 @@ import (
 
 // sessionMeta represents lightweight metadata from a Copilot session workspace.yaml.
 type sessionMeta struct {
-	ID      string `yaml:"id"`
-	CWD     string `yaml:"cwd"`
-	GitRoot string `yaml:"git_root,omitempty"`
+	ID      string
+	CWD     string
+	GitRoot string
+}
+
+// stringFromYAML extracts a string value from a decoded YAML map, trying each
+// key in order (and one level of nesting under "workspace") and returning the
+// first non-empty match. Recent Copilot CLI releases have renamed and moved
+// around workspace.yaml fields, so callers should list every known alias.
+func stringFromYAML(raw map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if v, ok := raw[key]; ok {
+			if s, ok := v.(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	if nested, ok := raw["workspace"].(map[string]interface{}); ok {
+		for _, key := range keys {
+			if v, ok := nested[key]; ok {
+				if s, ok := v.(string); ok && s != "" {
+					return s
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // GetCopilotDir returns the path to Copilot's config/data directory.
@@ -41,12 +66,16 @@ func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 		return nil, err
 	}
 
-	var meta sessionMeta
-	if err := yaml.Unmarshal(data, &meta); err != nil {
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, err
 	}
 
-	return &meta, nil
+	return &sessionMeta{
+		ID:      stringFromYAML(raw, "id", "sessionId", "session_id"),
+		CWD:     stringFromYAML(raw, "cwd", "directory", "workingDirectory", "working_directory", "path"),
+		GitRoot: stringFromYAML(raw, "git_root", "gitRoot", "root"),
+	}, nil
 }
 
 // GetTranscriptPath returns the path to the events.jsonl transcript within a session directory.
@@ -68,7 +97,9 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	}
 
 	// Write workspace.yaml
-	meta := sessionMeta{ID: sessionID}
+	meta := struct {
+		ID string `yaml:"id"`
+	}{ID: sessionID}
 	yamlData, err := yaml.Marshal(&meta)
 	if err != nil {
 		return "", fmt.Errorf("could not marshal workspace.yaml: %w", err)
@@ -81,4 +112,4 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-
+```
