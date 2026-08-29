@@ -227,8 +227,13 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent Copilot CLI session.
+// Copilot may still be flushing its on-disk session-state directory for a
+// short moment after the CLI process exits, so this polls a few times
+// rather than giving up on the first empty result (see agent.PollForSession).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	return scanForRecentSession(projectPath)
+	return agent.PollForSession(func() (*agent.SessionInfo, error) {
+		return scanForRecentSession(projectPath)
+	})
 }
 
 // RestoreSession writes a transcript to Copilot CLI's expected location.
@@ -471,5 +476,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-

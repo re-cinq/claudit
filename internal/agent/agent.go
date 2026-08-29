@@ -33,6 +33,37 @@ func PathsEqual(a, b string) bool {
 	return ra == rb
 }
 
+// sessionPollAttempts and sessionPollInterval bound how long PollForSession
+// retries a session lookup before giving up.
+const (
+	sessionPollAttempts = 4
+	sessionPollInterval = 250 * time.Millisecond
+)
+
+// PollForSession retries a session discovery function a few times with a
+// short delay between attempts. Some agent CLIs persist session state (an
+// on-disk index file, a SQLite row, etc.) slightly after their process
+// exits. When DiscoverSession runs from a post-commit git hook immediately
+// after that process exits, the very first lookup can race that write and
+// find nothing even though a session genuinely just completed. Retrying a
+// few times over a bounded (sub-second) window absorbs that race without
+// meaningfully slowing down commits when no session exists at all.
+func PollForSession(fn func() (*SessionInfo, error)) (*SessionInfo, error) {
+	var lastErr error
+	for attempt := 0; attempt < sessionPollAttempts; attempt++ {
+		session, err := fn()
+		if err != nil {
+			lastErr = err
+		} else if session != nil {
+			return session, nil
+		}
+		if attempt < sessionPollAttempts-1 {
+			time.Sleep(sessionPollInterval)
+		}
+	}
+	return nil, lastErr
+}
+
 // HasNestedHookCommand checks if a nested hook config (used by Claude/Gemini)
 // contains a specific command string. The structure is: [{hooks: [{command: "..."}]}].
 func HasNestedHookCommand(hookConfig interface{}, command string) bool {

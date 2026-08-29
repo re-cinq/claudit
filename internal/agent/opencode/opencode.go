@@ -231,7 +231,18 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 
 // DiscoverSession finds an active or recent OpenCode session.
 // It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// OpenCode may still be flushing its session/message data (SQLite rows or
+// flat files) for a short moment after the CLI process exits, so this polls
+// a few times rather than giving up on the first empty result (see
+// agent.PollForSession).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	return agent.PollForSession(func() (*agent.SessionInfo, error) {
+		return a.discoverSessionOnce(projectPath)
+	})
+}
+
+// discoverSessionOnce performs a single, non-retrying session lookup.
+func (a *Agent) discoverSessionOnce(projectPath string) (*agent.SessionInfo, error) {
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
@@ -497,4 +508,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
