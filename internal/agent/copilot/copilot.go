@@ -410,54 +410,62 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+// The nesting level under session-state has changed across Copilot CLI versions
+// (e.g. an extra grouping directory between session-state and the session's own
+// directory), so this walks the whole tree instead of assuming a fixed depth.
+// Sessions whose recorded cwd matches projectPath are preferred; if none match
+// (for example because a newer CLI renamed or dropped the cwd field), the most
+// recently modified session within the timeout is used as a best-effort fallback.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	entries, err := os.ReadDir(sessionDir)
-	if err != nil {
-		return nil, nil
-	}
-
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
+	var matchDir, matchID string
+	var matchModTime time.Time
+	var anyDir, anyID string
+	var anyModTime time.Time
 
-		info, err := entry.Info()
-		if err != nil {
-			continue
+	_ = filepath.Walk(sessionDir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info == nil || info.IsDir() || info.Name() != "workspace.yaml" {
+			return nil
 		}
 
 		modTime := info.ModTime()
 		if now.Sub(modTime) > recentTimeout {
-			continue
+			return nil
 		}
 
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
+		entryPath := filepath.Dir(path)
 		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
+		if err != nil || meta == nil || meta.ID == "" {
+			return nil
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
+		if anyDir == "" || modTime.After(anyModTime) {
+			anyDir = entryPath
+			anyID = meta.ID
+			anyModTime = modTime
 		}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+		if meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath) {
+			if matchDir == "" || modTime.After(matchModTime) {
+				matchDir = entryPath
+				matchID = meta.ID
+				matchModTime = modTime
+			}
 		}
+
+		return nil
+	})
+
+	bestDir, bestSessionID, bestModTime := matchDir, matchID, matchModTime
+	if bestDir == "" {
+		bestDir, bestSessionID, bestModTime = anyDir, anyID, anyModTime
 	}
 
 	if bestDir == "" {
@@ -471,5 +479,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
