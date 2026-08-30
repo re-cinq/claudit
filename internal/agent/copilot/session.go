@@ -34,6 +34,11 @@ func GetSessionStateDir() (string, error) {
 }
 
 // parseSessionMeta reads a workspace.yaml from a Copilot session directory.
+//
+// Copilot CLI has changed the field names/nesting of workspace.yaml across
+// releases (e.g. flattening or renaming the "cwd" field). To stay resilient
+// across those revisions, this parses into a generic map and checks several
+// known/plausible key names instead of relying on a single fixed struct shape.
 func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 	path := filepath.Join(sessionDir, "workspace.yaml")
 	data, err := os.ReadFile(path)
@@ -41,12 +46,42 @@ func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 		return nil, err
 	}
 
-	var meta sessionMeta
-	if err := yaml.Unmarshal(data, &meta); err != nil {
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, err
 	}
 
-	return &meta, nil
+	meta := &sessionMeta{
+		ID:      firstStringField(raw, "id", "session_id", "sessionId", "sessionID"),
+		CWD:     firstStringField(raw, "cwd", "cwd_path", "cwdPath", "working_directory", "workingDirectory", "directory", "workspace_dir", "workspaceFolder", "root"),
+		GitRoot: firstStringField(raw, "git_root", "gitRoot"),
+	}
+
+	// Some versions nest the workspace details under a "workspace" object
+	// instead of putting them at the top level.
+	if ws, ok := raw["workspace"].(map[string]interface{}); ok {
+		if meta.CWD == "" {
+			meta.CWD = firstStringField(ws, "cwd", "path", "directory")
+		}
+		if meta.ID == "" {
+			meta.ID = firstStringField(ws, "id")
+		}
+	}
+
+	return meta, nil
+}
+
+// firstStringField returns the first non-empty string value found in m for
+// the given candidate keys.
+func firstStringField(m map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if v, ok := m[key]; ok {
+			if s, ok := v.(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	return ""
 }
 
 // GetTranscriptPath returns the path to the events.jsonl transcript within a session directory.
@@ -81,4 +116,3 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-
