@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -409,67 +410,116 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
-// scanForRecentSession scans Copilot's session state directory for recent session directories.
-func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionStateDir()
-	if err != nil {
-		return nil, nil
-	}
+// copilotSessionCandidate represents a discovered Copilot transcript file
+// found while scanning the Copilot data directory for a recent session.
+type copilotSessionCandidate struct {
+	sessionDir     string
+	transcriptPath string
+	sessionID      string
+	modTime        time.Time
+	matchesCWD     bool
+}
 
-	entries, err := os.ReadDir(sessionDir)
+// scanForRecentSession scans Copilot's data directory for a session matching
+// projectPath. Copilot's on-disk session layout (directory names, metadata
+// file location/fields) has changed across CLI releases, and there is no
+// published spec for it, so rather than hard-coding a single known-good
+// location we walk the whole Copilot data directory for any recently
+// modified transcript file. A session whose recorded working directory
+// matches projectPath is preferred; when none can be matched (for example
+// because the metadata format changed again, or the session was relocated
+// after the CLI process exited) we fall back to the single most recently
+// modified session so that discovery run well after the CLI has exited
+// (e.g. from a post-commit hook) still succeeds.
+func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
+	copilotDir, err := GetCopilotDir()
 	if err != nil {
 		return nil, nil
 	}
 
 	now := time.Now()
-	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
+	timeout := agent.RecentSessionTimeout
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
+	seen := make(map[string]bool)
+	var candidates []copilotSessionCandidate
+
+	_ = filepath.WalkDir(copilotDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".jsonl") {
+			return nil
 		}
 
-		info, err := entry.Info()
+		sessionDir := filepath.Dir(path)
+		if seen[sessionDir] {
+			return nil
+		}
+
+		info, err := d.Info()
 		if err != nil {
-			continue
+			return nil
 		}
-
 		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
+		if now.Sub(modTime) > timeout {
+			return nil
+		}
+		seen[sessionDir] = true
+
+		sessionID := filepath.Base(sessionDir)
+		matchesCWD := false
+		if meta, err := parseSessionMeta(sessionDir); err == nil && meta != nil {
+			if meta.ID != "" {
+				sessionID = meta.ID
+			}
+			if meta.CWD != "" {
+				matchesCWD = agent.PathsEqual(meta.CWD, projectPath)
+			}
 		}
 
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
-		}
+		candidates = append(candidates, copilotSessionCandidate{
+			sessionDir:     sessionDir,
+			transcriptPath: path,
+			sessionID:      sessionID,
+			modTime:        modTime,
+			matchesCWD:     matchesCWD,
+		})
+		return nil
+	})
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
-		}
-
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
-		}
-	}
-
-	if bestDir == "" {
+	best := bestCopilotCandidate(candidates)
+	if best == nil {
 		return nil, nil
 	}
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
+		SessionID:      best.sessionID,
+		TranscriptPath: best.transcriptPath,
+		StartedAt:      best.modTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
 
+// bestCopilotCandidate prefers the most recent candidate whose recorded CWD
+// matches the project; if none match, it falls back to the single most
+// recently modified candidate overall.
+func bestCopilotCandidate(candidates []copilotSessionCandidate) *copilotSessionCandidate {
+	var best *copilotSessionCandidate
+	for i := range candidates {
+		c := &candidates[i]
+		if !c.matchesCWD {
+			continue
+		}
+		if best == nil || c.modTime.After(best.modTime) {
+			best = c
+		}
+	}
+	if best != nil {
+		return best
+	}
 
+	for i := range candidates {
+		c := &candidates[i]
+		if best == nil || c.modTime.After(best.modTime) {
+			best = c
+		}
+	}
+	return best
+}
