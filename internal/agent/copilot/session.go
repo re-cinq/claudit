@@ -33,9 +33,8 @@ func GetSessionStateDir() (string, error) {
 	return filepath.Join(copilotDir, "session-state"), nil
 }
 
-// parseSessionMeta reads a workspace.yaml from a Copilot session directory.
-func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
-	path := filepath.Join(sessionDir, "workspace.yaml")
+// parseSessionMeta reads and parses a Copilot workspace.yaml metadata file at path.
+func parseSessionMeta(path string) (*sessionMeta, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -81,4 +80,3 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-
