@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -410,6 +411,14 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// Matching is tried in order of confidence:
+//  1. workspace.yaml's cwd or git_root field equals projectPath.
+//  2. If workspace.yaml is missing/unparseable or has neither field set (the
+//     schema may have changed across Copilot CLI versions), fall back to the
+//     single most recently active session directory. We only take this
+//     last-resort path when we have no path info to compare against — never
+//     when the recorded path definitively points to a different project.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -426,30 +435,41 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestDir string
 	var bestSessionID string
 	var bestModTime time.Time
+	var fallbackDir string
+	var fallbackSessionID string
+	var fallbackModTime time.Time
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
 
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
+		entryPath := filepath.Join(sessionDir, entry.Name())
+		modTime := latestSessionModTime(entryPath, entry)
 		if now.Sub(modTime) > recentTimeout {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
+		meta, metaErr := parseSessionMeta(entryPath)
+
+		if metaErr != nil || meta == nil || (meta.CWD == "" && meta.GitRoot == "") {
+			// No usable path info recorded for this session; track it as a
+			// last-resort candidate rather than discarding it outright.
+			if fallbackDir == "" || modTime.After(fallbackModTime) {
+				fallbackDir = entryPath
+				if meta != nil && meta.ID != "" {
+					fallbackSessionID = meta.ID
+				} else {
+					fallbackSessionID = entry.Name()
+				}
+				fallbackModTime = modTime
+			}
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		matched := (meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)) ||
+			(meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath))
+		if !matched {
 			continue
 		}
 
@@ -461,7 +481,15 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	}
 
 	if bestDir == "" {
+		bestDir, bestSessionID, bestModTime = fallbackDir, fallbackSessionID, fallbackModTime
+	}
+
+	if bestDir == "" {
 		return nil, nil
+	}
+
+	if bestSessionID == "" {
+		bestSessionID = filepath.Base(bestDir)
 	}
 
 	return &agent.SessionInfo{
@@ -472,4 +500,21 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	}, nil
 }
 
-
+// latestSessionModTime returns the most recent modification time among a
+// session directory and its events.jsonl transcript. A directory's own mtime
+// only changes when entries are added/removed from it, not when an existing
+// file (like events.jsonl) is appended to, so a long-running session would
+// otherwise look stale even while actively being written to.
+func latestSessionModTime(sessionDir string, dirEntry os.DirEntry) time.Time {
+	var best time.Time
+	if info, err := dirEntry.Info(); err == nil {
+		best = info.ModTime()
+	}
+	if info, err := os.Stat(GetTranscriptPath(sessionDir)); err == nil {
+		if info.ModTime().After(best) {
+			best = info.ModTime()
+		}
+	}
+	return best
+}
+```
