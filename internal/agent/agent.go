@@ -1,3 +1,4 @@
+```go
 package agent
 
 import (
@@ -31,6 +32,56 @@ func PathsEqual(a, b string) bool {
 		rb = filepath.Clean(b)
 	}
 	return ra == rb
+}
+
+// activeSessionMarker mirrors the shiftlog-owned .shiftlog/active-session.json
+// file (see internal/session.ActiveSession) written by "shiftlog store"
+// whenever it observes a hook event carrying a session ID.
+type activeSessionMarker struct {
+	SessionID      string `json:"session_id"`
+	TranscriptPath string `json:"transcript_path"`
+	StartedAt      string `json:"started_at"`
+	ProjectPath    string `json:"project_path"`
+}
+
+// DiscoverActiveSessionMarker reads .shiftlog/active-session.json under
+// projectPath and returns a SessionInfo if it matches projectPath and was
+// recorded within RecentSessionTimeout. Returns nil if no usable marker is
+// found.
+//
+// This lets an agent recover a session for a manual (out-of-band) commit
+// even when the agent CLI's own on-disk session storage can't be reliably
+// scanned after the agent process has exited (e.g. its layout changed in a
+// newer release, or it reorganizes/archives session data on exit). The
+// marker is written live, while the agent is still running and its native
+// storage is known-good, so later discovery doesn't need to re-derive
+// anything from that storage.
+func DiscoverActiveSessionMarker(projectPath string) *SessionInfo {
+	data, err := os.ReadFile(filepath.Join(projectPath, ".shiftlog", "active-session.json"))
+	if err != nil {
+		return nil
+	}
+
+	var marker activeSessionMarker
+	if err := json.Unmarshal(data, &marker); err != nil || marker.SessionID == "" {
+		return nil
+	}
+
+	if !PathsEqual(marker.ProjectPath, projectPath) {
+		return nil
+	}
+
+	startedAt, err := time.Parse(time.RFC3339, marker.StartedAt)
+	if err != nil || time.Since(startedAt) > RecentSessionTimeout {
+		return nil
+	}
+
+	return &SessionInfo{
+		SessionID:      marker.SessionID,
+		TranscriptPath: marker.TranscriptPath,
+		StartedAt:      marker.StartedAt,
+		ProjectPath:    marker.ProjectPath,
+	}
 }
 
 // HasNestedHookCommand checks if a nested hook config (used by Claude/Gemini)
@@ -236,3 +287,4 @@ type Agent interface {
 	// Rendering: map tool names for display
 	ToolAliases() map[string]string
 }
+```

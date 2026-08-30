@@ -1,3 +1,4 @@
+```go
 package cmd
 
 import (
@@ -7,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/re-cinq/shift-log/internal/agent"
 	_ "github.com/re-cinq/shift-log/internal/agent/claude"   // register Claude agent
@@ -17,6 +19,7 @@ import (
 	"github.com/re-cinq/shift-log/internal/cli"
 	"github.com/re-cinq/shift-log/internal/config"
 	"github.com/re-cinq/shift-log/internal/git"
+	"github.com/re-cinq/shift-log/internal/session"
 	"github.com/re-cinq/shift-log/internal/storage"
 	"github.com/spf13/cobra"
 )
@@ -92,6 +95,15 @@ func runHookStore() error {
 
 	cli.LogDebug("store: tool=%s command=%q session=%s", hookData.ToolName, hookData.Command, hookData.SessionID)
 
+	// Record the most recently observed session so a later manual commit
+	// (post-commit hook, which has no session ID of its own) can still be
+	// attributed to the right session even if the agent CLI's own on-disk
+	// session storage is no longer reliably scannable by the time the
+	// commit happens (e.g. after the agent process has exited). This is
+	// recorded on every hook event, not just commit commands, since it may
+	// be the only hook event we ever see for a given session.
+	recordActiveSession(hookData)
+
 	// Check if this is a git commit command
 	if !ag.IsCommitCommand(hookData.ToolName, hookData.Command) {
 		cli.LogDebug("store: not a git commit command, skipping")
@@ -105,6 +117,33 @@ func runHookStore() error {
 	}
 
 	return storeConversation(ag, hookData.SessionID, hookData.TranscriptPath, hookData.TranscriptData)
+}
+
+// recordActiveSession persists the most recently observed session ID to
+// .shiftlog/active-session.json so that DiscoverSession implementations can
+// recover it later for a manual (out-of-band) commit, independent of the
+// agent CLI's own session storage format.
+func recordActiveSession(hookData *agent.HookData) {
+	if hookData == nil || hookData.SessionID == "" {
+		return
+	}
+	if !git.IsInsideWorkTree() {
+		return
+	}
+	projectPath, err := git.GetRepoRoot()
+	if err != nil {
+		return
+	}
+
+	err = session.WriteActiveSession(&session.ActiveSession{
+		SessionID:      hookData.SessionID,
+		TranscriptPath: hookData.TranscriptPath,
+		StartedAt:      time.Now().UTC().Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	})
+	if err != nil {
+		cli.LogDebug("store: failed to record active session: %v", err)
+	}
 }
 
 // runManualStore handles the manual (post-commit hook) mode.
@@ -290,3 +329,4 @@ func readTranscriptData(path string) ([]byte, error) {
 
 	return json.Marshal(messages)
 }
+```

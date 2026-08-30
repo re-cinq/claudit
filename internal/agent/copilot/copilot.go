@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -228,6 +229,15 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 
 // DiscoverSession finds an active or recent Copilot CLI session.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	// Prefer the shiftlog-owned marker recorded live during a previous hook
+	// event (see cmd/store.go's recordActiveSession). This avoids depending
+	// on Copilot's own on-disk session-state layout still being scannable
+	// after the Copilot process has exited, which is what a manual
+	// (out-of-band) commit requires.
+	if info := agent.DiscoverActiveSessionMarker(projectPath); info != nil {
+		return info, nil
+	}
+
 	return scanForRecentSession(projectPath)
 }
 
@@ -471,5 +481,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
