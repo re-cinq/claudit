@@ -34,6 +34,11 @@ func GetSessionStateDir() (string, error) {
 }
 
 // parseSessionMeta reads a workspace.yaml from a Copilot session directory.
+// Copilot has shifted this schema across releases (the working directory
+// field has been seen as "cwd", "directory", and nested under a "workspace"
+// key). The canonical fields are tried first; if they come back empty, a
+// handful of known alternate/nested locations are checked so session
+// discovery keeps working across those schema changes.
 func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 	path := filepath.Join(sessionDir, "workspace.yaml")
 	data, err := os.ReadFile(path)
@@ -46,7 +51,41 @@ func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 		return nil, err
 	}
 
+	if meta.CWD == "" || meta.ID == "" {
+		var raw map[string]interface{}
+		if yaml.Unmarshal(data, &raw) == nil {
+			if meta.CWD == "" {
+				meta.CWD = firstStringValue(raw, "cwd", "directory", "workingDirectory", "working_directory", "path")
+				if meta.CWD == "" {
+					if nested, ok := raw["workspace"].(map[string]interface{}); ok {
+						meta.CWD = firstStringValue(nested, "cwd", "directory", "path")
+					}
+				}
+			}
+			if meta.ID == "" {
+				meta.ID = firstStringValue(raw, "id", "sessionId", "session_id")
+			}
+		}
+	}
+
+	if meta.ID == "" {
+		// The session directory is named after the session ID whenever we
+		// write it ourselves (see WriteSessionFile); fall back to that.
+		meta.ID = filepath.Base(sessionDir)
+	}
+
 	return &meta, nil
+}
+
+// firstStringValue returns the first non-empty string value found in m for
+// the given keys, in order.
+func firstStringValue(m map[string]interface{}, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := m[k].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // GetTranscriptPath returns the path to the events.jsonl transcript within a session directory.
@@ -81,4 +120,3 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-

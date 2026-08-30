@@ -316,10 +316,19 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
+	// OpenCode has renamed timestamp columns across releases (e.g. time_updated
+	// vs updated_at). Resolve the actual column name at runtime instead of
+	// hardcoding one, falling back to rowid (always present on an ordinary
+	// SQLite table) so a rename doesn't break discovery entirely.
+	sessionTimeCol := sqliteOrderColumn(dbPath, "session",
+		"time_updated", "updated_at", "updatedAt", "time_created", "created_at", "createdAt")
+	messageTimeCol := sqliteOrderColumn(dbPath, "message",
+		"time_created", "created_at", "createdAt", "time_updated", "updated_at", "updatedAt")
+
 	// Find most recent session for this project
 	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
+		`SELECT id FROM session WHERE project_id='%s' ORDER BY %s DESC LIMIT 1;`,
+		projectID, sessionTimeCol,
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
@@ -330,8 +339,8 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
-		`SELECT time_updated FROM session WHERE id='%s';`,
-		sessionID,
+		`SELECT %s FROM session WHERE id='%s';`,
+		sessionTimeCol, sessionID,
 	)
 	cmd = exec.Command("sqlite3", dbPath, timeQuery)
 	timeOutput, err := cmd.Output()
@@ -355,8 +364,8 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 
 	// Get messages for this session as a JSON array
 	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
+		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY %s;`,
+		sessionID, messageTimeCol,
 	)
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
@@ -377,6 +386,42 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// sqliteTableColumns returns the column names of a SQLite table, or nil if
+// they can't be determined (sqlite3 unavailable, table missing, etc).
+func sqliteTableColumns(dbPath, table string) []string {
+	cmd := exec.Command("sqlite3", dbPath, fmt.Sprintf("PRAGMA table_info(%s);", table))
+	output, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	var cols []string
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		fields := strings.Split(line, "|")
+		if len(fields) >= 2 {
+			cols = append(cols, fields[1])
+		}
+	}
+	return cols
+}
+
+// sqliteOrderColumn picks the first candidate column that actually exists on
+// the given table, falling back to "rowid" (always present on an ordinary
+// SQLite table) if none of the candidates match. This insulates the
+// discovery queries from upstream OpenCode column renames.
+func sqliteOrderColumn(dbPath, table string, candidates ...string) string {
+	existing := make(map[string]bool)
+	for _, c := range sqliteTableColumns(dbPath, table) {
+		existing[c] = true
+	}
+	for _, cand := range candidates {
+		if existing[cand] {
+			return cand
+		}
+	}
+	return "rowid"
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -454,7 +499,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +541,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
