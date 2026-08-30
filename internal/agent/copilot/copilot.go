@@ -410,6 +410,16 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// Session directories are matched against projectPath via workspace.yaml's
+// cwd field when available. Copilot CLI has varied across versions in
+// whether session directories sit directly under the session-state root or
+// are nested one level deeper (e.g. under a workspace identifier), so both
+// layouts are scanned. When no directory carries CWD metadata that matches
+// projectPath (e.g. the metadata format changed upstream, or the field is
+// missing), the most recently modified candidate is used as a best-effort
+// fallback rather than reporting no session at all — a single active
+// session is by far the common case.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -421,55 +431,86 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		return nil, nil
 	}
 
-	now := time.Now()
-	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
+	var matched, fallback *candidateSession
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
 
-		info, err := entry.Info()
+		entryPath := filepath.Join(sessionDir, entry.Name())
+		considerSessionCandidate(entryPath, entry.Name(), projectPath, &matched, &fallback)
+
+		nested, err := os.ReadDir(entryPath)
 		if err != nil {
 			continue
 		}
-
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
-
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
-		}
-
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
-		}
-
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+		for _, ne := range nested {
+			if !ne.IsDir() {
+				continue
+			}
+			considerSessionCandidate(filepath.Join(entryPath, ne.Name()), ne.Name(), projectPath, &matched, &fallback)
 		}
 	}
 
-	if bestDir == "" {
+	best := matched
+	if best == nil {
+		best = fallback
+	}
+	if best == nil {
 		return nil, nil
 	}
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
+		SessionID:      best.sessionID,
+		TranscriptPath: GetTranscriptPath(best.dir),
+		StartedAt:      best.modTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
 
+// candidateSession tracks a recently modified Copilot session directory.
+type candidateSession struct {
+	dir       string
+	sessionID string
+	modTime   time.Time
+}
 
+// considerSessionCandidate evaluates a possible session directory, updating
+// matched (CWD confirmed against workspace.yaml) or fallback (recency only)
+// if it is a better candidate than what's already tracked.
+func considerSessionCandidate(dir, name, projectPath string, matched, fallback **candidateSession) {
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		return
+	}
+
+	modTime := info.ModTime()
+	// A directory's own mtime only changes when entries are added/removed
+	// within it, not when a file inside is appended to. Prefer the
+	// transcript's mtime when newer so long-running sessions aren't
+	// mistaken for stale ones.
+	if evInfo, err := os.Stat(GetTranscriptPath(dir)); err == nil && evInfo.ModTime().After(modTime) {
+		modTime = evInfo.ModTime()
+	}
+	if time.Since(modTime) > agent.RecentSessionTimeout {
+		return
+	}
+
+	meta, metaErr := parseSessionMeta(dir)
+	sessionID := name
+	if metaErr == nil && meta != nil && meta.ID != "" {
+		sessionID = meta.ID
+	}
+
+	if metaErr == nil && meta != nil && meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath) {
+		if *matched == nil || modTime.After((*matched).modTime) {
+			*matched = &candidateSession{dir: dir, sessionID: sessionID, modTime: modTime}
+		}
+		return
+	}
+
+	if *fallback == nil || modTime.After((*fallback).modTime) {
+		*fallback = &candidateSession{dir: dir, sessionID: sessionID, modTime: modTime}
+	}
+}
