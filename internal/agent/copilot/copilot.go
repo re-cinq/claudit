@@ -410,6 +410,10 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+// It matches sessions by working directory using parseSessionMeta's tolerant key
+// lookup. If no session in the timeout window carries usable working-directory
+// metadata at all (e.g. Copilot CLI renamed/removed that field), it falls back
+// to the most recently active session directory rather than discovering nothing.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -427,6 +431,11 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestSessionID string
 	var bestModTime time.Time
 
+	var fallbackDir string
+	var fallbackSessionID string
+	var fallbackModTime time.Time
+	sawCWDInfo := false
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -442,12 +451,27 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
 		meta, err := parseSessionMeta(entryPath)
 		if err != nil || meta == nil {
 			continue
 		}
+
+		sessionID := meta.ID
+		if sessionID == "" {
+			sessionID = entry.Name()
+		}
+
+		if fallbackDir == "" || modTime.After(fallbackModTime) {
+			fallbackDir = entryPath
+			fallbackSessionID = sessionID
+			fallbackModTime = modTime
+		}
+
+		if meta.CWD == "" {
+			continue
+		}
+		sawCWDInfo = true
 
 		if !agent.PathsEqual(meta.CWD, projectPath) {
 			continue
@@ -455,9 +479,15 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 		if bestDir == "" || modTime.After(bestModTime) {
 			bestDir = entryPath
-			bestSessionID = meta.ID
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
+	}
+
+	// No session carried usable CWD metadata at all: fall back to the most
+	// recently active session rather than reporting no session found.
+	if bestDir == "" && !sawCWDInfo {
+		bestDir, bestSessionID, bestModTime = fallbackDir, fallbackSessionID, fallbackModTime
 	}
 
 	if bestDir == "" {
@@ -471,5 +501,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
