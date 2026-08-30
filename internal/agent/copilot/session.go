@@ -10,9 +10,9 @@ import (
 
 // sessionMeta represents lightweight metadata from a Copilot session workspace.yaml.
 type sessionMeta struct {
-	ID      string `yaml:"id"`
-	CWD     string `yaml:"cwd"`
-	GitRoot string `yaml:"git_root,omitempty"`
+	ID      string
+	CWD     string
+	GitRoot string
 }
 
 // GetCopilotDir returns the path to Copilot's config/data directory.
@@ -34,6 +34,11 @@ func GetSessionStateDir() (string, error) {
 }
 
 // parseSessionMeta reads a workspace.yaml from a Copilot session directory.
+// Copilot CLI has used different key names for the working directory across
+// releases (e.g. cwd, cwdPath, workingDirectory, directory), and some
+// releases nest workspace fields under a top-level "workspace" key. Parse
+// generically via a raw map so session discovery tolerates this drift
+// instead of silently finding nothing when a field is renamed.
 func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 	path := filepath.Join(sessionDir, "workspace.yaml")
 	data, err := os.ReadFile(path)
@@ -41,12 +46,43 @@ func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 		return nil, err
 	}
 
-	var meta sessionMeta
-	if err := yaml.Unmarshal(data, &meta); err != nil {
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, err
 	}
 
-	return &meta, nil
+	meta := &sessionMeta{
+		ID:      firstStringField(raw, "id", "sessionId", "session_id", "sessionID"),
+		CWD:     firstStringField(raw, "cwd", "cwdPath", "workingDirectory", "directory", "path"),
+		GitRoot: firstStringField(raw, "git_root", "gitRoot", "root"),
+	}
+
+	if ws, ok := raw["workspace"].(map[string]interface{}); ok {
+		if meta.ID == "" {
+			meta.ID = firstStringField(ws, "id", "sessionId", "session_id", "sessionID")
+		}
+		if meta.CWD == "" {
+			meta.CWD = firstStringField(ws, "cwd", "cwdPath", "workingDirectory", "directory", "path")
+		}
+		if meta.GitRoot == "" {
+			meta.GitRoot = firstStringField(ws, "git_root", "gitRoot", "root")
+		}
+	}
+
+	return meta, nil
+}
+
+// firstStringField returns the first non-empty string value found under any
+// of the given keys in m.
+func firstStringField(m map[string]interface{}, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			if s, ok := v.(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	return ""
 }
 
 // GetTranscriptPath returns the path to the events.jsonl transcript within a session directory.
@@ -68,7 +104,9 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	}
 
 	// Write workspace.yaml
-	meta := sessionMeta{ID: sessionID}
+	meta := struct {
+		ID string `yaml:"id"`
+	}{ID: sessionID}
 	yamlData, err := yaml.Marshal(&meta)
 	if err != nil {
 		return "", fmt.Errorf("could not marshal workspace.yaml: %w", err)
@@ -81,4 +119,3 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-
