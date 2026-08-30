@@ -305,6 +305,12 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
+//
+// The session table's column names have changed across OpenCode releases (fields have
+// moved into/out of a nested JSON blob column), so instead of hard-coding a WHERE/ORDER
+// BY clause against specific column names, this pulls full rows as JSON via `sqlite3
+// -json` and matches project identity plus recency in Go against whichever shape is
+// present in a given row.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
@@ -316,41 +322,26 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
-	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
+	cmd := exec.Command("sqlite3", "-json", dbPath, "SELECT * FROM session;")
 	sessionOutput, err := cmd.Output()
 	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
-	// Check if this session was recent (within timeout)
-	timeQuery := fmt.Sprintf(
-		`SELECT time_updated FROM session WHERE id='%s';`,
-		sessionID,
-	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
-	timeOutput, err := cmd.Output()
-	if err == nil {
-		timeStr := strings.TrimSpace(string(timeOutput))
-		if t, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02T15:04:05.000Z", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02 15:04:05", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		}
-		// If we can't parse the time, proceed anyway — better to try than skip
+	var rows []map[string]json.RawMessage
+	if err := json.Unmarshal(sessionOutput, &rows); err != nil {
+		return nil, nil
+	}
+
+	sessionID, updatedAt, found := bestMatchingSession(rows, projectID, projectPath)
+	if !found {
+		return nil, nil
+	}
+
+	// Skip stale sessions, but don't block on an unparseable/missing timestamp —
+	// better to try the match than to silently give up.
+	if !updatedAt.IsZero() && time.Since(updatedAt) > agent.RecentSessionTimeout {
+		return nil, nil
 	}
 
 	// Get messages for this session as a JSON array
@@ -377,6 +368,118 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// bestMatchingSession scans session rows (as returned by `sqlite3 -json`) for the
+// most recently updated session belonging to the given project. Session fields may
+// live in top-level columns or be nested inside a JSON blob column (commonly named
+// "data"), depending on the OpenCode version, so both shapes are checked.
+func bestMatchingSession(rows []map[string]json.RawMessage, projectID, projectPath string) (string, time.Time, bool) {
+	var bestID string
+	var bestOrder float64
+	var bestTime time.Time
+	found := false
+
+	for _, row := range rows {
+		rowID := stringField(row, "id", "sessionID", "session_id")
+		if rowID == "" {
+			continue
+		}
+
+		fields := row
+		if dataRaw, exists := row["data"]; exists {
+			var nested map[string]json.RawMessage
+			if json.Unmarshal(dataRaw, &nested) == nil {
+				merged := make(map[string]json.RawMessage, len(row)+len(nested))
+				for k, v := range nested {
+					merged[k] = v
+				}
+				for k, v := range row {
+					merged[k] = v
+				}
+				fields = merged
+			}
+		}
+
+		pid := stringField(fields, "project_id", "projectID", "projectId")
+		dir := stringField(fields, "directory", "cwd", "path")
+
+		matched := pid != "" && pid == projectID
+		if !matched && dir != "" {
+			matched = agent.PathsEqual(dir, projectPath)
+		}
+		if !matched {
+			continue
+		}
+
+		order := numericField(fields, "time_updated", "time_created", "updated", "created")
+
+		if !found || order >= bestOrder {
+			bestID = rowID
+			bestOrder = order
+			bestTime = epochToTime(order)
+			found = true
+		}
+	}
+
+	return bestID, bestTime, found
+}
+
+// stringField returns the first non-empty string value found in fields for
+// any of the given keys, checked in order.
+func stringField(fields map[string]json.RawMessage, keys ...string) string {
+	for _, k := range keys {
+		raw, exists := fields[k]
+		if !exists {
+			continue
+		}
+		var s string
+		if json.Unmarshal(raw, &s) == nil && s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// numericField returns the first numeric value found in fields for any of the
+// given keys. It also handles nested time objects shaped like
+// {"created": N, "updated": N}, which some OpenCode versions use.
+func numericField(fields map[string]json.RawMessage, keys ...string) float64 {
+	for _, k := range keys {
+		raw, exists := fields[k]
+		if !exists {
+			continue
+		}
+		var n float64
+		if json.Unmarshal(raw, &n) == nil {
+			return n
+		}
+		var nested map[string]json.RawMessage
+		if json.Unmarshal(raw, &nested) == nil {
+			for _, nk := range []string{"updated", "created"} {
+				if nv, exists := nested[nk]; exists {
+					var f float64
+					if json.Unmarshal(nv, &f) == nil {
+						return f
+					}
+				}
+			}
+		}
+	}
+	return 0
+}
+
+// epochToTime converts a numeric timestamp field to a time.Time. OpenCode has
+// used both Unix seconds and Unix milliseconds across versions, so this picks
+// the unit based on magnitude.
+func epochToTime(v float64) time.Time {
+	if v <= 0 {
+		return time.Time{}
+	}
+	if v > 1e12 {
+		return time.UnixMilli(int64(v))
+	}
+	return time.Unix(int64(v), 0)
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -454,7 +557,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +599,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
