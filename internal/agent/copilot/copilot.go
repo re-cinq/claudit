@@ -160,6 +160,18 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 		}
 	}
 
+	// Cache a copy of the transcript while the session is still live. Some
+	// Copilot CLI versions clean up the session-state directory once the
+	// process exits, so scanForRecentSession alone can no longer find
+	// anything once the agent has finished running (e.g. a manual commit
+	// made a few seconds after the agent's session ended). Snapshotting the
+	// transcript into the project's own .shiftlog directory on every hook
+	// invocation keeps a copy available for the post-commit "store --manual"
+	// flow regardless of how Copilot manages its own session-state storage.
+	if sessionID != "" && transcriptPath != "" {
+		cacheSessionSnapshot(hook.CWD, sessionID, transcriptPath)
+	}
+
 	return &agent.HookData{
 		SessionID:      sessionID,
 		TranscriptPath: transcriptPath,
@@ -228,6 +240,13 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 
 // DiscoverSession finds an active or recent Copilot CLI session.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	// Prefer a snapshot cached by ParseHookInput during the live session:
+	// some Copilot CLI versions remove their own session-state directory
+	// once the process exits, which would make scanForRecentSession unable
+	// to find anything for a manual commit made after the session ended.
+	if info, err := discoverFromCache(projectPath); err == nil && info != nil {
+		return info, nil
+	}
 	return scanForRecentSession(projectPath)
 }
 
@@ -472,4 +491,35 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	}, nil
 }
 
+// copilotCacheDirName is where live-session snapshots are cached under the
+// project root, keyed by session ID.
+const copilotCacheDirName = "copilot-sessions"
 
+// cacheSessionSnapshot copies a live session's transcript into the project's
+// .shiftlog directory so it remains available even if Copilot CLI removes
+// its own session-state directory once the process exits. Best-effort: any
+// failure here is silently ignored so it never disrupts the hook flow.
+func cacheSessionSnapshot(projectPath, sessionID, transcriptPath string) {
+	if projectPath == "" || sessionID == "" || transcriptPath == "" {
+		return
+	}
+
+	data, err := os.ReadFile(transcriptPath)
+	if err != nil {
+		return
+	}
+
+	dir := filepath.Join(projectPath, ".shiftlog", copilotCacheDirName)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return
+	}
+
+	_ = os.WriteFile(filepath.Join(dir, sessionID+".jsonl"), data, 0600)
+}
+
+// discoverFromCache looks for a session transcript snapshot cached by
+// ParseHookInput under .shiftlog/copilot-sessions.
+func discoverFromCache(projectPath string) (*agent.SessionInfo, error) {
+	dir := filepath.Join(projectPath, ".shiftlog", copilotCacheDirName)
+	return agent.ScanDirForRecentSession(dir, ".jsonl", nil, projectPath)
+}

@@ -229,9 +229,23 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 	return &agent.Transcript{Entries: entries}, nil
 }
 
+// opencodeCacheDirName is where live-session snapshots (written by the
+// shiftlog plugin on every tool call) are cached under the project root.
+const opencodeCacheDirName = "opencode-sessions"
+
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first checks the snapshot cache written by the shiftlog plugin, then
+// falls back to flat file storage (pre-v1.2), then SQLite (v1.2+).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	// Prefer a snapshot cached live by the shiftlog plugin: newer OpenCode
+	// CLI versions don't reliably leave a discoverable trace of a finished
+	// session in their own on-disk/SQLite storage once the process exits
+	// (e.g. one-shot "opencode run" invocations), which would otherwise
+	// break discovery for a manual commit made after the session ends.
+	if info, err := discoverFromCache(projectPath); err == nil && info != nil {
+		return info, nil
+	}
+
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
@@ -249,6 +263,13 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 
 	projectID := GetProjectID(projectPath)
 	return discoverFromSQLite(dataDir, projectID, projectPath)
+}
+
+// discoverFromCache looks for a session snapshot written by the shiftlog
+// plugin under .shiftlog/opencode-sessions.
+func discoverFromCache(projectPath string) (*agent.SessionInfo, error) {
+	dir := filepath.Join(projectPath, ".shiftlog", opencodeCacheDirName)
+	return agent.ScanDirForRecentSession(dir, ".json", nil, projectPath)
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -454,7 +475,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +517,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
