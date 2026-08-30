@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -231,24 +232,32 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 
 // DiscoverSession finds an active or recent OpenCode session.
 // It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+//
+// OpenCode CLI (observed from ~1.14.x onward) can persist session/message data
+// asynchronously after the "opencode run" process exits, so a session that just
+// completed may not be discoverable the instant this is called from a git
+// post-commit hook. RetryDiscoverSession gives that flush a short, bounded
+// window to land before giving up.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	// Try flat file storage first (pre-v1.2 OpenCode)
-	session, err := a.discoverFromFlatFiles(projectPath)
-	if err != nil {
-		return nil, err
-	}
-	if session != nil {
-		return session, nil
-	}
+	return agent.RetryDiscoverSession(func() (*agent.SessionInfo, error) {
+		// Try flat file storage first (pre-v1.2 OpenCode)
+		session, err := a.discoverFromFlatFiles(projectPath)
+		if err != nil {
+			return nil, err
+		}
+		if session != nil {
+			return session, nil
+		}
 
-	// Fall back to SQLite (OpenCode v1.2+)
-	dataDir, err := GetDataDir()
-	if err != nil {
-		return nil, nil
-	}
+		// Fall back to SQLite (OpenCode v1.2+)
+		dataDir, err := GetDataDir()
+		if err != nil {
+			return nil, nil
+		}
 
-	projectID := GetProjectID(projectPath)
-	return discoverFromSQLite(dataDir, projectID, projectPath)
+		projectID := GetProjectID(projectPath)
+		return discoverFromSQLite(dataDir, projectID, projectPath)
+	})
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -454,7 +463,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +505,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```

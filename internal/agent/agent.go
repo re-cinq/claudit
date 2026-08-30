@@ -1,3 +1,4 @@
+```go
 package agent
 
 import (
@@ -12,6 +13,37 @@ import (
 // RecentSessionTimeout is the default timeout for considering a session "recent"
 // during session discovery across all agents.
 const RecentSessionTimeout = 5 * time.Minute
+
+// sessionDiscoveryRetries and sessionDiscoveryRetryDelay bound the retry loop in
+// RetryDiscoverSession. Some agent CLIs (observed with newer Copilot CLI and
+// OpenCode CLI releases) flush session state to disk asynchronously after their
+// process exits, so a session that was just active may not be discoverable the
+// instant a git post-commit hook runs. A short, bounded retry lets that flush land
+// without meaningfully slowing down commits that have no active agent session.
+const (
+	sessionDiscoveryRetries    = 3
+	sessionDiscoveryRetryDelay = 250 * time.Millisecond
+)
+
+// RetryDiscoverSession calls discover up to a few times with a short delay between
+// attempts, returning as soon as a session is found. It exists because some agent
+// CLIs persist session state asynchronously, so discovery immediately after the
+// agent process exits can race with that flush (see the retry constants above).
+func RetryDiscoverSession(discover func() (*SessionInfo, error)) (*SessionInfo, error) {
+	var lastErr error
+	for attempt := 0; attempt < sessionDiscoveryRetries; attempt++ {
+		session, err := discover()
+		if err != nil {
+			lastErr = err
+		} else if session != nil {
+			return session, nil
+		}
+		if attempt < sessionDiscoveryRetries-1 {
+			time.Sleep(sessionDiscoveryRetryDelay)
+		}
+	}
+	return nil, lastErr
+}
 
 // IsGitCommitCommand checks whether a shell command string represents a git commit.
 func IsGitCommitCommand(command string) bool {
@@ -236,3 +268,4 @@ type Agent interface {
 	// Rendering: map tool names for display
 	ToolAliases() map[string]string
 }
+```

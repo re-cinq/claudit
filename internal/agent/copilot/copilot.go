@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -227,8 +228,15 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent Copilot CLI session.
+//
+// Copilot CLI (observed from ~1.0.82 onward) can flush session state to disk
+// asynchronously after the process exits, so a session that just completed may
+// not be discoverable the instant this is called from a git post-commit hook.
+// RetryDiscoverSession gives that flush a short, bounded window to land.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	return scanForRecentSession(projectPath)
+	return agent.RetryDiscoverSession(func() (*agent.SessionInfo, error) {
+		return scanForRecentSession(projectPath)
+	})
 }
 
 // RestoreSession writes a transcript to Copilot CLI's expected location.
@@ -471,5 +479,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
