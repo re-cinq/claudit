@@ -410,6 +410,9 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+// Sessions whose workspace.yaml can't be resolved to a working directory (e.g. because a newer
+// Copilot CLI release renamed the field) are still considered candidates rather than skipped
+// outright, since ruling out a session on missing metadata is worse than a best-effort match.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -449,7 +452,11 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		// Only rule the session out when we positively know its working
+		// directory and it doesn't match. If the CLI's metadata format
+		// changed and no working directory could be determined, keep it as
+		// a candidate rather than discarding it.
+		if meta.CWD != "" && !agent.PathsEqual(meta.CWD, projectPath) {
 			continue
 		}
 
@@ -471,5 +478,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-

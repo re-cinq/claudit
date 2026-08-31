@@ -15,6 +15,10 @@ type sessionMeta struct {
 	GitRoot string `yaml:"git_root,omitempty"`
 }
 
+// cwdKeyAliases are alternate keys Copilot CLI has used across versions to
+// record the session's working directory in workspace.yaml.
+var cwdKeyAliases = []string{"cwd", "dir", "directory", "workingDirectory", "working_directory", "project_dir", "workspace", "path", "root"}
+
 // GetCopilotDir returns the path to Copilot's config/data directory.
 func GetCopilotDir() (string, error) {
 	home, err := os.UserHomeDir()
@@ -44,6 +48,21 @@ func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 	var meta sessionMeta
 	if err := yaml.Unmarshal(data, &meta); err != nil {
 		return nil, err
+	}
+
+	// Copilot CLI has used different field names for the working directory
+	// across releases. Fall back to scanning known aliases so session
+	// discovery keeps working when the canonical "cwd" key isn't present.
+	if meta.CWD == "" {
+		var raw map[string]interface{}
+		if err := yaml.Unmarshal(data, &raw); err == nil {
+			for _, key := range cwdKeyAliases {
+				if v, ok := raw[key].(string); ok && v != "" {
+					meta.CWD = v
+					break
+				}
+			}
+		}
 	}
 
 	return &meta, nil
@@ -81,4 +100,3 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-
