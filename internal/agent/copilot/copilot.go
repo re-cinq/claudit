@@ -20,7 +20,7 @@ func init() {
 // Agent implements the agent.Agent interface for GitHub Copilot CLI.
 type Agent struct{}
 
-func (a *Agent) Name() agent.Name   { return agent.Copilot }
+func (a *Agent) Name() agent.Name    { return agent.Copilot }
 func (a *Agent) DisplayName() string { return "Copilot CLI" }
 
 // ConfigureHooks sets up Copilot CLI hooks in .github/hooks/shiftlog.json.
@@ -119,10 +119,10 @@ func (a *Agent) DiagnoseHooks(repoRoot string) []agent.DiagnosticCheck {
 func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 	var hook struct {
 		// Generic format fields
-		SessionID      string `json:"session_id"`
-		TranscriptPath string `json:"transcript_path"`
+		SessionID       string `json:"session_id"`
+		TranscriptPath  string `json:"transcript_path"`
 		GenericToolName string `json:"tool_name"`
-		ToolInput      struct {
+		ToolInput       struct {
 			Command string `json:"command"`
 		} `json:"tool_input"`
 
@@ -410,6 +410,12 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// It prefers a session whose recorded CWD matches projectPath, but falls back to the most
+// recently modified session directory (using the directory name as the session ID, which is
+// how WriteSessionFile names them) when no confirmed match is found. Recent Copilot CLI
+// releases have changed workspace.yaml's shape without notice, so metadata that fails to
+// parse (or lacks a usable CWD) must not prevent discovery of a session that was just created.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -423,9 +429,12 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
+
+	var matchDir, matchSessionID string
+	var matchModTime time.Time
+
+	var fallbackDir, fallbackSessionID string
+	var fallbackModTime time.Time
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -442,10 +451,18 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
+
+		// Every recent session directory is a candidate for the recency fallback,
+		// regardless of whether its metadata can be read.
+		if fallbackDir == "" || modTime.After(fallbackModTime) {
+			fallbackDir = entryPath
+			fallbackSessionID = entry.Name()
+			fallbackModTime = modTime
+		}
+
 		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
+		if err != nil || meta == nil || meta.CWD == "" {
 			continue
 		}
 
@@ -453,11 +470,21 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+		sessionID := meta.ID
+		if sessionID == "" {
+			sessionID = entry.Name()
 		}
+
+		if matchDir == "" || modTime.After(matchModTime) {
+			matchDir = entryPath
+			matchSessionID = sessionID
+			matchModTime = modTime
+		}
+	}
+
+	bestDir, bestSessionID, bestModTime := matchDir, matchSessionID, matchModTime
+	if bestDir == "" {
+		bestDir, bestSessionID, bestModTime = fallbackDir, fallbackSessionID, fallbackModTime
 	}
 
 	if bestDir == "" {
@@ -471,5 +498,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
