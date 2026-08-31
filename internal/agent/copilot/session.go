@@ -24,13 +24,27 @@ func GetCopilotDir() (string, error) {
 	return filepath.Join(home, ".copilot"), nil
 }
 
-// GetSessionStateDir returns the session state directory.
+// GetSessionStateDir returns the session state directory used while a
+// Copilot CLI process is actively running.
 func GetSessionStateDir() (string, error) {
 	copilotDir, err := GetCopilotDir()
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(copilotDir, "session-state"), nil
+}
+
+// GetHistorySessionStateDir returns the directory Copilot CLI persists
+// session state to once a session has completed (used for `--resume`).
+// Manual, post-exit session discovery needs to check this location too,
+// since session-state may no longer hold the session by the time a
+// post-commit hook runs.
+func GetHistorySessionStateDir() (string, error) {
+	copilotDir, err := GetCopilotDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(copilotDir, "history-session-state"), nil
 }
 
 // parseSessionMeta reads a workspace.yaml from a Copilot session directory.
@@ -81,4 +95,3 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-

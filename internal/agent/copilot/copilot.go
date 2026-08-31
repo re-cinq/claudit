@@ -227,8 +227,28 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent Copilot CLI session.
+// Manual (post-commit hook) discovery runs after the Copilot CLI process
+// has already exited, so the session may still be mid-flush to disk (or
+// mid-move from the live session-state directory to the persisted history
+// directory). Retry briefly to absorb that delay before giving up.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	return scanForRecentSession(projectPath)
+	const maxAttempts = 5
+	const retryDelay = 400 * time.Millisecond
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(retryDelay)
+		}
+		session, err := scanForRecentSession(projectPath)
+		if err != nil {
+			return nil, err
+		}
+		if session != nil {
+			return session, nil
+		}
+	}
+
+	return nil, nil
 }
 
 // RestoreSession writes a transcript to Copilot CLI's expected location.
@@ -409,15 +429,25 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
-// scanForRecentSession scans Copilot's session state directory for recent session directories.
+// scanForRecentSession scans Copilot's session state directories for recent
+// session directories.
+//
+// Copilot CLI keeps live session state under session-state while a process
+// is actively running, but persists completed sessions to
+// history-session-state (the location `copilot --resume` reads from). Manual
+// (post-commit hook) discovery runs after the CLI has already exited, so it
+// must check both locations — session-state alone is not reliable once the
+// process has finished.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionStateDir()
-	if err != nil {
-		return nil, nil
+	var candidateDirs []string
+	if dir, err := GetSessionStateDir(); err == nil {
+		candidateDirs = append(candidateDirs, dir)
+	}
+	if dir, err := GetHistorySessionStateDir(); err == nil {
+		candidateDirs = append(candidateDirs, dir)
 	}
 
-	entries, err := os.ReadDir(sessionDir)
-	if err != nil {
+	if len(candidateDirs) == 0 {
 		return nil, nil
 	}
 
@@ -427,36 +457,43 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-
-		info, err := entry.Info()
+	for _, sessionDir := range candidateDirs {
+		entries, err := os.ReadDir(sessionDir)
 		if err != nil {
 			continue
 		}
 
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
 
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
-		}
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
-		}
+			modTime := info.ModTime()
+			if now.Sub(modTime) > recentTimeout {
+				continue
+			}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+			// Check if this session directory has a workspace.yaml
+			entryPath := filepath.Join(sessionDir, entry.Name())
+			meta, err := parseSessionMeta(entryPath)
+			if err != nil || meta == nil {
+				continue
+			}
+
+			if !agent.PathsEqual(meta.CWD, projectPath) {
+				continue
+			}
+
+			if bestDir == "" || modTime.After(bestModTime) {
+				bestDir = entryPath
+				bestSessionID = meta.ID
+				bestModTime = modTime
+			}
 		}
 	}
 
@@ -471,5 +508,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
