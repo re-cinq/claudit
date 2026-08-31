@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -150,6 +151,7 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 
 	sessionID := hook.SessionID
 	transcriptPath := hook.TranscriptPath
+	var transcriptData []byte
 
 	// If no session info from generic fields, try CWD-based discovery
 	if sessionID == "" && hook.CWD != "" {
@@ -157,6 +159,7 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 		if err == nil && si != nil {
 			sessionID = si.SessionID
 			transcriptPath = si.TranscriptPath
+			transcriptData = si.TranscriptData
 		}
 	}
 
@@ -165,6 +168,7 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 		TranscriptPath: transcriptPath,
 		ToolName:       toolName,
 		Command:        command,
+		TranscriptData: transcriptData,
 	}, nil
 }
 
@@ -464,12 +468,95 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		return nil, nil
 	}
 
+	// Newer Copilot CLI versions no longer write an events.jsonl file into the
+	// session directory; the full turn transcript instead lives in the SQLite
+	// session-store.db under ~/.copilot. Fall back to querying it when the
+	// legacy transcript file is absent.
+	transcriptPath := GetTranscriptPath(bestDir)
+	if _, statErr := os.Stat(transcriptPath); statErr != nil {
+		if data, dbErr := transcriptFromSessionStore(bestSessionID); dbErr == nil && len(data) > 0 {
+			return &agent.SessionInfo{
+				SessionID:      bestSessionID,
+				StartedAt:      bestModTime.Format(time.RFC3339),
+				ProjectPath:    projectPath,
+				TranscriptData: data,
+			}, nil
+		}
+	}
+
 	return &agent.SessionInfo{
 		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
+		TranscriptPath: transcriptPath,
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
 
+// transcriptFromSessionStore reconstructs a transcript for sessionID from
+// Copilot's SQLite session store (session-store.db). Newer Copilot CLI
+// versions record each conversation turn in a "turns" table (session_id,
+// turn_index, user_message, assistant_response) instead of writing a
+// per-session events.jsonl file. The returned bytes are shaped as
+// events.jsonl-compatible JSONL so they can flow through the existing
+// parseCopilotTranscript parser unchanged.
+func transcriptFromSessionStore(sessionID string) ([]byte, error) {
+	dbPath, err := GetSessionStoreDBPath()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, err
+	}
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		return nil, fmt.Errorf("sqlite3 not available")
+	}
 
+	query := fmt.Sprintf(
+		`SELECT json_group_array(json_object('turn_index', turn_index, 'user_message', user_message, 'assistant_response', assistant_response)) FROM turns WHERE session_id='%s' ORDER BY turn_index;`,
+		strings.ReplaceAll(sessionID, "'", "''"),
+	)
+	cmd := exec.Command("sqlite3", dbPath, query)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	raw := strings.TrimSpace(string(out))
+	if raw == "" || raw == "[null]" || raw == "[]" {
+		return nil, fmt.Errorf("no turns found for session %s", sessionID)
+	}
+
+	var turns []struct {
+		TurnIndex         int    `json:"turn_index"`
+		UserMessage       string `json:"user_message"`
+		AssistantResponse string `json:"assistant_response"`
+	}
+	if err := json.Unmarshal([]byte(raw), &turns); err != nil {
+		return nil, err
+	}
+
+	var lines []string
+	for _, t := range turns {
+		if t.UserMessage != "" {
+			if ev, err := json.Marshal(copilotEvent{
+				Type: "user.message",
+				Data: copilotEventData{Content: t.UserMessage},
+			}); err == nil {
+				lines = append(lines, string(ev))
+			}
+		}
+		if t.AssistantResponse != "" {
+			if ev, err := json.Marshal(copilotEvent{
+				Type: "assistant.message",
+				Data: copilotEventData{Message: t.AssistantResponse},
+			}); err == nil {
+				lines = append(lines, string(ev))
+			}
+		}
+	}
+	if len(lines) == 0 {
+		return nil, fmt.Errorf("no messages in session turns for session %s", sessionID)
+	}
+
+	return []byte(strings.Join(lines, "\n")), nil
+}
