@@ -33,7 +33,33 @@ func GetSessionStateDir() (string, error) {
 	return filepath.Join(copilotDir, "session-state"), nil
 }
 
+// extractString looks up the first matching key (checked in order) in m whose
+// value is a non-empty string. Copilot CLI releases have varied where fields
+// like the working directory live in workspace.yaml (top-level vs. nested
+// under a "workspace"/"session" key, snake_case vs. camelCase), so this also
+// searches nested maps rather than assuming a fixed shape.
+func extractString(m map[string]interface{}, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			if s, ok := v.(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	for _, v := range m {
+		if nested, ok := v.(map[string]interface{}); ok {
+			if s := extractString(nested, keys...); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
 // parseSessionMeta reads a workspace.yaml from a Copilot session directory.
+// The file is parsed generically (rather than into a fixed struct) so that
+// field renames/nesting changes across Copilot CLI versions don't break
+// session discovery.
 func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 	path := filepath.Join(sessionDir, "workspace.yaml")
 	data, err := os.ReadFile(path)
@@ -41,12 +67,16 @@ func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 		return nil, err
 	}
 
-	var meta sessionMeta
-	if err := yaml.Unmarshal(data, &meta); err != nil {
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, err
 	}
 
-	return &meta, nil
+	return &sessionMeta{
+		ID:      extractString(raw, "id", "session_id", "sessionId", "sessionID"),
+		CWD:     extractString(raw, "cwd", "working_dir", "workingDirectory", "directory", "workspace_path", "workspacePath", "path"),
+		GitRoot: extractString(raw, "git_root", "gitRoot", "repo_root", "repoRoot"),
+	}, nil
 }
 
 // GetTranscriptPath returns the path to the events.jsonl transcript within a session directory.
@@ -81,4 +111,3 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-
