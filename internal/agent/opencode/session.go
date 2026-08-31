@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -81,6 +82,46 @@ type sessionInfo struct {
 	Title     string `json:"title,omitempty"`
 }
 
+// parseSessionInfoFields extracts the session id and directory from a
+// session info JSON blob. OpenCode has changed both its on-disk layout and
+// some field names across versions, so besides the primary sessionInfo
+// struct tags we also probe a handful of alternate key names before giving
+// up on a file.
+func parseSessionInfoFields(data []byte) (id, directory string, ok bool) {
+	var meta sessionInfo
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return "", "", false
+	}
+
+	id = meta.ID
+	directory = meta.Directory
+
+	if id == "" || directory == "" {
+		var raw map[string]interface{}
+		if err := json.Unmarshal(data, &raw); err == nil {
+			if id == "" {
+				id = firstStringField(raw, "id", "sessionID", "session_id", "sessionId")
+			}
+			if directory == "" {
+				directory = firstStringField(raw, "directory", "cwd", "path", "workingDirectory", "working_directory", "root")
+			}
+		}
+	}
+
+	return id, directory, id != "" && directory != ""
+}
+
+// firstStringField returns the first non-empty string value found in raw
+// under any of the given keys.
+func firstStringField(raw map[string]interface{}, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := raw[k].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // WriteSessionFile writes a session and its messages to OpenCode's storage.
 func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (string, error) {
 	sessionDir, err := GetSessionDir(projectPath)
@@ -127,3 +168,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
