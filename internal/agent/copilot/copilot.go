@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -409,67 +410,153 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
-// scanForRecentSession scans Copilot's session state directory for recent session directories.
-func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionStateDir()
-	if err != nil {
-		return nil, nil
-	}
+// maxSessionScanDepth bounds how many directory levels the session scan will
+// descend into, in case a Copilot CLI version buckets sessions into
+// subdirectories (e.g. by date) instead of storing them flat under the
+// session state directory.
+const maxSessionScanDepth = 3
 
-	entries, err := os.ReadDir(sessionDir)
-	if err != nil {
-		return nil, nil
+// sessionCandidate is a discovered Copilot session directory.
+type sessionCandidate struct {
+	sessionDir string
+	sessionID  string
+	cwd        string
+	modTime    time.Time
+}
+
+// scanForRecentSession scans Copilot's session state directory (or directories,
+// since the directory name and layout have changed across CLI versions) for a
+// recent session belonging to projectPath.
+func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
+	dirs := CandidateSessionStateDirs()
+	if len(dirs) == 0 {
+		if def, err := GetSessionStateDir(); err == nil {
+			dirs = []string{def}
+		}
 	}
 
 	now := time.Now()
-	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
+	var candidates []sessionCandidate
+	for _, dir := range dirs {
+		candidates = append(candidates, findSessionCandidates(dir, now)...)
+	}
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	var best *sessionCandidate
+	for i := range candidates {
+		c := &candidates[i]
+		if c.cwd == "" || !agent.PathsEqual(c.cwd, projectPath) {
 			continue
 		}
-
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
-
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
-		}
-
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
-		}
-
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+		if best == nil || c.modTime.After(best.modTime) {
+			best = c
 		}
 	}
 
-	if bestDir == "" {
+	// If no session's recorded CWD matches (e.g. the field was renamed or
+	// removed by a newer CLI version), fall back to the single unambiguous
+	// candidate rather than giving up entirely.
+	if best == nil && len(candidates) == 1 {
+		best = &candidates[0]
+	}
+
+	if best == nil {
 		return nil, nil
 	}
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
+		SessionID:      best.sessionID,
+		TranscriptPath: findTranscriptFile(best.sessionDir),
+		StartedAt:      best.modTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
 
+// findSessionCandidates walks dir (up to maxSessionScanDepth levels) looking
+// for session metadata files and returns one candidate per file found that is
+// recent enough to be relevant.
+func findSessionCandidates(dir string, now time.Time) []sessionCandidate {
+	var candidates []sessionCandidate
 
+	walkSessionDirs(dir, 0, func(sessionDir, metaPath string) {
+		var modTime time.Time
+		if info, err := os.Stat(metaPath); err == nil {
+			modTime = info.ModTime()
+		}
+		if dirInfo, err := os.Stat(sessionDir); err == nil && dirInfo.ModTime().After(modTime) {
+			modTime = dirInfo.ModTime()
+		}
+		if modTime.IsZero() || now.Sub(modTime) > agent.RecentSessionTimeout {
+			return
+		}
+
+		meta, err := parseSessionMetaFile(metaPath)
+		if err != nil || meta == nil || meta.ID == "" {
+			return
+		}
+
+		candidates = append(candidates, sessionCandidate{
+			sessionDir: sessionDir,
+			sessionID:  meta.ID,
+			cwd:        meta.CWD,
+			modTime:    modTime,
+		})
+	})
+
+	return candidates
+}
+
+// walkSessionDirs recursively visits dir, up to maxSessionScanDepth levels
+// deep, invoking fn with the containing directory and path of every session
+// metadata file it finds.
+func walkSessionDirs(dir string, depth int, fn func(sessionDir, metaPath string)) {
+	if depth > maxSessionScanDepth {
+		return
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+
+	for _, entry := range entries {
+		name := entry.Name()
+		full := filepath.Join(dir, name)
+
+		if entry.IsDir() {
+			walkSessionDirs(full, depth+1, fn)
+			continue
+		}
+
+		for _, metaName := range sessionMetaFileNames {
+			if name == metaName {
+				fn(dir, full)
+				break
+			}
+		}
+	}
+}
+
+// findTranscriptFile returns the events transcript file within a session
+// directory, tolerating filename changes across Copilot CLI versions.
+func findTranscriptFile(sessionDir string) string {
+	def := GetTranscriptPath(sessionDir)
+	if _, err := os.Stat(def); err == nil {
+		return def
+	}
+
+	entries, err := os.ReadDir(sessionDir)
+	if err != nil {
+		return def
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".jsonl") {
+			return filepath.Join(sessionDir, entry.Name())
+		}
+	}
+	return def
+}
+```
