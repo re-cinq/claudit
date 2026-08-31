@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -89,6 +90,7 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 		ToolName:       hook.ToolName,
 		Command:        hook.ToolInput.Command,
 		TranscriptData: transcriptData,
+		ProjectPath:    hook.ProjectDir,
 	}, nil
 }
 
@@ -230,8 +232,18 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first checks the active-session marker (written by ParseHookInput on the
+// most recent hook call), then tries flat file storage (pre-v1.2), then falls
+// back to SQLite (v1.2+).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	// Prefer the marker over reconstructing OpenCode's storage layout: the
+	// project-ID/session-directory scheme below has already changed across
+	// versions and isn't a stable contract, whereas the marker is written by
+	// shiftlog itself from data the plugin hands us directly.
+	if info := agent.DiscoverFromActiveSessionMarker(projectPath); info != nil {
+		return info, nil
+	}
+
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
@@ -454,7 +466,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +508,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```

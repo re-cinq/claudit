@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -165,6 +166,7 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 		TranscriptPath: transcriptPath,
 		ToolName:       toolName,
 		Command:        command,
+		ProjectPath:    hook.CWD,
 	}, nil
 }
 
@@ -228,6 +230,13 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 
 // DiscoverSession finds an active or recent Copilot CLI session.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	// Prefer the marker recorded by ParseHookInput on the most recent hook call:
+	// Copilot's own session-state storage is not guaranteed to still reflect the
+	// session once the CLI process has exited (e.g. by the time a manual commit's
+	// post-commit hook runs), and its on-disk layout has changed across versions.
+	if info := agent.DiscoverFromActiveSessionMarker(projectPath); info != nil {
+		return info, nil
+	}
 	return scanForRecentSession(projectPath)
 }
 
@@ -471,5 +480,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```

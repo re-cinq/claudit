@@ -1,3 +1,4 @@
+```go
 package agent
 
 import (
@@ -193,6 +194,7 @@ type HookData struct {
 	ToolName       string
 	Command        string
 	TranscriptData []byte // inline transcript data (e.g. from OpenCode plugin SDK)
+	ProjectPath    string // project/working directory, when the hook payload provides one
 }
 
 // SessionInfo represents a discovered active session.
@@ -202,6 +204,90 @@ type SessionInfo struct {
 	StartedAt      string
 	ProjectPath    string
 	TranscriptData []byte // inline transcript data (e.g. from SQLite discovery)
+}
+
+// ActiveSessionMarker is a lightweight, first-party pointer to "the session that
+// was active in this project a moment ago", written to .shiftlog/active-session.json
+// whenever an agent's hook fires.
+//
+// Agents like Copilot and OpenCode expose no session lifecycle hook (only
+// per-tool-call hooks), and their own on-disk session storage format/location is
+// not a stable contract - it has changed across CLI versions and may again. A
+// manual `git commit` (captured by shiftlog's post-commit hook, which runs
+// *after* the agent process has already exited) has no way to ask the agent
+// where its session went. Recording this marker on every hook invocation - not
+// just on commits - gives `store --manual` a reliable, version-independent way
+// to find the session, mirroring the pattern Claude already uses via its
+// SessionStart/SessionEnd hooks.
+type ActiveSessionMarker struct {
+	SessionID      string `json:"session_id"`
+	TranscriptPath string `json:"transcript_path"`
+	StartedAt      string `json:"started_at"`
+	ProjectPath    string `json:"project_path"`
+}
+
+// activeSessionMarkerPath returns the path to the active session marker file
+// for the given project.
+func activeSessionMarkerPath(projectPath string) string {
+	return filepath.Join(projectPath, ".shiftlog", "active-session.json")
+}
+
+// WriteActiveSessionMarker records the currently active session for projectPath
+// so a later `store --manual` invocation can find it. Best-effort: failures are
+// silently ignored since this is only ever a fallback for session discovery.
+func WriteActiveSessionMarker(projectPath, sessionID, transcriptPath string) {
+	if projectPath == "" || sessionID == "" {
+		return
+	}
+
+	marker := ActiveSessionMarker{
+		SessionID:      sessionID,
+		TranscriptPath: transcriptPath,
+		StartedAt:      time.Now().Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}
+
+	data, err := json.Marshal(&marker)
+	if err != nil {
+		return
+	}
+
+	path := activeSessionMarkerPath(projectPath)
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return
+	}
+	_ = os.WriteFile(path, data, 0600)
+}
+
+// DiscoverFromActiveSessionMarker reads the marker written by
+// WriteActiveSessionMarker, returning nil if it is absent, for a different
+// project, or stale (older than RecentSessionTimeout).
+func DiscoverFromActiveSessionMarker(projectPath string) *SessionInfo {
+	data, err := os.ReadFile(activeSessionMarkerPath(projectPath))
+	if err != nil {
+		return nil
+	}
+
+	var marker ActiveSessionMarker
+	if err := json.Unmarshal(data, &marker); err != nil {
+		return nil
+	}
+
+	if marker.SessionID == "" || !PathsEqual(marker.ProjectPath, projectPath) {
+		return nil
+	}
+
+	startedAt, err := time.Parse(time.RFC3339, marker.StartedAt)
+	if err != nil || time.Since(startedAt) > RecentSessionTimeout {
+		return nil
+	}
+
+	return &SessionInfo{
+		SessionID:      marker.SessionID,
+		TranscriptPath: marker.TranscriptPath,
+		StartedAt:      marker.StartedAt,
+		ProjectPath:    marker.ProjectPath,
+	}
 }
 
 // Agent defines the interface that each coding agent CLI must implement.
@@ -236,3 +322,4 @@ type Agent interface {
 	// Rendering: map tool names for display
 	ToolAliases() map[string]string
 }
+```

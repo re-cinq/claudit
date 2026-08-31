@@ -1,3 +1,4 @@
+```go
 package cmd
 
 import (
@@ -91,6 +92,16 @@ func runHookStore() error {
 	}
 
 	cli.LogDebug("store: tool=%s command=%q session=%s", hookData.ToolName, hookData.Command, hookData.SessionID)
+
+	// Opportunistically record the active session for this project, regardless
+	// of whether this particular tool call is a commit. Some agents (Copilot,
+	// OpenCode) have no dedicated session-lifecycle hook and their own on-disk
+	// session storage isn't a stable format to scan after the process exits, so
+	// this hook call may be the only chance to durably capture "which session is
+	// active here" for a later `store --manual` (post-commit hook) to use.
+	if hookData.ProjectPath != "" && hookData.SessionID != "" {
+		agent.WriteActiveSessionMarker(hookData.ProjectPath, hookData.SessionID, hookData.TranscriptPath)
+	}
 
 	// Check if this is a git commit command
 	if !ag.IsCommitCommand(hookData.ToolName, hookData.Command) {
@@ -290,3 +301,4 @@ func readTranscriptData(path string) ([]byte, error) {
 
 	return json.Marshal(messages)
 }
+```
