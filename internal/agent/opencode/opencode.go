@@ -230,7 +230,12 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+),
+// then finally falls back to scanning every project directory/session row. The
+// last fallback covers versions where OpenCode's own project identifier no
+// longer matches the git-root-commit hash we compute locally (mirroring the
+// Gemini agent's ScanAllProjectDirs resilience pattern for the same class of
+// upstream identifier drift).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
@@ -241,14 +246,21 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
+	// Fall back to SQLite (OpenCode v1.2+)
 	projectID := GetProjectID(projectPath)
-	return discoverFromSQLite(dataDir, projectID, projectPath)
+	if sqliteSession, err := discoverFromSQLite(dataDir, projectID, projectPath); err == nil && sqliteSession != nil {
+		return sqliteSession, nil
+	}
+
+	// Last resort: scan every project directory under session storage for a
+	// session whose recorded directory matches projectPath, in case the
+	// computed project ID doesn't match what OpenCode actually used.
+	return scanAllSessionDirs(dataDir, projectPath)
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -294,6 +306,80 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}
 
 	// The transcript path for OpenCode is the message directory
+	msgDir, _ := GetMessageDir(bestSessionID)
+
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: msgDir,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
+}
+
+// scanAllSessionDirs scans every project subdirectory under the session
+// storage directory for a recent session belonging to projectPath. Unlike
+// discoverFromFlatFiles, it doesn't assume the project directory name is the
+// git-root-commit hash we compute locally — it matches on each session file's
+// own recorded "directory" field when present, and otherwise just picks the
+// most recently modified recent session as a best effort.
+func scanAllSessionDirs(dataDir, projectPath string) (*agent.SessionInfo, error) {
+	baseDir := filepath.Join(dataDir, "storage", "session")
+	projectDirs, err := os.ReadDir(baseDir)
+	if err != nil {
+		return nil, nil
+	}
+
+	now := time.Now()
+	recentTimeout := agent.RecentSessionTimeout
+	var bestSessionID string
+	var bestModTime time.Time
+
+	for _, projectDir := range projectDirs {
+		if !projectDir.IsDir() {
+			continue
+		}
+
+		sessionFiles, err := os.ReadDir(filepath.Join(baseDir, projectDir.Name()))
+		if err != nil {
+			continue
+		}
+
+		for _, sf := range sessionFiles {
+			if sf.IsDir() || !strings.HasSuffix(sf.Name(), ".json") {
+				continue
+			}
+
+			info, err := sf.Info()
+			if err != nil {
+				continue
+			}
+
+			modTime := info.ModTime()
+			if now.Sub(modTime) > recentTimeout {
+				continue
+			}
+
+			filePath := filepath.Join(baseDir, projectDir.Name(), sf.Name())
+			if data, err := os.ReadFile(filePath); err == nil {
+				var meta sessionInfo
+				if err := json.Unmarshal(data, &meta); err == nil && meta.Directory != "" {
+					if !agent.PathsEqual(meta.Directory, projectPath) {
+						continue
+					}
+				}
+			}
+
+			if bestSessionID == "" || modTime.After(bestModTime) {
+				bestSessionID = strings.TrimSuffix(sf.Name(), ".json")
+				bestModTime = modTime
+			}
+		}
+	}
+
+	if bestSessionID == "" {
+		return nil, nil
+	}
+
 	msgDir, _ := GetMessageDir(bestSessionID)
 
 	return &agent.SessionInfo{
@@ -497,4 +583,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
