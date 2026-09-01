@@ -410,6 +410,14 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// Copilot CLI has changed the shape of workspace.yaml across releases, so a
+// session directory may be missing it, have it in an unexpected shape, or have
+// CWD/GitRoot values that no longer match the project path exactly. Rather than
+// silently finding nothing in that case, we prefer a directory whose metadata
+// matches the project, but fall back to the most recently modified session (that
+// actually has a transcript) within the timeout window - mirroring the
+// recency-only discovery already used for Claude/Gemini.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -423,9 +431,12 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
+
+	var bestMatchDir, bestMatchSessionID string
+	var bestMatchTime time.Time
+
+	var bestAnyDir, bestAnySessionID string
+	var bestAnyTime time.Time
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -442,22 +453,46 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
+
+		// A session directory is only useful to us if it has a transcript to store.
+		if _, err := os.Stat(GetTranscriptPath(entryPath)); err != nil {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
+		// The directory is named after the session ID, so we always have a
+		// usable ID even if workspace.yaml is missing or unparseable.
+		sessionID := entry.Name()
+		matched := false
+
+		if meta, err := parseSessionMeta(entryPath); err == nil && meta != nil {
+			if meta.ID != "" {
+				sessionID = meta.ID
+			}
+			if (meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)) ||
+				(meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath)) {
+				matched = true
+			}
 		}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+		if matched && (bestMatchDir == "" || modTime.After(bestMatchTime)) {
+			bestMatchDir = entryPath
+			bestMatchSessionID = sessionID
+			bestMatchTime = modTime
 		}
+
+		if bestAnyDir == "" || modTime.After(bestAnyTime) {
+			bestAnyDir = entryPath
+			bestAnySessionID = sessionID
+			bestAnyTime = modTime
+		}
+	}
+
+	bestDir, bestSessionID, bestModTime := bestMatchDir, bestMatchSessionID, bestMatchTime
+	if bestDir == "" {
+		// No directory had metadata that matched the project - fall back to the
+		// most recent session we saw rather than reporting no session at all.
+		bestDir, bestSessionID, bestModTime = bestAnyDir, bestAnySessionID, bestAnyTime
 	}
 
 	if bestDir == "" {
@@ -471,5 +506,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
