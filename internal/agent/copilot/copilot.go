@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -409,7 +410,14 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
-// scanForRecentSession scans Copilot's session state directory for recent session directories.
+// scanForRecentSession scans Copilot's session state directory for recent sessions.
+//
+// Newer Copilot CLI releases store each session as a single flat
+// "<sessionID>.json" file directly under the session-state directory (a
+// JSONL stream of events, despite the .json extension) instead of a
+// per-session directory containing workspace.yaml + events.jsonl. We check
+// both layouts: the flat-file layout used by the real CLI, and the legacy
+// directory layout still produced by our own RestoreSession/WriteSessionFile.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -423,53 +431,97 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
+	var bestPath string
 	var bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
+	consider := func(path, sessionID, cwd string, modTime time.Time) {
+		if now.Sub(modTime) > recentTimeout {
+			return
 		}
+		if !agent.PathsEqual(cwd, projectPath) {
+			return
+		}
+		if bestPath == "" || modTime.After(bestModTime) {
+			bestPath = path
+			bestSessionID = sessionID
+			bestModTime = modTime
+		}
+	}
 
+	for _, entry := range entries {
 		info, err := entry.Info()
 		if err != nil {
 			continue
 		}
 
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
-
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
+
+		if entry.IsDir() {
+			// Legacy layout: <sessionID>/workspace.yaml + events.jsonl
+			meta, err := parseSessionMeta(entryPath)
+			if err != nil || meta == nil {
+				continue
+			}
+			consider(GetTranscriptPath(entryPath), meta.ID, meta.CWD, info.ModTime())
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		if !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+		// Flat-file layout: <sessionID>.json transcript, with the working
+		// directory recorded on the session.start event.
+		cwd, ok := sessionStartCWD(entryPath)
+		if !ok {
+			continue
 		}
+		consider(entryPath, strings.TrimSuffix(entry.Name(), ".json"), cwd, info.ModTime())
 	}
 
-	if bestDir == "" {
+	if bestPath == "" {
 		return nil, nil
 	}
 
 	return &agent.SessionInfo{
 		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
+		TranscriptPath: bestPath,
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
 
+// sessionStartCWD scans a flat Copilot transcript file for its session.start
+// event and returns the working directory it recorded there, if any.
+func sessionStartCWD(path string) (string, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer func() { _ = f.Close() }()
 
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		var event struct {
+			Type string `json:"type"`
+			Data struct {
+				CWD string `json:"cwd"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			continue
+		}
+		if event.Type == "session.start" {
+			return event.Data.CWD, event.Data.CWD != ""
+		}
+	}
+	return "", false
+}
+```
