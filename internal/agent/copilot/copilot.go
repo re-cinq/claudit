@@ -409,67 +409,128 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
+// sessionCandidate represents a discovered Copilot session directory
+// (identified by the presence of a workspace.yaml file) along with its
+// parsed metadata and modification time.
+type sessionCandidate struct {
+	dir     string
+	modTime time.Time
+	meta    *sessionMeta
+}
+
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// Copilot CLI has changed its on-disk session layout and workspace.yaml
+// field names across releases. This first looks for a session whose
+// recorded working directory matches projectPath, and falls back to the
+// single most recently modified session within the recent-session window
+// when no explicit match can be determined (e.g. because the CWD field is
+// missing or under an unrecognized name).
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	entries, err := os.ReadDir(sessionDir)
-	if err != nil {
-		return nil, nil
-	}
+	candidates := collectSessionDirs(sessionDir)
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
+
+	var bestMatch *sessionCandidate
+	var bestAny *sessionCandidate
+
+	for _, c := range candidates {
+		if now.Sub(c.modTime) > recentTimeout {
+			continue
+		}
+
+		if bestAny == nil || c.modTime.After(bestAny.modTime) {
+			bestAny = c
+		}
+
+		if c.meta.CWD != "" && agent.PathsEqual(c.meta.CWD, projectPath) {
+			if bestMatch == nil || c.modTime.After(bestMatch.modTime) {
+				bestMatch = c
+			}
+		}
+	}
+
+	chosen := bestMatch
+	if chosen == nil {
+		chosen = bestAny
+	}
+
+	if chosen == nil {
+		return nil, nil
+	}
+
+	sessionID := chosen.meta.ID
+	if sessionID == "" {
+		sessionID = filepath.Base(chosen.dir)
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      sessionID,
+		TranscriptPath: GetTranscriptPath(chosen.dir),
+		StartedAt:      chosen.modTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
+}
+
+// collectSessionDirs walks the Copilot session-state directory looking for
+// session directories, identified by the presence of a workspace.yaml file.
+// Some Copilot CLI releases nest session directories one level deeper (e.g.
+// under a per-project folder), so entries without a workspace.yaml of their
+// own are checked one additional level down.
+func collectSessionDirs(root string) []*sessionCandidate {
+	var out []*sessionCandidate
+
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return out
+	}
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
+		path := filepath.Join(root, entry.Name())
 
-		info, err := entry.Info()
+		if c := readSessionDir(path); c != nil {
+			out = append(out, c)
+			continue
+		}
+
+		nested, err := os.ReadDir(path)
 		if err != nil {
 			continue
 		}
-
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
-
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
-		}
-
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
-		}
-
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+		for _, ne := range nested {
+			if !ne.IsDir() {
+				continue
+			}
+			if c := readSessionDir(filepath.Join(path, ne.Name())); c != nil {
+				out = append(out, c)
+			}
 		}
 	}
 
-	if bestDir == "" {
-		return nil, nil
-	}
-
-	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
-		ProjectPath:    projectPath,
-	}, nil
+	return out
 }
 
+// readSessionDir returns a sessionCandidate if path contains a valid
+// workspace.yaml, or nil otherwise.
+func readSessionDir(path string) *sessionCandidate {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil
+	}
 
+	meta, err := parseSessionMeta(path)
+	if err != nil || meta == nil {
+		return nil
+	}
+
+	return &sessionCandidate{dir: path, modTime: info.ModTime(), meta: meta}
+}
