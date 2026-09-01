@@ -409,24 +409,26 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
-// scanForRecentSession scans Copilot's session state directory for recent session directories.
-func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionStateDir()
+// sessionCandidate is a directory that may contain a Copilot session (i.e. it
+// directly contains a workspace.yaml file), discovered while scanning the
+// session state tree.
+type sessionCandidate struct {
+	path    string
+	modTime time.Time
+}
+
+// collectSessionCandidates walks the session state directory looking for
+// directories that directly contain a workspace.yaml file. Some Copilot CLI
+// releases have added an extra grouping level under the session state
+// directory (e.g. sharded by date), so up to one extra level of nesting is
+// scanned when a directory doesn't directly contain a workspace.yaml.
+func collectSessionCandidates(dir string, depth int) []sessionCandidate {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, nil
+		return nil
 	}
 
-	entries, err := os.ReadDir(sessionDir)
-	if err != nil {
-		return nil, nil
-	}
-
-	now := time.Now()
-	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
-
+	var candidates []sessionCandidate
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -437,27 +439,78 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
+		entryPath := filepath.Join(dir, entry.Name())
+		if _, err := os.Stat(filepath.Join(entryPath, "workspace.yaml")); err == nil {
+			candidates = append(candidates, sessionCandidate{path: entryPath, modTime: info.ModTime()})
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
+		if depth < 1 {
+			candidates = append(candidates, collectSessionCandidates(entryPath, depth+1)...)
+		}
+	}
+
+	return candidates
+}
+
+// scanForRecentSession scans Copilot's session state directory for recent session directories.
+func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
+	sessionDir, err := GetSessionStateDir()
+	if err != nil {
+		return nil, nil
+	}
+
+	candidates := collectSessionCandidates(sessionDir, 0)
+	if candidates == nil {
+		return nil, nil
+	}
+
+	now := time.Now()
+	recentTimeout := agent.RecentSessionTimeout
+	var bestDir, bestSessionID string
+	var bestModTime time.Time
+
+	// Sessions whose workspace.yaml couldn't be matched to projectPath (e.g.
+	// because a Copilot release renamed or omitted the cwd field). If exactly
+	// one such candidate is recent, it's used as a last-resort match.
+	var unmatchedDir, unmatchedSessionID string
+	var unmatchedModTime time.Time
+	unmatchedCount := 0
+
+	for _, c := range candidates {
+		if now.Sub(c.modTime) > recentTimeout {
+			continue
+		}
+
+		meta, err := parseSessionMeta(c.path)
 		if err != nil || meta == nil {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		sessionID := meta.ID
+		if sessionID == "" {
+			sessionID = filepath.Base(c.path)
+		}
+
+		if meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath) {
+			if bestDir == "" || c.modTime.After(bestModTime) {
+				bestDir = c.path
+				bestSessionID = sessionID
+				bestModTime = c.modTime
+			}
 			continue
 		}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+		unmatchedCount++
+		if unmatchedDir == "" || c.modTime.After(unmatchedModTime) {
+			unmatchedDir = c.path
+			unmatchedSessionID = sessionID
+			unmatchedModTime = c.modTime
 		}
+	}
+
+	if bestDir == "" && unmatchedCount == 1 {
+		bestDir, bestSessionID, bestModTime = unmatchedDir, unmatchedSessionID, unmatchedModTime
 	}
 
 	if bestDir == "" {
@@ -471,5 +524,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
