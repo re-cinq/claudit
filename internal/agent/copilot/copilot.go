@@ -423,9 +423,17 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
+
+	var matchedDir, matchedID string
+	var matchedModTime time.Time
+
+	// fallback tracks the single most recently modified session directory
+	// within the recency window, regardless of whether its metadata could be
+	// parsed or matched a project path. Newer Copilot CLI releases have
+	// changed the metadata file name and field names, so this keeps
+	// discovery working even when the strict match below can't parse it.
+	var fallbackDir, fallbackID string
+	var fallbackModTime time.Time
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -442,22 +450,41 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
+
+		if fallbackDir == "" || modTime.After(fallbackModTime) {
+			fallbackDir = entryPath
+			fallbackID = entry.Name()
+			fallbackModTime = modTime
+		}
+
+		// Check if this session directory has parseable metadata
 		meta, err := parseSessionMeta(entryPath)
 		if err != nil || meta == nil {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		matches := (meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)) ||
+			(meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath))
+		if !matches {
 			continue
 		}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+		id := meta.ID
+		if id == "" {
+			id = entry.Name()
 		}
+
+		if matchedDir == "" || modTime.After(matchedModTime) {
+			matchedDir = entryPath
+			matchedID = id
+			matchedModTime = modTime
+		}
+	}
+
+	bestDir, bestSessionID, bestModTime := matchedDir, matchedID, matchedModTime
+	if bestDir == "" {
+		bestDir, bestSessionID, bestModTime = fallbackDir, fallbackID, fallbackModTime
 	}
 
 	if bestDir == "" {
@@ -466,10 +493,8 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	return &agent.SessionInfo{
 		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
+		TranscriptPath: ResolveTranscriptPath(bestDir),
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
