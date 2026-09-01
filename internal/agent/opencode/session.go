@@ -1,6 +1,7 @@
 package opencode
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -126,4 +127,87 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 	_ = os.WriteFile(msgPath, transcriptData, 0600)
 
 	return sessionPath, nil
+}
+
+// sqliteTables returns all table names in a SQLite database.
+func sqliteTables(dbPath string) ([]string, error) {
+	cmd := exec.Command("sqlite3", dbPath, "SELECT name FROM sqlite_master WHERE type='table';")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	var tables []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			tables = append(tables, line)
+		}
+	}
+	return tables, nil
+}
+
+// sqliteColumns returns the column names of a table via PRAGMA table_info.
+func sqliteColumns(dbPath, table string) ([]string, error) {
+	cmd := exec.Command("sqlite3", dbPath, fmt.Sprintf("PRAGMA table_info(%s);", table))
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	var cols []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Split(line, "|")
+		if len(fields) >= 2 {
+			cols = append(cols, fields[1])
+		}
+	}
+	return cols, nil
+}
+
+// findTable locates the first table matching one of the candidate names
+// (case-insensitive) and returns its actual name and columns. OpenCode has
+// renamed tables across releases (e.g. singular to plural), so callers
+// should list every known alias.
+func findTable(dbPath string, candidates []string) (string, []string, error) {
+	tables, err := sqliteTables(dbPath)
+	if err != nil {
+		return "", nil, err
+	}
+	byLower := make(map[string]string, len(tables))
+	for _, t := range tables {
+		byLower[strings.ToLower(t)] = t
+	}
+	for _, c := range candidates {
+		if actual, ok := byLower[strings.ToLower(c)]; ok {
+			cols, err := sqliteColumns(dbPath, actual)
+			if err != nil {
+				return "", nil, err
+			}
+			return actual, cols, nil
+		}
+	}
+	return "", nil, nil
+}
+
+// pickColumn returns the first candidate column name present in cols
+// (case-insensitive), or "" if none match.
+func pickColumn(cols []string, candidates ...string) string {
+	byLower := make(map[string]string, len(cols))
+	for _, c := range cols {
+		byLower[strings.ToLower(c)] = c
+	}
+	for _, cand := range candidates {
+		if actual, ok := byLower[strings.ToLower(cand)]; ok {
+			return actual
+		}
+	}
+	return ""
+}
+
+// sqliteEscape escapes single quotes for use in a SQL string literal.
+func sqliteEscape(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
 }
