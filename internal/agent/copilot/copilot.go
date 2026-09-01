@@ -409,67 +409,110 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
-// scanForRecentSession scans Copilot's session state directory for recent session directories.
+// scanForRecentSession scans Copilot's session state directories for a recent
+// session matching projectPath. Different Copilot CLI versions have used
+// different directory names/depths and metadata field layouts, so all known
+// candidate directories are walked recursively and metadata is parsed
+// tolerantly (see sessionMeta.effectiveCWD/effectiveGitRoot).
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionStateDir()
-	if err != nil {
-		return nil, nil
-	}
-
-	entries, err := os.ReadDir(sessionDir)
-	if err != nil {
+	stateDirs, err := GetSessionStateDirs()
+	if err != nil || len(stateDirs) == 0 {
 		return nil, nil
 	}
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
+
 	var bestDir string
 	var bestSessionID string
 	var bestModTime time.Time
+	matchFound := false
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
+	// Track the single most recent session seen (regardless of CWD/git-root
+	// match) as a fallback for metadata layouts we don't recognize.
+	var fallbackDir string
+	var fallbackSessionID string
+	var fallbackModTime time.Time
+	fallbackCount := 0
 
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
+	for _, stateDir := range stateDirs {
+		_ = filepath.Walk(stateDir, func(path string, info os.FileInfo, walkErr error) error {
+			if walkErr != nil || info == nil || info.IsDir() {
+				return nil
+			}
 
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
+			isMetaFile := false
+			for _, name := range sessionMetaFileNames {
+				if info.Name() == name {
+					isMetaFile = true
+					break
+				}
+			}
+			if !isMetaFile {
+				return nil
+			}
 
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
-		}
+			entryPath := filepath.Dir(path)
+			modTime := info.ModTime()
+			if dirInfo, statErr := os.Stat(entryPath); statErr == nil && dirInfo.ModTime().After(modTime) {
+				modTime = dirInfo.ModTime()
+			}
+			if now.Sub(modTime) > recentTimeout {
+				return nil
+			}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
-		}
+			meta, parseErr := parseSessionMeta(entryPath)
+			if parseErr != nil || meta == nil || meta.ID == "" {
+				return nil
+			}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
-		}
+			fallbackCount++
+			if fallbackDir == "" || modTime.After(fallbackModTime) {
+				fallbackDir = entryPath
+				fallbackSessionID = meta.ID
+				fallbackModTime = modTime
+			}
+
+			cwd := meta.effectiveCWD()
+			gitRoot := meta.effectiveGitRoot()
+			matches := (cwd != "" && agent.PathsEqual(cwd, projectPath)) ||
+				(gitRoot != "" && agent.PathsEqual(gitRoot, projectPath))
+			if !matches {
+				return nil
+			}
+
+			matchFound = true
+			if bestDir == "" || modTime.After(bestModTime) {
+				bestDir = entryPath
+				bestSessionID = meta.ID
+				bestModTime = modTime
+			}
+			return nil
+		})
 	}
 
-	if bestDir == "" {
-		return nil, nil
+	if matchFound {
+		return &agent.SessionInfo{
+			SessionID:      bestSessionID,
+			TranscriptPath: GetTranscriptPath(bestDir),
+			StartedAt:      bestModTime.Format(time.RFC3339),
+			ProjectPath:    projectPath,
+		}, nil
 	}
 
-	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
-		ProjectPath:    projectPath,
-	}, nil
+	// No session recorded a CWD/git-root we recognized as matching. If
+	// exactly one recent session exists across all candidate directories,
+	// use it rather than giving up — this tolerates metadata formats we
+	// don't recognize while avoiding false positives when multiple
+	// concurrent sessions are present.
+	if fallbackCount == 1 {
+		return &agent.SessionInfo{
+			SessionID:      fallbackSessionID,
+			TranscriptPath: GetTranscriptPath(fallbackDir),
+			StartedAt:      fallbackModTime.Format(time.RFC3339),
+			ProjectPath:    projectPath,
+		}, nil
+	}
+
+	return nil, nil
 }
-
-
