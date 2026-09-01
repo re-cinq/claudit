@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -410,6 +411,14 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// Session directories are ideally matched against projectPath via workspace.yaml's
+// cwd/git_root fields, but that metadata format has changed across Copilot CLI
+// releases (it may be missing or use different field names). Rather than reporting
+// no session at all when a confirmed metadata match can't be made, this falls back
+// to the most recently modified session directory within the recency window — the
+// directory itself is always named after the session ID, so this still yields a
+// usable session in the common case of a single active session per project.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -426,6 +435,7 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestDir string
 	var bestSessionID string
 	var bestModTime time.Time
+	var bestConfirmed bool
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -442,21 +452,34 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
+		// The session directory is always named after the session ID
+		// (see WriteSessionFile), so this is a safe default even when
+		// workspace.yaml can't be parsed or matched.
+		sessionID := entry.Name()
+
+		confirmed := false
+		if meta, err := parseSessionMeta(entryPath); err == nil && meta != nil {
+			if meta.ID != "" {
+				sessionID = meta.ID
+			}
+			if (meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)) ||
+				(meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath)) {
+				confirmed = true
+			}
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
-		}
+		// A confirmed cwd/git_root match always wins over an unconfirmed one.
+		// Among candidates with the same confirmation status, prefer the most recent.
+		better := bestDir == "" ||
+			(confirmed && !bestConfirmed) ||
+			(confirmed == bestConfirmed && modTime.After(bestModTime))
 
-		if bestDir == "" || modTime.After(bestModTime) {
+		if better {
 			bestDir = entryPath
-			bestSessionID = meta.ID
+			bestSessionID = sessionID
 			bestModTime = modTime
+			bestConfirmed = confirmed
 		}
 	}
 
@@ -471,5 +494,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
