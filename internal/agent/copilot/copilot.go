@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -410,6 +411,12 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// Copilot CLI has renamed the workspace.yaml fields across releases (see
+// parseSessionMeta), so a session whose CWD we can't determine is no longer
+// skipped outright: it's still considered a candidate (matched on recency
+// alone) rather than silently dropped, which previously caused session
+// discovery to fail completely once the CLI changed its field names.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -449,13 +456,23 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		// Only filter by CWD when we were able to determine it. If the CLI
+		// renamed/removed the field, meta.CWD is empty and we fall back to
+		// matching on recency alone rather than dropping the session.
+		if meta.CWD != "" && !agent.PathsEqual(meta.CWD, projectPath) {
 			continue
+		}
+
+		sessionID := meta.ID
+		if sessionID == "" {
+			// Session directories are named after the session ID; fall back
+			// to the directory name if the id field couldn't be found.
+			sessionID = entry.Name()
 		}
 
 		if bestDir == "" || modTime.After(bestModTime) {
 			bestDir = entryPath
-			bestSessionID = meta.ID
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
 	}
@@ -471,5 +488,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
