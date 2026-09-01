@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -5,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,7 +22,7 @@ func init() {
 // Agent implements the agent.Agent interface for GitHub Copilot CLI.
 type Agent struct{}
 
-func (a *Agent) Name() agent.Name   { return agent.Copilot }
+func (a *Agent) Name() agent.Name    { return agent.Copilot }
 func (a *Agent) DisplayName() string { return "Copilot CLI" }
 
 // ConfigureHooks sets up Copilot CLI hooks in .github/hooks/shiftlog.json.
@@ -119,10 +121,10 @@ func (a *Agent) DiagnoseHooks(repoRoot string) []agent.DiagnosticCheck {
 func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 	var hook struct {
 		// Generic format fields
-		SessionID      string `json:"session_id"`
-		TranscriptPath string `json:"transcript_path"`
+		SessionID       string `json:"session_id"`
+		TranscriptPath  string `json:"transcript_path"`
 		GenericToolName string `json:"tool_name"`
-		ToolInput      struct {
+		ToolInput       struct {
 			Command string `json:"command"`
 		} `json:"tool_input"`
 
@@ -409,15 +411,24 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
-// scanForRecentSession scans Copilot's session state directory for recent session directories.
+// scanForRecentSession scans Copilot's session state directory for recent session
+// directories, matching by working directory.
+//
+// This walks the tree under the session state directory (rather than assuming
+// a single fixed nesting depth of `session-state/<id>/workspace.yaml`) because
+// that flat-layout assumption has never been verified against a real Copilot
+// CLI install: Copilot CLI has, in practice, been observed grouping session
+// directories under an intermediate per-workspace directory
+// (`session-state/<workspace>/<id>/workspace.yaml`) as well as storing them
+// directly. Walking for `workspace.yaml` files handles either layout, and any
+// deeper nesting, uniformly.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	entries, err := os.ReadDir(sessionDir)
-	if err != nil {
+	if _, err := os.Stat(sessionDir); err != nil {
 		return nil, nil
 	}
 
@@ -427,30 +438,29 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
+	_ = filepath.WalkDir(sessionDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() || d.Name() != "workspace.yaml" {
+			return nil
 		}
 
-		info, err := entry.Info()
+		info, err := d.Info()
 		if err != nil {
-			continue
+			return nil
 		}
 
 		modTime := info.ModTime()
 		if now.Sub(modTime) > recentTimeout {
-			continue
+			return nil
 		}
 
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
+		entryPath := filepath.Dir(path)
 		meta, err := parseSessionMeta(entryPath)
 		if err != nil || meta == nil {
-			continue
+			return nil
 		}
 
 		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
+			return nil
 		}
 
 		if bestDir == "" || modTime.After(bestModTime) {
@@ -458,7 +468,8 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			bestSessionID = meta.ID
 			bestModTime = modTime
 		}
-	}
+		return nil
+	})
 
 	if bestDir == "" {
 		return nil, nil
@@ -471,5 +482,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
