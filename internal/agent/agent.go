@@ -1,3 +1,4 @@
+<complete corrected file content>
 package agent
 
 import (
@@ -12,6 +13,35 @@ import (
 // RecentSessionTimeout is the default timeout for considering a session "recent"
 // during session discovery across all agents.
 const RecentSessionTimeout = 5 * time.Minute
+
+// SessionDiscoveryPollTimeout is how long PollForSession retries a discovery
+// function before giving up. Some coding agent CLIs (e.g. Copilot CLI,
+// OpenCode) persist their session state to disk asynchronously and may not
+// have finished writing it out by the moment their process exits — which is
+// exactly when manual (post-commit hook) session discovery runs. A single
+// discovery attempt at that instant can race the CLI's own flush.
+const SessionDiscoveryPollTimeout = 3 * time.Second
+
+// SessionDiscoveryPollInterval is the delay between PollForSession retries.
+const SessionDiscoveryPollInterval = 200 * time.Millisecond
+
+// PollForSession retries a session discovery function until it finds a
+// session or SessionDiscoveryPollTimeout elapses. Agents whose session
+// discovery can race a CLI's asynchronous state flush should route their
+// DiscoverSession implementation through this helper.
+func PollForSession(discover func() (*SessionInfo, error)) (*SessionInfo, error) {
+	deadline := time.Now().Add(SessionDiscoveryPollTimeout)
+	for {
+		session, err := discover()
+		if err != nil || session != nil {
+			return session, err
+		}
+		if time.Now().After(deadline) {
+			return nil, nil
+		}
+		time.Sleep(SessionDiscoveryPollInterval)
+	}
+}
 
 // IsGitCommitCommand checks whether a shell command string represents a git commit.
 func IsGitCommitCommand(command string) bool {
@@ -236,3 +266,4 @@ type Agent interface {
 	// Rendering: map tool names for display
 	ToolAliases() map[string]string
 }
+</complete corrected file content>

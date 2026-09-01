@@ -1,3 +1,4 @@
+<complete corrected file content>
 package copilot
 
 import (
@@ -227,8 +228,14 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent Copilot CLI session.
+// Copilot CLI may not have finished flushing its session-state directory to
+// disk by the instant its process exits, which is exactly when manual
+// (post-commit hook) discovery runs — so this retries briefly rather than
+// giving up on the first empty scan.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	return scanForRecentSession(projectPath)
+	return agent.PollForSession(func() (*agent.SessionInfo, error) {
+		return scanForRecentSession(projectPath)
+	})
 }
 
 // RestoreSession writes a transcript to Copilot CLI's expected location.
@@ -471,5 +478,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+</complete corrected file content>

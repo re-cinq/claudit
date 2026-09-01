@@ -1,3 +1,4 @@
+<complete corrected file content>
 package opencode
 
 import (
@@ -231,7 +232,18 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 
 // DiscoverSession finds an active or recent OpenCode session.
 // It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// OpenCode may not have finished flushing its session state by the instant
+// its process exits, which is exactly when manual (post-commit hook)
+// discovery runs — so the whole lookup is retried briefly rather than
+// giving up after a single empty scan.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	return agent.PollForSession(func() (*agent.SessionInfo, error) {
+		return a.discoverSessionOnce(projectPath)
+	})
+}
+
+// discoverSessionOnce performs a single, non-retried session discovery attempt.
+func (a *Agent) discoverSessionOnce(projectPath string) (*agent.SessionInfo, error) {
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
@@ -438,63 +450,119 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 		}
 	}
 
-	// Parse timestamp
-	if timeRaw, ok := raw["time"]; ok {
-		var timeObj struct {
-			Created string `json:"created"`
-		}
-		if err := json.Unmarshal(timeRaw, &timeObj); err == nil {
-			entry.Timestamp = timeObj.Created
+	// Parse timestamp (various field names)
+	for _, key := range []string{"time_created", "timestamp", "created_at"} {
+		if tsRaw, ok := raw[key]; ok {
+			var ts json.Number
+			if err := json.Unmarshal(tsRaw, &ts); err == nil {
+				entry.Timestamp = ts.String()
+			} else {
+				var tsStr string
+				if err := json.Unmarshal(tsRaw, &tsStr); err == nil {
+					entry.Timestamp = tsStr
+				}
+			}
+			break
 		}
 	}
 
-	// Parse content
-	entry.Message = parseOpenCodeMessage(raw, entry.Type)
+	// Build message content from "parts" (typed) or "content" (plain string)
+	var content []agent.ContentBlock
+
+	if partsRaw, ok := raw["parts"]; ok {
+		var parts []map[string]json.RawMessage
+		var partsStr string
+
+		// parts may be a JSON string (from SQLite) or a JSON array directly
+		if err := json.Unmarshal(partsRaw, &partsStr); err == nil {
+			_ = json.Unmarshal([]byte(partsStr), &parts)
+		} else {
+			_ = json.Unmarshal(partsRaw, &parts)
+		}
+
+		for _, part := range parts {
+			content = append(content, parseOpenCodePart(part))
+		}
+	} else if contentRaw, ok := raw["content"]; ok {
+		var contentStr string
+		if err := json.Unmarshal(contentRaw, &contentStr); err == nil && contentStr != "" {
+			content = append(content, agent.ContentBlock{Type: "text", Text: contentStr})
+		}
+	}
+
+	if len(content) == 0 {
+		content = []agent.ContentBlock{{Type: "text", Text: ""}}
+	}
+
+	role := "user"
+	switch entry.Type {
+	case agent.MessageTypeAssistant:
+		role = "assistant"
+	case agent.MessageTypeSystem:
+		role = "system"
+	}
+
+	entry.Message = &agent.Message{
+		Role:    role,
+		Content: content,
+	}
 
 	return entry
 }
 
-
-// parseOpenCodeMessage parses message content from an OpenCode entry.
-func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
-	if msgType == "" {
-		return nil
+// parseOpenCodePart parses a single "parts" entry from an OpenCode message.
+func parseOpenCodePart(part map[string]json.RawMessage) agent.ContentBlock {
+	var partType string
+	if typeRaw, ok := part["type"]; ok {
+		_ = json.Unmarshal(typeRaw, &partType)
 	}
 
-	msg := &agent.Message{}
-	switch msgType {
-	case agent.MessageTypeUser:
-		msg.Role = "user"
-	case agent.MessageTypeAssistant:
-		msg.Role = "assistant"
-	case agent.MessageTypeSystem:
-		msg.Role = "system"
+	var data map[string]json.RawMessage
+	if dataRaw, ok := part["data"]; ok {
+		_ = json.Unmarshal(dataRaw, &data)
+	}
+	if data == nil {
+		data = part
 	}
 
-	// Try "content" as string
-	if contentRaw, ok := raw["content"]; ok {
+	switch partType {
+	case "text", "reasoning":
 		var text string
-		if err := json.Unmarshal(contentRaw, &text); err == nil && text != "" {
-			msg.Content = []agent.ContentBlock{{Type: "text", Text: text}}
-			return msg
+		if textRaw, ok := data["text"]; ok {
+			_ = json.Unmarshal(textRaw, &text)
 		}
+		return agent.ContentBlock{Type: "text", Text: text}
 
-		// Try as array of content blocks
-		var blocks []agent.ContentBlock
-		if err := json.Unmarshal(contentRaw, &blocks); err == nil && len(blocks) > 0 {
-			msg.Content = blocks
-			return msg
+	case "tool_call", "tool-call", "tool":
+		var id, name string
+		if idRaw, ok := data["id"]; ok {
+			_ = json.Unmarshal(idRaw, &id)
 		}
+		if nameRaw, ok := data["name"]; ok {
+			_ = json.Unmarshal(nameRaw, &name)
+		}
+		var input json.RawMessage
+		if inputRaw, ok := data["input"]; ok {
+			input = inputRaw
+		}
+		return agent.ContentBlock{Type: "tool_use", ToolUseID: id, Name: name, Input: input}
+
+	case "tool_result", "tool-result":
+		var id string
+		if idRaw, ok := data["id"]; ok {
+			_ = json.Unmarshal(idRaw, &id)
+		}
+		var result json.RawMessage
+		if resultRaw, ok := data["result"]; ok {
+			result = resultRaw
+		} else if outputRaw, ok := data["output"]; ok {
+			result = outputRaw
+		}
+		return agent.ContentBlock{Type: "tool_result", ToolUseID: id, Content: result}
+
+	default:
+		raw, _ := json.Marshal(data)
+		return agent.ContentBlock{Type: "text", Text: string(raw)}
 	}
-
-	// Try "message" field
-	if msgRaw, ok := raw["message"]; ok {
-		var innerMsg agent.Message
-		if err := json.Unmarshal(msgRaw, &innerMsg); err == nil {
-			return &innerMsg
-		}
-	}
-
-	return msg
 }
-
+</complete corrected file content>
