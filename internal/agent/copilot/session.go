@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -34,6 +35,9 @@ func GetSessionStateDir() (string, error) {
 }
 
 // parseSessionMeta reads a workspace.yaml from a Copilot session directory.
+// Newer Copilot CLI releases have used different key names for the same
+// concept (e.g. cwd vs workingDirectory), so this falls back to scanning the
+// raw document for known alternates when the primary struct tags come up empty.
 func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 	path := filepath.Join(sessionDir, "workspace.yaml")
 	data, err := os.ReadFile(path)
@@ -46,7 +50,29 @@ func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 		return nil, err
 	}
 
+	if meta.CWD == "" || meta.ID == "" {
+		var raw map[string]interface{}
+		if err := yaml.Unmarshal(data, &raw); err == nil {
+			if meta.CWD == "" {
+				meta.CWD = firstStringField(raw, "cwd", "cwdPath", "workingDirectory", "workspacePath", "directory", "path")
+			}
+			if meta.ID == "" {
+				meta.ID = firstStringField(raw, "id", "sessionId", "sessionID", "session_id")
+			}
+		}
+	}
+
 	return &meta, nil
+}
+
+// firstStringField returns the first non-empty string value found in m for the given keys.
+func firstStringField(m map[string]interface{}, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := m[k].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // GetTranscriptPath returns the path to the events.jsonl transcript within a session directory.
@@ -81,4 +107,4 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-
+```
