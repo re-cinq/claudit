@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -409,67 +410,93 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
-// scanForRecentSession scans Copilot's session state directory for recent session directories.
-func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionStateDir()
-	if err != nil {
-		return nil, nil
-	}
+// sessionCandidate represents a recently-modified session directory found
+// while scanning Copilot's session state directories.
+type sessionCandidate struct {
+	dir     string
+	id      string
+	modTime time.Time
+}
 
-	entries, err := os.ReadDir(sessionDir)
-	if err != nil {
+// scanForRecentSession scans Copilot's session state directories for a
+// recent session matching projectPath. Copilot CLI has used different
+// directory names and metadata formats across versions, so several known
+// candidate directories and metadata variants are tried (see session.go).
+// If no session's recorded working directory matches projectPath (e.g.
+// because the metadata field name changed in a newer CLI version) but
+// exactly one recent session exists system-wide, it is used as a
+// best-effort fallback rather than reporting no session at all.
+func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
+	stateDirs, err := GetSessionStateDirs()
+	if err != nil || len(stateDirs) == 0 {
 		return nil, nil
 	}
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
+	var best *sessionCandidate
+	var soleRecent *sessionCandidate
+	recentCount := 0
 
-		info, err := entry.Info()
+	for _, stateDir := range stateDirs {
+		entries, err := os.ReadDir(stateDir)
 		if err != nil {
 			continue
 		}
 
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
 
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
-		}
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
-		}
+			modTime := info.ModTime()
+			if now.Sub(modTime) > recentTimeout {
+				continue
+			}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+			entryPath := filepath.Join(stateDir, entry.Name())
+			sessionID := entry.Name()
+			matched := false
+
+			if meta, err := parseSessionMeta(entryPath); err == nil && meta != nil {
+				if meta.ID != "" {
+					sessionID = meta.ID
+				}
+				matched = meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)
+			}
+
+			recentCount++
+			candidate := &sessionCandidate{dir: entryPath, id: sessionID, modTime: modTime}
+
+			if matched && (best == nil || modTime.After(best.modTime)) {
+				best = candidate
+			}
+			if soleRecent == nil || modTime.After(soleRecent.modTime) {
+				soleRecent = candidate
+			}
 		}
 	}
 
-	if bestDir == "" {
+	chosen := best
+	if chosen == nil && recentCount == 1 {
+		chosen = soleRecent
+	}
+
+	if chosen == nil {
 		return nil, nil
 	}
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
+		SessionID:      chosen.id,
+		TranscriptPath: GetTranscriptPath(chosen.dir),
+		StartedAt:      chosen.modTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
