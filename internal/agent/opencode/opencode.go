@@ -251,54 +251,146 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 	return discoverFromSQLite(dataDir, projectID, projectPath)
 }
 
-// discoverFromFlatFiles tries the legacy flat file session discovery.
+// discoverFromFlatFiles tries the flat file session discovery. Newer OpenCode
+// releases have nested session files an extra level deep (e.g.
+// session/<id>/info.json) rather than storing a flat <id>.json directly
+// inside the project directory, so this walks the tree recursively instead
+// of assuming a fixed depth.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
-	if err != nil {
-		return nil, nil
+	if sessionDir, err := GetSessionDir(projectPath); err == nil {
+		if sessionID, modTime := walkSessionFiles(sessionDir); sessionID != "" {
+			return &agent.SessionInfo{
+				SessionID:      sessionID,
+				TranscriptPath: resolveMessageDir(sessionID),
+				StartedAt:      modTime.Format(time.RFC3339),
+				ProjectPath:    projectPath,
+			}, nil
+		}
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
+	// The project-ID directory may not exist or may not match (e.g. if
+	// OpenCode's own project identifier no longer lines up with the git
+	// root commit hash used here), so fall back to a broad scan of every
+	// project's sessions, matching on an embedded path field instead.
+	return scanAllSessionDirs(projectPath)
+}
+
+// walkSessionFiles recursively scans dir for the most recently modified
+// session JSON file within the recent-session window, regardless of
+// nesting depth. It returns the session ID (derived from the containing
+// directory for nested metadata files such as info.json/session.json, or
+// from the filename otherwise) and the file's modification time.
+func walkSessionFiles(dir string) (sessionID string, modTime time.Time) {
+	now := time.Now()
+
+	_ = filepath.Walk(dir, func(p string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(info.Name(), ".json") || info.Name() == "sessions-index.json" {
+			return nil
+		}
+		if now.Sub(info.ModTime()) > agent.RecentSessionTimeout {
+			return nil
+		}
+		if sessionID != "" && !info.ModTime().After(modTime) {
+			return nil
+		}
+
+		base := strings.TrimSuffix(info.Name(), ".json")
+		if base == "info" || base == "session" {
+			sessionID = filepath.Base(filepath.Dir(p))
+		} else {
+			sessionID = base
+		}
+		modTime = info.ModTime()
+		return nil
+	})
+
+	return sessionID, modTime
+}
+
+// scanAllSessionDirs scans every project directory under storage/session
+// for a session belonging to projectPath, matching on an embedded
+// directory/path/cwd/worktree field inside each session file. This is a
+// fallback for when the project-ID directory lookup fails.
+func scanAllSessionDirs(projectPath string) (*agent.SessionInfo, error) {
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
+	root := filepath.Join(dataDir, "storage", "session")
 
 	now := time.Now()
-	recentTimeout := agent.RecentSessionTimeout
-	var bestSessionID string
+	var bestPath, bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
+	_ = filepath.Walk(root, func(p string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(info.Name(), ".json") || info.Name() == "sessions-index.json" {
+			return nil
+		}
+		if now.Sub(info.ModTime()) > agent.RecentSessionTimeout {
+			return nil
+		}
+		if bestPath != "" && !info.ModTime().After(bestModTime) {
+			return nil
 		}
 
-		info, err := entry.Info()
+		data, err := os.ReadFile(p)
 		if err != nil {
-			continue
+			return nil
+		}
+		var header struct {
+			ID        string `json:"id"`
+			Directory string `json:"directory"`
+			Path      string `json:"path"`
+			CWD       string `json:"cwd"`
+			Worktree  string `json:"worktree"`
+		}
+		if err := json.Unmarshal(data, &header); err != nil {
+			return nil
 		}
 
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
+		candidate := header.Directory
+		if candidate == "" {
+			candidate = header.Path
+		}
+		if candidate == "" {
+			candidate = header.CWD
+		}
+		if candidate == "" {
+			candidate = header.Worktree
+		}
+		if candidate == "" || !agent.PathsEqual(candidate, projectPath) {
+			return nil
 		}
 
-		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
-			bestModTime = modTime
+		sessionID := header.ID
+		if sessionID == "" {
+			base := strings.TrimSuffix(info.Name(), ".json")
+			if base == "info" || base == "session" {
+				sessionID = filepath.Base(filepath.Dir(p))
+			} else {
+				sessionID = base
+			}
 		}
-	}
 
-	if bestSessionID == "" {
+		bestPath = p
+		bestSessionID = sessionID
+		bestModTime = info.ModTime()
+		return nil
+	})
+
+	if bestPath == "" {
 		return nil, nil
 	}
-
-	// The transcript path for OpenCode is the message directory
-	msgDir, _ := GetMessageDir(bestSessionID)
 
 	return &agent.SessionInfo{
 		SessionID:      bestSessionID,
-		TranscriptPath: msgDir,
+		TranscriptPath: resolveMessageDir(bestSessionID),
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
@@ -497,4 +589,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-

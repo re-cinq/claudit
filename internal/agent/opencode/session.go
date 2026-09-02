@@ -73,6 +73,29 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// resolveMessageDir returns the message directory for a session, preferring
+// whichever known OpenCode storage layout actually has content on disk.
+// Recent OpenCode releases have nested message storage under an additional
+// "session" segment; older releases used a flat "message/<id>" layout.
+func resolveMessageDir(sessionID string) string {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return ""
+	}
+
+	candidates := []string{
+		filepath.Join(dataDir, "storage", "message", sessionID),
+		filepath.Join(dataDir, "storage", "session", "message", sessionID),
+		filepath.Join(dataDir, "storage", "session", sessionID, "message"),
+	}
+	for _, c := range candidates {
+		if entries, err := os.ReadDir(c); err == nil && len(entries) > 0 {
+			return c
+		}
+	}
+	return candidates[0]
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
