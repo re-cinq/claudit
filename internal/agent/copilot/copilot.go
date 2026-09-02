@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -449,7 +450,10 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		// Only reject on a CWD that's actually recorded and doesn't match;
+		// if the field is missing (e.g. renamed in a newer Copilot CLI
+		// version), fall back to recency to pick the best candidate.
+		if c := meta.cwd(); c != "" && !agent.PathsEqual(c, projectPath) {
 			continue
 		}
 
@@ -471,5 +475,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
