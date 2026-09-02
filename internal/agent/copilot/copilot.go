@@ -410,6 +410,16 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// workspace.yaml is treated as best-effort metadata rather than a hard
+// requirement: newer Copilot CLI releases have been observed to omit fields
+// or change their names, in which case the CWD can't be confirmed. In that
+// case the session directory name is used as the session ID (Copilot names
+// session directories after the session ID) and a session whose CWD can be
+// confirmed to match projectPath is always preferred over one that can't.
+// When no candidate's CWD can be confirmed, the most recently active
+// session is used instead — the same CWD-agnostic fallback already relied
+// on for Claude/Gemini discovery (agent.ScanDirForRecentSession).
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -426,6 +436,8 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestDir string
 	var bestSessionID string
 	var bestModTime time.Time
+	var bestCWDMatch bool
+	haveBest := false
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -437,30 +449,45 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
+		entryPath := filepath.Join(sessionDir, entry.Name())
 		modTime := info.ModTime()
+
+		// events.jsonl is appended to for the life of the session, so its
+		// mtime is a better freshness signal than the directory's own mtime,
+		// which may only reflect when the session was created.
+		if txInfo, err := os.Stat(GetTranscriptPath(entryPath)); err == nil && txInfo.ModTime().After(modTime) {
+			modTime = txInfo.ModTime()
+		}
+
 		if now.Sub(modTime) > recentTimeout {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
+		sessionID := entry.Name()
+		cwdMatch := false
+		if meta, err := parseSessionMeta(entryPath); err == nil && meta != nil {
+			if meta.ID != "" {
+				sessionID = meta.ID
+			}
+			if meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath) {
+				cwdMatch = true
+			}
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
-		}
+		better := !haveBest ||
+			(cwdMatch && !bestCWDMatch) ||
+			(cwdMatch == bestCWDMatch && modTime.After(bestModTime))
 
-		if bestDir == "" || modTime.After(bestModTime) {
+		if better {
 			bestDir = entryPath
-			bestSessionID = meta.ID
+			bestSessionID = sessionID
 			bestModTime = modTime
+			bestCWDMatch = cwdMatch
+			haveBest = true
 		}
 	}
 
-	if bestDir == "" {
+	if !haveBest {
 		return nil, nil
 	}
 
@@ -471,5 +498,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
