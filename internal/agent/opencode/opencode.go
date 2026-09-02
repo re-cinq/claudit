@@ -317,26 +317,28 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	}
 
 	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
+	sessionID := querySQLiteScalar(dbPath, fmt.Sprintf(
 		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
 		projectID,
-	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+	))
+	if sessionID == "" {
+		// Newer OpenCode releases changed how project_id is derived, so a
+		// locally computed project_id may no longer match what's stored in
+		// the database. Fall back to the most recently updated session
+		// overall; the recency check below still guards against picking up
+		// an unrelated stale session.
+		sessionID = querySQLiteScalar(dbPath, `SELECT id FROM session ORDER BY time_updated DESC LIMIT 1;`)
+	}
+	if sessionID == "" {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
 	// Check if this session was recent (within timeout)
-	timeQuery := fmt.Sprintf(
+	timeStr := querySQLiteScalar(dbPath, fmt.Sprintf(
 		`SELECT time_updated FROM session WHERE id='%s';`,
 		sessionID,
-	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
-	timeOutput, err := cmd.Output()
-	if err == nil {
-		timeStr := strings.TrimSpace(string(timeOutput))
+	))
+	if timeStr != "" {
 		if t, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
 			if time.Since(t) > agent.RecentSessionTimeout {
 				return nil, nil
@@ -358,7 +360,7 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, msgQuery)
+	cmd := exec.Command("sqlite3", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
 	if err != nil {
 		return nil, nil
@@ -377,6 +379,17 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// querySQLiteScalar runs a single-column sqlite3 query against dbPath and
+// returns the trimmed output, or "" if the query failed or returned nothing.
+func querySQLiteScalar(dbPath, query string) string {
+	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, query)
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -454,7 +467,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +509,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
