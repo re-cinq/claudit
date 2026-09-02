@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -410,6 +411,10 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+// It tolerates metadata format/field-name drift across Copilot CLI versions: sessions whose
+// working directory matches projectPath are preferred, but if metadata can't be positively
+// matched (e.g. a renamed field) and exactly one recent session exists, it is used as a
+// best-effort fallback.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -421,11 +426,16 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		return nil, nil
 	}
 
+	type candidate struct {
+		dir       string
+		sessionID string
+		modTime   time.Time
+	}
+
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
+	var matched []candidate
+	var unknown []candidate
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -442,34 +452,55 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
+		meta, metaErr := parseSessionMeta(entryPath)
+
+		sessionID := entry.Name()
+		if meta != nil && meta.ID != "" {
+			sessionID = meta.ID
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
-		}
+		c := candidate{dir: entryPath, sessionID: sessionID, modTime: modTime}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+		switch {
+		case metaErr != nil || meta == nil:
+			// Metadata file format has drifted (missing/renamed). Keep as a
+			// weak candidate rather than dropping it outright.
+			unknown = append(unknown, c)
+		case meta.CWD == "" && meta.GitRoot == "":
+			unknown = append(unknown, c)
+		case agent.PathsEqual(meta.CWD, projectPath) || (meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath)):
+			matched = append(matched, c)
 		}
 	}
 
-	if bestDir == "" {
+	pickBest := func(cands []candidate) *candidate {
+		var best *candidate
+		for i := range cands {
+			if best == nil || cands[i].modTime.After(best.modTime) {
+				best = &cands[i]
+			}
+		}
+		return best
+	}
+
+	best := pickBest(matched)
+	if best == nil && len(unknown) == 1 {
+		// Exactly one recent session and we couldn't positively match its
+		// working directory (metadata format drift) — it's still the most
+		// reasonable candidate.
+		best = &unknown[0]
+	}
+
+	if best == nil {
 		return nil, nil
 	}
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
+		SessionID:      best.sessionID,
+		TranscriptPath: GetTranscriptPath(best.dir),
+		StartedAt:      best.modTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
