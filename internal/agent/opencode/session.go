@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -73,6 +74,42 @@ func GetMessageDir(sessionID string) (string, error) {
 	return filepath.Join(dataDir, "storage", "message", sessionID), nil
 }
 
+// sessionDirCandidates returns candidate session-metadata directories for a
+// project, tried in priority order. OpenCode has restructured its on-disk
+// storage layout across releases (e.g. introducing a per-project
+// "project/<id>/storage/..." prefix), so discovery isn't limited to the
+// legacy "storage/session/<projectID>" path returned by GetSessionDir.
+func sessionDirCandidates(projectPath string) ([]string, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return nil, err
+	}
+
+	projectID := GetProjectID(projectPath)
+
+	return []string{
+		filepath.Join(dataDir, "storage", "session", projectID),
+		filepath.Join(dataDir, "project", projectID, "storage", "session"),
+		filepath.Join(dataDir, "project", projectID, "storage", "session", "info"),
+	}, nil
+}
+
+// messageDirCandidates returns candidate message directories for a session,
+// tried in priority order (see sessionDirCandidates).
+func messageDirCandidates(projectPath, sessionID string) ([]string, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return nil, err
+	}
+
+	projectID := GetProjectID(projectPath)
+
+	return []string{
+		filepath.Join(dataDir, "storage", "message", sessionID),
+		filepath.Join(dataDir, "project", projectID, "storage", "message", sessionID),
+	}, nil
+}
+
 // sessionInfo represents an OpenCode session JSON file.
 type sessionInfo struct {
 	ID        string `json:"id"`
@@ -127,3 +164,4 @@ func WriteSessionFile(projectPath, sessionID string, transcriptData []byte) (str
 
 	return sessionPath, nil
 }
+```
