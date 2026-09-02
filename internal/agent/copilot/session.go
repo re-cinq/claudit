@@ -8,12 +8,24 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// sessionMeta represents lightweight metadata from a Copilot session workspace.yaml.
+// sessionMeta represents lightweight metadata from a Copilot session workspace file.
 type sessionMeta struct {
-	ID      string `yaml:"id"`
-	CWD     string `yaml:"cwd"`
-	GitRoot string `yaml:"git_root,omitempty"`
+	ID  string
+	CWD string
 }
+
+// sessionMetaFilenames lists the filenames Copilot CLI has used across
+// versions to store per-session workspace metadata (YAML and JSON variants).
+var sessionMetaFilenames = []string{
+	"workspace.yaml", "workspace.yml", "workspace.json",
+	"session.yaml", "session.json",
+}
+
+// sessionMetaIDKeys and sessionMetaCWDKeys list the known field names used
+// across Copilot CLI versions for the session ID and working directory,
+// tried in priority order.
+var sessionMetaIDKeys = []string{"id", "sessionId", "session_id"}
+var sessionMetaCWDKeys = []string{"cwd", "cwdPath", "workingDirectory", "workspaceFolder", "directory"}
 
 // GetCopilotDir returns the path to Copilot's config/data directory.
 func GetCopilotDir() (string, error) {
@@ -33,20 +45,42 @@ func GetSessionStateDir() (string, error) {
 	return filepath.Join(copilotDir, "session-state"), nil
 }
 
-// parseSessionMeta reads a workspace.yaml from a Copilot session directory.
+// parseSessionMeta reads workspace metadata from a Copilot session directory.
+// It probes several known filenames and field names since Copilot CLI has
+// changed both across releases.
 func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
-	path := filepath.Join(sessionDir, "workspace.yaml")
-	data, err := os.ReadFile(path)
-	if err != nil {
+	var data []byte
+	var readErr error
+	for _, name := range sessionMetaFilenames {
+		data, readErr = os.ReadFile(filepath.Join(sessionDir, name))
+		if readErr == nil {
+			break
+		}
+	}
+	if readErr != nil {
+		return nil, readErr
+	}
+
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, err
 	}
 
-	var meta sessionMeta
-	if err := yaml.Unmarshal(data, &meta); err != nil {
-		return nil, err
+	meta := &sessionMeta{}
+	for _, key := range sessionMetaIDKeys {
+		if v, ok := raw[key].(string); ok && v != "" {
+			meta.ID = v
+			break
+		}
+	}
+	for _, key := range sessionMetaCWDKeys {
+		if v, ok := raw[key].(string); ok && v != "" {
+			meta.CWD = v
+			break
+		}
 	}
 
-	return &meta, nil
+	return meta, nil
 }
 
 // GetTranscriptPath returns the path to the events.jsonl transcript within a session directory.
@@ -68,8 +102,7 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	}
 
 	// Write workspace.yaml
-	meta := sessionMeta{ID: sessionID}
-	yamlData, err := yaml.Marshal(&meta)
+	yamlData, err := yaml.Marshal(map[string]string{"id": sessionID})
 	if err != nil {
 		return "", fmt.Errorf("could not marshal workspace.yaml: %w", err)
 	}
@@ -81,4 +114,3 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-
