@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -410,6 +411,14 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// Copilot CLI versions have varied in whether/how they expose the session's
+// working directory in workspace.yaml (see sessionMeta.effectiveCWD). To stay
+// robust across those changes, this prefers a session whose recorded working
+// directory matches projectPath, but falls back to the most recently modified
+// session directory within the timeout window when no CWD match is available
+// or the metadata doesn't expose one — mirroring the recency-only discovery
+// used by the Claude and Gemini agents.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -423,9 +432,13 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
+
+	var bestDir, bestSessionID string
 	var bestModTime time.Time
+	haveCWDMatch := false
+
+	var fallbackDir, fallbackSessionID string
+	var fallbackModTime time.Time
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -449,27 +462,45 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		// Track the most recent session regardless of CWD as a fallback, in
+		// case this Copilot CLI version's metadata doesn't expose a working
+		// directory we recognize.
+		if fallbackDir == "" || modTime.After(fallbackModTime) {
+			fallbackDir = entryPath
+			fallbackSessionID = meta.ID
+			fallbackModTime = modTime
+		}
+
+		if meta.effectiveCWD() == "" || !agent.PathsEqual(meta.effectiveCWD(), projectPath) {
 			continue
 		}
 
-		if bestDir == "" || modTime.After(bestModTime) {
+		if !haveCWDMatch || modTime.After(bestModTime) {
 			bestDir = entryPath
 			bestSessionID = meta.ID
 			bestModTime = modTime
+			haveCWDMatch = true
 		}
 	}
 
-	if bestDir == "" {
+	if haveCWDMatch {
+		return &agent.SessionInfo{
+			SessionID:      bestSessionID,
+			TranscriptPath: GetTranscriptPath(bestDir),
+			StartedAt:      bestModTime.Format(time.RFC3339),
+			ProjectPath:    projectPath,
+		}, nil
+	}
+
+	if fallbackDir == "" {
 		return nil, nil
 	}
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
+		SessionID:      fallbackSessionID,
+		TranscriptPath: GetTranscriptPath(fallbackDir),
+		StartedAt:      fallbackModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
