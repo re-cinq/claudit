@@ -1,9 +1,11 @@
 package copilot
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -13,6 +15,74 @@ type sessionMeta struct {
 	ID      string `yaml:"id"`
 	CWD     string `yaml:"cwd"`
 	GitRoot string `yaml:"git_root,omitempty"`
+}
+
+// metadataFilenames lists known/possible Copilot session metadata filenames,
+// tried in order. Newer CLI releases have renamed this file across versions,
+// so we don't assume "workspace.yaml" is the only possibility.
+var metadataFilenames = []string{
+	"workspace.yaml",
+	"workspace.yml",
+	"session.yaml",
+	"metadata.yaml",
+	"metadata.json",
+	"state.json",
+}
+
+// cwdKeyPaths lists known/possible (possibly nested) key paths Copilot may
+// use to record a session's working directory, tried in order to tolerate
+// field renames across CLI versions.
+var cwdKeyPaths = [][]string{
+	{"cwd"},
+	{"cwdPath"},
+	{"workingDirectory"},
+	{"working_directory"},
+	{"directory"},
+	{"path"},
+	{"workspace", "cwd"},
+	{"workspace", "path"},
+	{"session", "cwd"},
+}
+
+// idKeyPaths lists known/possible (possibly nested) key paths for a session's
+// identifier, tried in order to tolerate field renames across CLI versions.
+var idKeyPaths = [][]string{
+	{"id"},
+	{"sessionId"},
+	{"session_id"},
+	{"sessionID"},
+	{"workspace", "id"},
+	{"session", "id"},
+}
+
+// gitRootKeyPaths lists known/possible key paths for a session's git root.
+var gitRootKeyPaths = [][]string{
+	{"git_root"},
+	{"gitRoot"},
+	{"workspace", "git_root"},
+	{"workspace", "gitRoot"},
+}
+
+// lookupNestedString looks up a (possibly nested) string value in a generic
+// map decoded from YAML or JSON.
+func lookupNestedString(m map[string]interface{}, keys []string) (string, bool) {
+	cur := m
+	for i, k := range keys {
+		v, ok := cur[k]
+		if !ok {
+			return "", false
+		}
+		if i == len(keys)-1 {
+			s, ok := v.(string)
+			return s, ok
+		}
+		next, ok := v.(map[string]interface{})
+		if !ok {
+			return "", false
+		}
+		cur = next
+	}
+	return "", false
 }
 
 // GetCopilotDir returns the path to Copilot's config/data directory.
@@ -33,20 +103,56 @@ func GetSessionStateDir() (string, error) {
 	return filepath.Join(copilotDir, "session-state"), nil
 }
 
-// parseSessionMeta reads a workspace.yaml from a Copilot session directory.
+// parseSessionMeta reads a Copilot session directory's metadata file,
+// tolerating renamed files and renamed/nested fields across CLI versions.
 func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
-	path := filepath.Join(sessionDir, "workspace.yaml")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
+	var lastErr error = os.ErrNotExist
+
+	for _, name := range metadataFilenames {
+		path := filepath.Join(sessionDir, name)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		var raw map[string]interface{}
+		if strings.HasSuffix(name, ".json") {
+			if err := json.Unmarshal(data, &raw); err != nil {
+				lastErr = err
+				continue
+			}
+		} else {
+			if err := yaml.Unmarshal(data, &raw); err != nil {
+				lastErr = err
+				continue
+			}
+		}
+
+		meta := &sessionMeta{}
+		for _, keys := range idKeyPaths {
+			if v, ok := lookupNestedString(raw, keys); ok && v != "" {
+				meta.ID = v
+				break
+			}
+		}
+		for _, keys := range cwdKeyPaths {
+			if v, ok := lookupNestedString(raw, keys); ok && v != "" {
+				meta.CWD = v
+				break
+			}
+		}
+		for _, keys := range gitRootKeyPaths {
+			if v, ok := lookupNestedString(raw, keys); ok && v != "" {
+				meta.GitRoot = v
+				break
+			}
+		}
+
+		return meta, nil
 	}
 
-	var meta sessionMeta
-	if err := yaml.Unmarshal(data, &meta); err != nil {
-		return nil, err
-	}
-
-	return &meta, nil
+	return nil, lastErr
 }
 
 // GetTranscriptPath returns the path to the events.jsonl transcript within a session directory.
@@ -81,4 +187,3 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-
