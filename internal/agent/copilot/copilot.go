@@ -423,9 +423,14 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
+
+	type sessionCandidate struct {
+		dir     string
+		id      string
+		modTime time.Time
+		matched bool
+	}
+	var candidates []sessionCandidate
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -449,27 +454,60 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
+		id := meta.resolveID()
+		if id == "" {
+			// Fall back to the directory name, which Copilot conventionally
+			// names after the session identifier.
+			id = entry.Name()
 		}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+		matched := false
+		for _, dirCandidate := range meta.directoryCandidates() {
+			if agent.PathsEqual(dirCandidate, projectPath) {
+				matched = true
+				break
+			}
+		}
+
+		candidates = append(candidates, sessionCandidate{
+			dir:     entryPath,
+			id:      id,
+			modTime: modTime,
+			matched: matched,
+		})
+	}
+
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	// Prefer the most recently modified session whose directory actually matched.
+	var best *sessionCandidate
+	for i := range candidates {
+		c := &candidates[i]
+		if !c.matched {
+			continue
+		}
+		if best == nil || c.modTime.After(best.modTime) {
+			best = c
 		}
 	}
 
-	if bestDir == "" {
+	// Copilot has changed the workspace metadata field names across versions,
+	// so if nothing matched on a recognized directory field but there's only
+	// one recent session, use it as a best-effort fallback.
+	if best == nil && len(candidates) == 1 {
+		best = &candidates[0]
+	}
+
+	if best == nil {
 		return nil, nil
 	}
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
+		SessionID:      best.id,
+		TranscriptPath: GetTranscriptPath(best.dir),
+		StartedAt:      best.modTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
