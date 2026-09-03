@@ -13,6 +13,35 @@ import (
 // during session discovery across all agents.
 const RecentSessionTimeout = 5 * time.Minute
 
+// discoverSessionRetryWindow bounds how long RetryDiscoverSession keeps
+// polling before giving up.
+const discoverSessionRetryWindow = 3 * time.Second
+
+// discoverSessionRetryInterval is the pause between polling attempts.
+const discoverSessionRetryInterval = 250 * time.Millisecond
+
+// RetryDiscoverSession polls find until it returns a session or an error,
+// retrying nil-nil results for a short window. Some agent CLIs finalize
+// their session state on disk asynchronously after the process exits, so a
+// single scan performed right after the CLI exits can lose that race even
+// though the same scan succeeds while the CLI is still running (e.g. from a
+// postToolUse hook). Retrying briefly closes that gap without materially
+// slowing down commits that truly have no active session, since those return
+// nil immediately on the first attempt.
+func RetryDiscoverSession(find func() (*SessionInfo, error)) (*SessionInfo, error) {
+	deadline := time.Now().Add(discoverSessionRetryWindow)
+	for {
+		session, err := find()
+		if err != nil || session != nil {
+			return session, err
+		}
+		if time.Now().After(deadline) {
+			return nil, nil
+		}
+		time.Sleep(discoverSessionRetryInterval)
+	}
+}
+
 // IsGitCommitCommand checks whether a shell command string represents a git commit.
 func IsGitCommitCommand(command string) bool {
 	return strings.Contains(command, "git commit") ||
