@@ -304,6 +304,12 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
+// escapeSQLLiteral escapes a string for safe embedding inside a single-quoted
+// SQLite string literal by doubling embedded single quotes.
+func escapeSQLLiteral(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
@@ -316,10 +322,14 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
+	// Find most recent session for this project. Match on the stored
+	// `directory` column (the literal cwd OpenCode recorded) as well as our
+	// locally-recomputed project_id hash: newer OpenCode releases may derive
+	// project_id differently than our reimplementation of the algorithm, but
+	// `directory` is an authoritative, unambiguous field we can rely on.
 	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
+		`SELECT id FROM session WHERE project_id='%s' OR directory='%s' ORDER BY time_updated DESC LIMIT 1;`,
+		escapeSQLLiteral(projectID), escapeSQLLiteral(projectPath),
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
@@ -331,7 +341,7 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
 		`SELECT time_updated FROM session WHERE id='%s';`,
-		sessionID,
+		escapeSQLLiteral(sessionID),
 	)
 	cmd = exec.Command("sqlite3", dbPath, timeQuery)
 	timeOutput, err := cmd.Output()
@@ -356,7 +366,7 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	// Get messages for this session as a JSON array
 	msgQuery := fmt.Sprintf(
 		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
+		escapeSQLLiteral(sessionID),
 	)
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
@@ -454,7 +464,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +506,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
