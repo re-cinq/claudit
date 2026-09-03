@@ -410,6 +410,15 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// It prefers a session whose recorded workspace cwd matches projectPath, but
+// falls back to the most recently modified session overall if none match.
+// The fallback matters because manual (post-commit) discovery resolves
+// projectPath independently via git, and newer Copilot CLI releases have
+// been observed to record the workspace cwd in a form that no longer
+// compares equal to that value even though the session is otherwise the
+// right one — which previously caused manual session discovery to silently
+// find nothing.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -423,9 +432,9 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
+	var bestDir, bestAnyDir string
+	var bestSessionID, bestAnySessionID string
+	var bestModTime, bestAnyModTime time.Time
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -449,6 +458,13 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
+		// Track the most recent session regardless of cwd as a fallback.
+		if bestAnyDir == "" || modTime.After(bestAnyModTime) {
+			bestAnyDir = entryPath
+			bestAnySessionID = meta.ID
+			bestAnyModTime = modTime
+		}
+
 		if !agent.PathsEqual(meta.CWD, projectPath) {
 			continue
 		}
@@ -458,6 +474,13 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			bestSessionID = meta.ID
 			bestModTime = modTime
 		}
+	}
+
+	if bestDir == "" {
+		// No cwd match found; fall back to the most recently modified session.
+		bestDir = bestAnyDir
+		bestSessionID = bestAnySessionID
+		bestModTime = bestAnyModTime
 	}
 
 	if bestDir == "" {
@@ -471,5 +494,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
