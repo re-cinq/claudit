@@ -63,6 +63,17 @@ func GetSessionDir(projectPath string) (string, error) {
 	return filepath.Join(dataDir, "storage", "session", projectID), nil
 }
 
+// GetSessionRootDir returns the root session storage directory, which
+// contains one subdirectory per project ID.
+func GetSessionRootDir() (string, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(dataDir, "storage", "session"), nil
+}
+
 // GetMessageDir returns the message storage directory for a session.
 func GetMessageDir(sessionID string) (string, error) {
 	dataDir, err := GetDataDir()

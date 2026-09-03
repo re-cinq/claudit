@@ -15,6 +15,37 @@ type sessionMeta struct {
 	GitRoot string `yaml:"git_root,omitempty"`
 }
 
+// cwdFieldAliases lists alternate key names Copilot CLI may use for the
+// session's working directory in workspace.yaml. Newer CLI versions have
+// been observed renaming or nesting this field, so we probe common
+// alternatives when the canonical "cwd" key isn't present.
+var cwdFieldAliases = []string{
+	"cwd", "workingDirectory", "working_directory", "directory",
+	"workspaceFolder", "workspace_folder", "path", "root",
+}
+
+// findStringField looks up any of the given keys in raw, checking the top
+// level first and then one level of nesting (e.g. a "workspace" sub-object).
+func findStringField(raw map[string]interface{}, keys []string) string {
+	for _, k := range keys {
+		if v, ok := raw[k].(string); ok && v != "" {
+			return v
+		}
+	}
+	for _, v := range raw {
+		nested, ok := v.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		for _, k := range keys {
+			if s, ok := nested[k].(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
 // GetCopilotDir returns the path to Copilot's config/data directory.
 func GetCopilotDir() (string, error) {
 	home, err := os.UserHomeDir()
@@ -44,6 +75,20 @@ func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 	var meta sessionMeta
 	if err := yaml.Unmarshal(data, &meta); err != nil {
 		return nil, err
+	}
+
+	// Copilot CLI has changed workspace.yaml's field names across versions.
+	// If the canonical "cwd" field is missing, probe common alternate names
+	// (including inside a nested sub-object) before giving up on it.
+	if meta.CWD == "" {
+		var raw map[string]interface{}
+		if err := yaml.Unmarshal(data, &raw); err == nil {
+			meta.CWD = findStringField(raw, cwdFieldAliases)
+		}
+	}
+
+	if meta.ID == "" {
+		meta.ID = filepath.Base(sessionDir)
 	}
 
 	return &meta, nil
@@ -81,4 +126,3 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-

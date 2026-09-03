@@ -410,6 +410,10 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+// It prefers sessions whose recorded CWD matches projectPath, but falls back to the most
+// recently modified session overall when no CWD match is found — workspace.yaml's CWD field
+// (or its name) can change across Copilot CLI versions, and reporting no session at all would
+// be worse than a best-effort guess bounded by the recent-session timeout.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -423,9 +427,11 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
+
 	var bestDir string
 	var bestSessionID string
 	var bestModTime time.Time
+	var bestIsMatch bool
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -449,14 +455,13 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
-		}
+		isMatch := meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)
 
-		if bestDir == "" || modTime.After(bestModTime) {
+		if bestDir == "" || (isMatch && !bestIsMatch) || (isMatch == bestIsMatch && modTime.After(bestModTime)) {
 			bestDir = entryPath
 			bestSessionID = meta.ID
 			bestModTime = modTime
+			bestIsMatch = isMatch
 		}
 	}
 
@@ -471,5 +476,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
