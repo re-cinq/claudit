@@ -409,6 +409,14 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
+// copilotSessionCandidate represents a recently-modified session directory
+// found while scanning Copilot's session state directory.
+type copilotSessionCandidate struct {
+	dir       string
+	sessionID string
+	modTime   time.Time
+}
+
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
@@ -423,9 +431,9 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
+
+	var best *copilotSessionCandidate
+	var recentCandidates []copilotSessionCandidate
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -449,27 +457,38 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		c := copilotSessionCandidate{dir: entryPath, sessionID: meta.ID, modTime: modTime}
+		recentCandidates = append(recentCandidates, c)
+
+		// Match against either the recorded cwd or git root: newer Copilot
+		// CLI releases have been observed to populate one but not the other.
+		matchesCWD := meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)
+		matchesGitRoot := meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath)
+		if !matchesCWD && !matchesGitRoot {
 			continue
 		}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+		if best == nil || modTime.After(best.modTime) {
+			best = &c
 		}
 	}
 
-	if bestDir == "" {
+	if best == nil && len(recentCandidates) == 1 {
+		// Neither cwd nor git_root matched a known project location — the
+		// workspace.yaml path fields may have changed format. If there's
+		// exactly one recent session in the state dir, assume it's ours
+		// rather than silently dropping the conversation.
+		best = &recentCandidates[0]
+	}
+
+	if best == nil {
 		return nil, nil
 	}
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
+		SessionID:      best.sessionID,
+		TranscriptPath: GetTranscriptPath(best.dir),
+		StartedAt:      best.modTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
