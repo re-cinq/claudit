@@ -410,6 +410,9 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+// Copilot CLI's workspace.yaml schema has drifted across releases, so a session whose CWD
+// can't be determined is kept as a fallback candidate: if it's the only recent session, we
+// assume it belongs to this project rather than silently discovering nothing.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -423,9 +426,15 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
+
+	type candidate struct {
+		dir     string
+		id      string
+		modTime time.Time
+	}
+
+	var best *candidate
+	var fallbackCandidates []candidate
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -445,31 +454,36 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
 		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
+		if err != nil || meta == nil || meta.ID == "" {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		if meta.CWD != "" {
+			if !agent.PathsEqual(meta.CWD, projectPath) {
+				continue
+			}
+			if best == nil || modTime.After(best.modTime) {
+				best = &candidate{dir: entryPath, id: meta.ID, modTime: modTime}
+			}
 			continue
 		}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
-		}
+		// CWD couldn't be determined (schema drift): remember it as a fallback.
+		fallbackCandidates = append(fallbackCandidates, candidate{dir: entryPath, id: meta.ID, modTime: modTime})
 	}
 
-	if bestDir == "" {
+	if best == nil && len(fallbackCandidates) == 1 {
+		best = &fallbackCandidates[0]
+	}
+
+	if best == nil {
 		return nil, nil
 	}
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
+		SessionID:      best.id,
+		TranscriptPath: GetTranscriptPath(best.dir),
+		StartedAt:      best.modTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
