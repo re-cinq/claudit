@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -81,6 +82,22 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 	var transcriptData []byte
 	if hook.TranscriptData != "" {
 		transcriptData = []byte(hook.TranscriptData)
+	}
+
+	// Cache the session while the plugin hook is live and the transcript
+	// data/path are known good. OpenCode's own session storage (flat files
+	// pre-v1.2, SQLite v1.2+) may no longer be reachable in the same way by
+	// the time a manual commit's post-commit hook calls DiscoverSession
+	// after the CLI process has exited, so this cache is the fallback that
+	// makes manual-commit capture reliable across storage-format changes.
+	if hook.SessionID != "" && hook.ProjectDir != "" {
+		_ = agent.CacheDiscoveredSession(hook.ProjectDir, agent.OpenCode, &agent.SessionInfo{
+			SessionID:      hook.SessionID,
+			TranscriptPath: transcriptPath,
+			TranscriptData: transcriptData,
+			StartedAt:      time.Now().Format(time.RFC3339),
+			ProjectPath:    hook.ProjectDir,
+		})
 	}
 
 	return &agent.HookData{
@@ -232,6 +249,14 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 // DiscoverSession finds an active or recent OpenCode session.
 // It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	// Prefer a session cached while the plugin hook was live: this covers
+	// OpenCode versions/storage layouts (flat files or SQLite) that may not
+	// be reliably queryable anymore by the time a manual commit's
+	// post-commit hook runs after the CLI process has exited.
+	if cached := agent.CachedSession(projectPath, agent.OpenCode); cached != nil {
+		return cached, nil
+	}
+
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
 	if err != nil {
@@ -454,7 +479,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +521,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```

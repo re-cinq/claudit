@@ -1,3 +1,4 @@
+```go
 package agent
 
 import (
@@ -204,6 +205,66 @@ type SessionInfo struct {
 	TranscriptData []byte // inline transcript data (e.g. from SQLite discovery)
 }
 
+// activeSessionCachePath returns the path to the shiftlog-owned cache file
+// used to remember a session discovered while an agent's hook was actively
+// firing, keyed per agent so multiple agents can't clobber each other.
+func activeSessionCachePath(projectPath string, agentName Name) string {
+	return filepath.Join(projectPath, ".shiftlog", "active-session-"+string(agentName)+".json")
+}
+
+// CacheDiscoveredSession persists a session discovered via a live hook
+// invocation (e.g. postToolUse), so DiscoverSession can still recover it
+// later even if the coding agent's own on-disk/transient session state has
+// since been rotated or cleaned up (some agent CLIs clear "active session"
+// state shortly after the CLI process exits, which otherwise breaks
+// discovery for commits made manually right after a session ends). This is
+// a best-effort cache: callers should ignore errors, since it only ever
+// supplements the agent's own discovery mechanism.
+func CacheDiscoveredSession(projectPath string, agentName Name, info *SessionInfo) error {
+	if info == nil || info.SessionID == "" || projectPath == "" {
+		return nil
+	}
+	if fi, err := os.Stat(projectPath); err != nil || !fi.IsDir() {
+		return nil
+	}
+
+	path := activeSessionCachePath(projectPath, agentName)
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+
+	data, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(path, data, 0600)
+}
+
+// CachedSession reads back a session previously persisted by
+// CacheDiscoveredSession, if it still falls within the recent-session
+// window. Returns nil if no cache exists, it's unreadable, or it has
+// expired.
+func CachedSession(projectPath string, agentName Name) *SessionInfo {
+	data, err := os.ReadFile(activeSessionCachePath(projectPath, agentName))
+	if err != nil {
+		return nil
+	}
+
+	var info SessionInfo
+	if err := json.Unmarshal(data, &info); err != nil || info.SessionID == "" {
+		return nil
+	}
+
+	if startedAt, err := time.Parse(time.RFC3339, info.StartedAt); err == nil {
+		if time.Since(startedAt) > RecentSessionTimeout {
+			return nil
+		}
+	}
+
+	return &info
+}
+
 // Agent defines the interface that each coding agent CLI must implement.
 type Agent interface {
 	// Identity
@@ -236,3 +297,4 @@ type Agent interface {
 	// Rendering: map tool names for display
 	ToolAliases() map[string]string
 }
+```

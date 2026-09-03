@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -160,6 +161,27 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 		}
 	}
 
+	// Copilot CLI cleans up ~/.copilot/session-state/<id>/ shortly after the
+	// process exits, which breaks discovery for commits made manually right
+	// after a session ends. Cache the session (with a live copy of the
+	// transcript) here, while the hook fires and the data is still known
+	// good, so DiscoverSession can recover it later even if the CLI has
+	// already removed its own on-disk state.
+	if sessionID != "" && hook.CWD != "" {
+		info := &agent.SessionInfo{
+			SessionID:      sessionID,
+			TranscriptPath: transcriptPath,
+			StartedAt:      time.Now().Format(time.RFC3339),
+			ProjectPath:    hook.CWD,
+		}
+		if transcriptPath != "" {
+			if data, err := os.ReadFile(transcriptPath); err == nil {
+				info.TranscriptData = data
+			}
+		}
+		_ = agent.CacheDiscoveredSession(hook.CWD, agent.Copilot, info)
+	}
+
 	return &agent.HookData{
 		SessionID:      sessionID,
 		TranscriptPath: transcriptPath,
@@ -228,6 +250,13 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 
 // DiscoverSession finds an active or recent Copilot CLI session.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
+	// Prefer a session cached while the postToolUse hook was live: Copilot
+	// CLI removes its own session-state directory shortly after the process
+	// exits, so by the time a manual commit's post-commit hook runs, the
+	// directory scan below may find nothing even though a session just ran.
+	if cached := agent.CachedSession(projectPath, agent.Copilot); cached != nil {
+		return cached, nil
+	}
 	return scanForRecentSession(projectPath)
 }
 
@@ -471,5 +500,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
