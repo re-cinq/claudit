@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -427,6 +428,14 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestSessionID string
 	var bestModTime time.Time
 
+	// Newer Copilot CLI releases have been observed to omit the "cwd" field
+	// from workspace.yaml. When that happens we can't verify a session
+	// belongs to this project by path, so track the most recently modified
+	// session as a fallback candidate instead of discarding it outright.
+	var fallbackDir string
+	var fallbackSessionID string
+	var fallbackModTime time.Time
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -449,6 +458,15 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
+		if meta.CWD == "" {
+			if fallbackDir == "" || modTime.After(fallbackModTime) {
+				fallbackDir = entryPath
+				fallbackSessionID = meta.ID
+				fallbackModTime = modTime
+			}
+			continue
+		}
+
 		if !agent.PathsEqual(meta.CWD, projectPath) {
 			continue
 		}
@@ -458,6 +476,10 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			bestSessionID = meta.ID
 			bestModTime = modTime
 		}
+	}
+
+	if bestDir == "" {
+		bestDir, bestSessionID, bestModTime = fallbackDir, fallbackSessionID, fallbackModTime
 	}
 
 	if bestDir == "" {
@@ -471,5 +493,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```

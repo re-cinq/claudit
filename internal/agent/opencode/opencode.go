@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -304,6 +305,28 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
+// findMostRecentSessionID queries the OpenCode SQLite database for the most
+// recently updated session ID. When projectID is empty, no project filter is
+// applied.
+func findMostRecentSessionID(dbPath, projectID string) string {
+	var sessionQuery string
+	if projectID != "" {
+		sessionQuery = fmt.Sprintf(
+			`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
+			projectID,
+		)
+	} else {
+		sessionQuery = `SELECT id FROM session ORDER BY time_updated DESC LIMIT 1;`
+	}
+
+	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
+	sessionOutput, err := cmd.Output()
+	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+		return ""
+	}
+	return strings.TrimSpace(string(sessionOutput))
+}
+
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
@@ -317,23 +340,24 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	}
 
 	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
-	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+	sessionID := findMostRecentSessionID(dbPath, projectID)
+	if sessionID == "" {
+		// OpenCode's project identification scheme may no longer match our
+		// computed projectID (e.g. sessions are no longer keyed by git root
+		// commit hash). Fall back to the globally most recent session —
+		// still bounded by the recency check below.
+		sessionID = findMostRecentSessionID(dbPath, "")
+	}
+	if sessionID == "" {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
 		`SELECT time_updated FROM session WHERE id='%s';`,
 		sessionID,
 	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
+	cmd := exec.Command("sqlite3", dbPath, timeQuery)
 	timeOutput, err := cmd.Output()
 	if err == nil {
 		timeStr := strings.TrimSpace(string(timeOutput))
@@ -497,4 +521,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
