@@ -423,9 +423,20 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
+	projectGitRoot := gitRootFor(projectPath)
+
 	var bestDir string
 	var bestSessionID string
 	var bestModTime time.Time
+
+	// unmatchedDir/unmatchedCount track recent session directories whose
+	// metadata didn't match projectPath by any known field. If exactly one
+	// such directory exists, it's used as a last-resort fallback so that a
+	// Copilot CLI update renaming/relocating the fields we match on doesn't
+	// silently drop the session (ambiguous when there's more than one).
+	var unmatchedCount int
+	var unmatchedDir, unmatchedSessionID string
+	var unmatchedModTime time.Time
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -449,7 +460,16 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		cwdMatches := agent.PathsEqual(meta.CWD, projectPath)
+		gitRootMatches := meta.GitRoot != "" && projectGitRoot != "" && agent.PathsEqual(meta.GitRoot, projectGitRoot)
+
+		if !cwdMatches && !gitRootMatches {
+			unmatchedCount++
+			if unmatchedDir == "" || modTime.After(unmatchedModTime) {
+				unmatchedDir = entryPath
+				unmatchedSessionID = meta.ID
+				unmatchedModTime = modTime
+			}
 			continue
 		}
 
@@ -458,6 +478,12 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			bestSessionID = meta.ID
 			bestModTime = modTime
 		}
+	}
+
+	if bestDir == "" && unmatchedCount == 1 {
+		bestDir = unmatchedDir
+		bestSessionID = unmatchedSessionID
+		bestModTime = unmatchedModTime
 	}
 
 	if bestDir == "" {
@@ -471,5 +497,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-

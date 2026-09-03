@@ -3,7 +3,9 @@ package copilot
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -49,6 +51,20 @@ func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 	return &meta, nil
 }
 
+// gitRootFor returns the git repository root for dir, or "" if dir is not
+// inside a git repository or git is unavailable. Used as a fallback match
+// key when a session's recorded cwd doesn't line up with projectPath
+// (e.g. due to path normalization differences in the agent CLI).
+func gitRootFor(dir string) string {
+	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	cmd.Dir = dir
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+
 // GetTranscriptPath returns the path to the events.jsonl transcript within a session directory.
 func GetTranscriptPath(sessionDir string) string {
 	return filepath.Join(sessionDir, "events.jsonl")
@@ -81,4 +97,3 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-
