@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -33,6 +34,17 @@ func GetSessionStateDir() (string, error) {
 	return filepath.Join(copilotDir, "session-state"), nil
 }
 
+// candidateIDKeys, candidateCWDKeys and candidateGitRootKeys list the field
+// names Copilot CLI has used (across releases) for a session's identifier,
+// working directory, and git root in workspace.yaml. Parsing checks all of
+// them so discovery keeps working even if a release renames a field.
+// candidateNestedKeys covers releases that wrap the metadata under a key
+// instead of storing it at the document root.
+var candidateIDKeys = []string{"id", "sessionId", "sessionID", "session_id"}
+var candidateCWDKeys = []string{"cwd", "cwdPath", "workingDirectory", "workingDir", "directory", "dir"}
+var candidateGitRootKeys = []string{"git_root", "gitRoot", "gitRootPath"}
+var candidateNestedKeys = []string{"workspace", "session", "meta"}
+
 // parseSessionMeta reads a workspace.yaml from a Copilot session directory.
 func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 	path := filepath.Join(sessionDir, "workspace.yaml")
@@ -41,12 +53,65 @@ func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 		return nil, err
 	}
 
-	var meta sessionMeta
-	if err := yaml.Unmarshal(data, &meta); err != nil {
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, err
 	}
 
-	return &meta, nil
+	meta := &sessionMeta{
+		ID:      firstStringField(raw, candidateIDKeys),
+		CWD:     firstStringField(raw, candidateCWDKeys),
+		GitRoot: firstStringField(raw, candidateGitRootKeys),
+	}
+
+	for _, key := range candidateNestedKeys {
+		nested, ok := asStringMap(raw[key])
+		if !ok {
+			continue
+		}
+		if meta.ID == "" {
+			meta.ID = firstStringField(nested, candidateIDKeys)
+		}
+		if meta.CWD == "" {
+			meta.CWD = firstStringField(nested, candidateCWDKeys)
+		}
+		if meta.GitRoot == "" {
+			meta.GitRoot = firstStringField(nested, candidateGitRootKeys)
+		}
+	}
+
+	return meta, nil
+}
+
+// firstStringField returns the first non-empty string value found in m for
+// any of the given keys.
+func firstStringField(m map[string]interface{}, keys []string) string {
+	for _, k := range keys {
+		if v, ok := m[k].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// asStringMap converts a YAML-decoded value into map[string]interface{},
+// handling both the map[string]interface{} and map[interface{}]interface{}
+// shapes a YAML decoder may produce for nested mappings.
+func asStringMap(v interface{}) (map[string]interface{}, bool) {
+	switch m := v.(type) {
+	case map[string]interface{}:
+		return m, true
+	case map[interface{}]interface{}:
+		out := make(map[string]interface{}, len(m))
+		for k, vv := range m {
+			if ks, ok := k.(string); ok {
+				out[ks] = vv
+			}
+		}
+		return out, true
+	default:
+		return nil, false
+	}
 }
 
 // GetTranscriptPath returns the path to the events.jsonl transcript within a session directory.
@@ -81,4 +146,4 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-
+```

@@ -1,12 +1,13 @@
+```go
 package opencode
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -304,7 +305,15 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
-// discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
+// discoverFromSQLite queries the OpenCode SQLite database for the most
+// recent session belonging to this project. OpenCode's SQLite schema has
+// shifted across releases (the message table already needs json_patch to
+// attach an id to its data blob, showing the schema isn't just flat scalar
+// columns), so instead of assuming fixed column names like project_id or
+// time_updated, each row is dumped as JSON (sqlite3 -json) and searched
+// structurally for a value that identifies this project — either the
+// locally computed project ID or the actual working directory — and for a
+// recency timestamp.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
@@ -316,57 +325,55 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
-	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
-	)
-	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
-	sessionOutput, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(sessionOutput)) == "" {
+	rows, err := queryJSONRows(dbPath, "SELECT * FROM session ORDER BY rowid DESC LIMIT 200;")
+	if err != nil || len(rows) == 0 {
 		return nil, nil
 	}
-	sessionID := strings.TrimSpace(string(sessionOutput))
 
-	// Check if this session was recent (within timeout)
-	timeQuery := fmt.Sprintf(
-		`SELECT time_updated FROM session WHERE id='%s';`,
-		sessionID,
-	)
-	cmd = exec.Command("sqlite3", dbPath, timeQuery)
-	timeOutput, err := cmd.Output()
-	if err == nil {
-		timeStr := strings.TrimSpace(string(timeOutput))
-		if t, err := time.Parse(time.RFC3339Nano, timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02T15:04:05.000Z", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
-		} else if t, err := time.Parse("2006-01-02 15:04:05", timeStr); err == nil {
-			if time.Since(t) > agent.RecentSessionTimeout {
-				return nil, nil
-			}
+	var sessionID string
+	var updatedAt time.Time
+	var haveTime bool
+	for _, row := range rows {
+		if !rowMatchesTarget(row, projectID) && !rowMatchesPath(row, projectPath) {
+			continue
 		}
-		// If we can't parse the time, proceed anyway — better to try than skip
+		id, _ := row["id"].(string)
+		if id == "" {
+			continue
+		}
+		sessionID = id
+		updatedAt, haveTime = findMostRecentTime(row)
+		break
 	}
 
-	// Get messages for this session as a JSON array
-	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
-	)
-	cmd = exec.Command("sqlite3", dbPath, msgQuery)
-	msgOutput, err := cmd.Output()
+	if sessionID == "" {
+		return nil, nil
+	}
+
+	// If we can't find a recency timestamp, proceed anyway — better to try
+	// than to silently give up.
+	if haveTime && time.Since(updatedAt) > agent.RecentSessionTimeout {
+		return nil, nil
+	}
+
+	msgRows, err := queryJSONRows(dbPath, "SELECT * FROM message ORDER BY rowid ASC;")
 	if err != nil {
 		return nil, nil
 	}
 
-	transcriptData := []byte(strings.TrimSpace(string(msgOutput)))
-	// sqlite3 returns "[null]" when no rows match
-	if string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
+	var messages []map[string]interface{}
+	for _, row := range msgRows {
+		if rowMatchesTarget(row, sessionID) {
+			messages = append(messages, row)
+		}
+	}
+
+	if len(messages) == 0 {
+		return nil, nil
+	}
+
+	transcriptData, err := json.Marshal(messages)
+	if err != nil {
 		return nil, nil
 	}
 
@@ -377,6 +384,160 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// queryJSONRows runs a query against the OpenCode SQLite database and
+// returns each result row as a map of column name to value, using sqlite3's
+// -json output mode so callers don't need to know the exact column layout.
+func queryJSONRows(dbPath, query string) ([]map[string]interface{}, error) {
+	cmd := exec.Command("sqlite3", "-json", dbPath, query)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	trimmed := strings.TrimSpace(string(out))
+	if trimmed == "" {
+		return nil, nil
+	}
+
+	var rows []map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// rowMatchesTarget reports whether any string value in row (recursing into
+// nested/embedded JSON blobs) equals target exactly.
+func rowMatchesTarget(row map[string]interface{}, target string) bool {
+	if target == "" {
+		return false
+	}
+	return valueContains(row, target, false)
+}
+
+// rowMatchesPath reports whether any string value in row (recursing into
+// nested/embedded JSON blobs) refers to the same filesystem path as target.
+func rowMatchesPath(row map[string]interface{}, target string) bool {
+	if target == "" {
+		return false
+	}
+	return valueContains(row, target, true)
+}
+
+// valueContains recursively searches v for a string matching target, either
+// by exact equality or (when pathMode is true) by filesystem path equality.
+// String values that look like embedded JSON are unmarshalled and searched
+// too, since some OpenCode releases store a JSON blob inside a TEXT column
+// alongside (or instead of) flat columns.
+func valueContains(v interface{}, target string, pathMode bool) bool {
+	switch val := v.(type) {
+	case string:
+		if val == "" {
+			return false
+		}
+		if pathMode {
+			if agent.PathsEqual(val, target) {
+				return true
+			}
+		} else if val == target {
+			return true
+		}
+
+		trimmed := strings.TrimSpace(val)
+		if len(trimmed) > 1 && (trimmed[0] == '{' || trimmed[0] == '[') {
+			var nested interface{}
+			if err := json.Unmarshal([]byte(trimmed), &nested); err == nil {
+				return valueContains(nested, target, pathMode)
+			}
+		}
+		return false
+	case map[string]interface{}:
+		for _, vv := range val {
+			if valueContains(vv, target, pathMode) {
+				return true
+			}
+		}
+	case []interface{}:
+		for _, vv := range val {
+			if valueContains(vv, target, pathMode) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// findMostRecentTime searches v for the most recent timestamp among any
+// fields whose key looks time-related (e.g. "updated", "created", "time"),
+// handling both epoch numbers (seconds, milliseconds, or microseconds) and
+// common string time formats.
+func findMostRecentTime(v interface{}) (time.Time, bool) {
+	var best time.Time
+	found := false
+
+	var walk func(key string, val interface{})
+	walk = func(key string, val interface{}) {
+		switch t := val.(type) {
+		case map[string]interface{}:
+			for k, vv := range t {
+				walk(k, vv)
+			}
+		case []interface{}:
+			for _, vv := range t {
+				walk(key, vv)
+			}
+		default:
+			lk := strings.ToLower(key)
+			if !strings.Contains(lk, "update") && !strings.Contains(lk, "creat") && lk != "time" {
+				return
+			}
+			if tm, ok := extractTime(t); ok {
+				if !found || tm.After(best) {
+					best = tm
+					found = true
+				}
+			}
+		}
+	}
+	walk("", v)
+	return best, found
+}
+
+// extractTime converts a JSON-decoded value (float64 epoch or string) into a time.Time.
+func extractTime(v interface{}) (time.Time, bool) {
+	switch val := v.(type) {
+	case float64:
+		return epochToTime(val), true
+	case string:
+		if t, err := time.Parse(time.RFC3339Nano, val); err == nil {
+			return t, true
+		}
+		if t, err := time.Parse("2006-01-02T15:04:05.000Z", val); err == nil {
+			return t, true
+		}
+		if t, err := time.Parse("2006-01-02 15:04:05", val); err == nil {
+			return t, true
+		}
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			return epochToTime(f), true
+		}
+	}
+	return time.Time{}, false
+}
+
+// epochToTime converts an epoch value of unknown resolution (seconds,
+// milliseconds, or microseconds) into a time.Time.
+func epochToTime(v float64) time.Time {
+	switch {
+	case v > 1e15:
+		return time.UnixMicro(int64(v))
+	case v > 1e12:
+		return time.UnixMilli(int64(v))
+	default:
+		return time.Unix(int64(v), 0)
+	}
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -454,7 +615,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +657,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
