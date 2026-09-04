@@ -449,7 +449,7 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		if !sessionMetaMatchesProject(meta, projectPath) {
 			continue
 		}
 
@@ -472,4 +472,21 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	}, nil
 }
 
-
+// sessionMetaMatchesProject reports whether a Copilot session's recorded
+// location metadata corresponds to projectPath. Copilot CLI has recorded the
+// working directory under different workspace.yaml keys across versions
+// ("cwd" and "git_root"); a session matches if either one resolves to
+// projectPath. If a given build omits both fields entirely, the session is
+// not excluded on that basis alone — rejecting it would silently discard
+// every session and break discovery outright, which is worse than the small
+// risk of picking an unrelated recent session in the single-project case
+// that "shiftlog store --manual" runs in.
+func sessionMetaMatchesProject(meta *sessionMeta, projectPath string) bool {
+	if meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath) {
+		return true
+	}
+	if meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath) {
+		return true
+	}
+	return meta.CWD == "" && meta.GitRoot == ""
+}

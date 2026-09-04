@@ -353,20 +353,12 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
 
-	// Get messages for this session as a JSON array
-	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
-	)
-	cmd = exec.Command("sqlite3", dbPath, msgQuery)
-	msgOutput, err := cmd.Output()
-	if err != nil {
-		return nil, nil
-	}
-
-	transcriptData := []byte(strings.TrimSpace(string(msgOutput)))
-	// sqlite3 returns "[null]" when no rows match
-	if string(transcriptData) == "[null]" || string(transcriptData) == "[]" {
+	// Get messages for this session as a JSON array. The exact column names
+	// on the "message" table (the session-linking column, and the column
+	// used to order messages chronologically) have varied across OpenCode
+	// releases, so this tolerates either changing or disappearing.
+	transcriptData := queryMessagesForSession(dbPath, sessionID)
+	if len(transcriptData) == 0 {
 		return nil, nil
 	}
 
@@ -377,6 +369,69 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
+}
+
+// messageSessionColumn returns the name of the column on OpenCode's
+// "message" table that references the owning session. OpenCode has used
+// different naming conventions for this column across versions (e.g.
+// "session_id" vs "sessionID"); rather than hardcoding one, inspect the
+// actual table schema so discovery keeps working across releases.
+func messageSessionColumn(dbPath string) string {
+	cmd := exec.Command("sqlite3", dbPath, "PRAGMA table_info(message);")
+	output, err := cmd.Output()
+	if err != nil {
+		return "session_id"
+	}
+
+	for _, line := range strings.Split(string(output), "\n") {
+		cols := strings.Split(line, "|")
+		if len(cols) < 2 {
+			continue
+		}
+		name := strings.TrimSpace(cols[1])
+		switch strings.ToLower(name) {
+		case "session_id", "sessionid":
+			return name
+		}
+	}
+
+	return "session_id"
+}
+
+// queryMessagesForSession fetches all messages for a session as a JSON
+// array. It first tries the fully-specified query (filtered and ordered
+// chronologically); if the ordering column doesn't exist in this OpenCode
+// version's schema, it retries without ordering rather than failing
+// discovery outright.
+func queryMessagesForSession(dbPath, sessionID string) []byte {
+	sessionCol := messageSessionColumn(dbPath)
+
+	queries := []string{
+		fmt.Sprintf(
+			`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE %s='%s' ORDER BY time_created;`,
+			sessionCol, sessionID,
+		),
+		fmt.Sprintf(
+			`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE %s='%s';`,
+			sessionCol, sessionID,
+		),
+	}
+
+	for _, q := range queries {
+		cmd := exec.Command("sqlite3", dbPath, q)
+		output, err := cmd.Output()
+		if err != nil {
+			continue
+		}
+
+		data := strings.TrimSpace(string(output))
+		if data == "" || data == "[null]" || data == "[]" {
+			continue
+		}
+		return []byte(data)
+	}
+
+	return nil
 }
 
 // RestoreSession writes a session to OpenCode's storage location.
@@ -454,7 +509,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +551,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
