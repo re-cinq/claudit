@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -410,6 +411,10 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+// It prefers a session whose recorded working directory matches projectPath, but falls back to
+// the most recently modified recent session when no session records a matching (or any) working
+// directory — Copilot CLI has changed the workspace.yaml field names across versions, and manual
+// commit discovery only ever runs immediately after a session for this project just finished.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -423,9 +428,11 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
+
 	var bestDir string
 	var bestSessionID string
 	var bestModTime time.Time
+	var bestCWDMatch bool
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -442,21 +449,28 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
 		meta, err := parseSessionMeta(entryPath)
 		if err != nil || meta == nil {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
+		sessionID := meta.ID
+		if sessionID == "" {
+			sessionID = entry.Name()
 		}
 
-		if bestDir == "" || modTime.After(bestModTime) {
+		cwdMatch := meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)
+
+		better := bestDir == "" ||
+			(cwdMatch && !bestCWDMatch) ||
+			(cwdMatch == bestCWDMatch && modTime.After(bestModTime))
+
+		if better {
 			bestDir = entryPath
-			bestSessionID = meta.ID
+			bestSessionID = sessionID
 			bestModTime = modTime
+			bestCWDMatch = cwdMatch
 		}
 	}
 
@@ -471,5 +485,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
