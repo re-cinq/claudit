@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -228,7 +229,15 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 
 // DiscoverSession finds an active or recent Copilot CLI session.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	return scanForRecentSession(projectPath)
+	if info, err := scanForRecentSession(projectPath); err == nil && info != nil {
+		return info, nil
+	}
+	// Copilot's session-state directory is not guaranteed to still be present
+	// or matchable once the CLI process has exited (e.g. after a one-shot
+	// `copilot -p` run), so manual (post-commit hook) discovery falls back to
+	// whatever shiftlog itself observed and cached while the session was
+	// still live (see cacheDiscoveredSession).
+	return loadCachedSession(projectPath), nil
 }
 
 // RestoreSession writes a transcript to Copilot CLI's expected location.
@@ -464,12 +473,13 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		return nil, nil
 	}
 
-	return &agent.SessionInfo{
+	info := &agent.SessionInfo{
 		SessionID:      bestSessionID,
 		TranscriptPath: GetTranscriptPath(bestDir),
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
-	}, nil
+	}
+	cacheDiscoveredSession(projectPath, info.SessionID, info.TranscriptPath)
+	return info, nil
 }
-
-
+```

@@ -1,11 +1,18 @@
+```go
 package copilot
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/re-cinq/shift-log/internal/agent"
 )
 
 // sessionMeta represents lightweight metadata from a Copilot session workspace.yaml.
@@ -82,3 +89,79 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
 
+// cachedSession is shiftlog's own durable record of a discovered Copilot
+// session, keyed by project path. Copilot's on-disk session-state directory
+// for a session is not guaranteed to still exist or still be matchable by
+// CWD once the CLI process has exited (e.g. after a one-shot `copilot -p`
+// run), so shiftlog caches whatever it discovers while the process is still
+// live and falls back to this cache for later, out-of-process discovery
+// (the `--manual` / post-commit hook flow).
+type cachedSession struct {
+	SessionID      string    `json:"session_id"`
+	TranscriptPath string    `json:"transcript_path"`
+	ProjectPath    string    `json:"project_path"`
+	CachedAt       time.Time `json:"cached_at"`
+}
+
+// cacheFilePath returns the path to shiftlog's cache file for a project.
+func cacheFilePath(projectPath string) (string, error) {
+	copilotDir, err := GetCopilotDir()
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(projectPath))
+	name := hex.EncodeToString(sum[:]) + ".json"
+	return filepath.Join(copilotDir, "shiftlog-cache", name), nil
+}
+
+// cacheDiscoveredSession records a successful session discovery so it can be
+// recovered later even if Copilot's own session-state has since disappeared.
+func cacheDiscoveredSession(projectPath, sessionID, transcriptPath string) {
+	if sessionID == "" {
+		return
+	}
+	path, err := cacheFilePath(projectPath)
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return
+	}
+	data, err := json.Marshal(cachedSession{
+		SessionID:      sessionID,
+		TranscriptPath: transcriptPath,
+		ProjectPath:    projectPath,
+		CachedAt:       time.Now(),
+	})
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, data, 0600)
+}
+
+// loadCachedSession returns a previously cached session discovery for a
+// project, if one exists and is still within the recent-session window.
+func loadCachedSession(projectPath string) *agent.SessionInfo {
+	path, err := cacheFilePath(projectPath)
+	if err != nil {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var cs cachedSession
+	if err := json.Unmarshal(data, &cs); err != nil {
+		return nil
+	}
+	if time.Since(cs.CachedAt) > agent.RecentSessionTimeout {
+		return nil
+	}
+	return &agent.SessionInfo{
+		SessionID:      cs.SessionID,
+		TranscriptPath: cs.TranscriptPath,
+		StartedAt:      cs.CachedAt.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}
+}
+```
