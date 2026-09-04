@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -46,7 +47,38 @@ func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 		return nil, err
 	}
 
+	// Newer Copilot CLI releases have been observed using different key
+	// names for the working directory / git root / session id. If the
+	// expected keys came back empty, fall back to scanning the raw
+	// document for known aliases so we don't silently fail to match a
+	// valid session just because a field was renamed.
+	if meta.CWD == "" || meta.GitRoot == "" || meta.ID == "" {
+		var raw map[string]interface{}
+		if err := yaml.Unmarshal(data, &raw); err == nil {
+			if meta.CWD == "" {
+				meta.CWD = firstNonEmptyString(raw, "cwd", "workingDirectory", "working_dir", "directory", "path", "workspacePath", "workspace_path")
+			}
+			if meta.GitRoot == "" {
+				meta.GitRoot = firstNonEmptyString(raw, "git_root", "gitRoot", "root", "repoRoot", "repo_root")
+			}
+			if meta.ID == "" {
+				meta.ID = firstNonEmptyString(raw, "id", "sessionId", "session_id")
+			}
+		}
+	}
+
 	return &meta, nil
+}
+
+// firstNonEmptyString returns the first non-empty string value found in raw
+// for the given candidate keys, or "" if none match.
+func firstNonEmptyString(raw map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if v, ok := raw[key].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // GetTranscriptPath returns the path to the events.jsonl transcript within a session directory.
@@ -81,4 +113,4 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-
+```

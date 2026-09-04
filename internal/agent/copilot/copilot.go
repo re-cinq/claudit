@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -449,13 +450,26 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		// Match on either the working directory or the git repo root.
+		// Depending on Copilot CLI version and invocation mode, only one
+		// of these fields may actually be populated in workspace.yaml.
+		matched := meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)
+		if !matched && meta.GitRoot != "" {
+			matched = agent.PathsEqual(meta.GitRoot, projectPath)
+		}
+		if !matched {
 			continue
+		}
+
+		sessionID := meta.ID
+		if sessionID == "" {
+			// Session directories are named after the session ID.
+			sessionID = entry.Name()
 		}
 
 		if bestDir == "" || modTime.After(bestModTime) {
 			bestDir = entryPath
-			bestSessionID = meta.ID
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
 	}
@@ -471,5 +485,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
