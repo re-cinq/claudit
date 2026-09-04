@@ -410,6 +410,15 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// Copilot CLI's workspace.yaml metadata shape has drifted across versions
+// (see parseSessionMeta). Rather than silently dropping a session whenever
+// that metadata fails to parse into the exact expected fields — which
+// previously caused DiscoverSession to return nil and no note to be stored —
+// a directory is only excluded when its metadata explicitly names a
+// *different* project. Missing or unparseable metadata falls back to using
+// the session directory name (the session ID by Copilot's own convention)
+// and recency alone.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -442,20 +451,22 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
-		}
+		sessionID := entry.Name()
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
+		if meta, metaErr := parseSessionMeta(entryPath); metaErr == nil && meta != nil {
+			if meta.ID != "" {
+				sessionID = meta.ID
+			}
+			if meta.CWD != "" && !agent.PathsEqual(meta.CWD, projectPath) {
+				// Metadata explicitly names a different project; skip.
+				continue
+			}
 		}
 
 		if bestDir == "" || modTime.After(bestModTime) {
 			bestDir = entryPath
-			bestSessionID = meta.ID
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
 	}
@@ -471,5 +482,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
