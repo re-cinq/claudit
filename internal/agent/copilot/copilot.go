@@ -409,7 +409,22 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
+// copilotSessionCandidate is a session-state directory considered during
+// recent-session discovery.
+type copilotSessionCandidate struct {
+	dir     string
+	id      string
+	modTime time.Time
+	matches bool
+}
+
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// Copilot CLI has changed the field names used in each session's
+// workspace.yaml across releases (see parseSessionMeta), so a session whose
+// metadata fails to parse or no longer reports a matching cwd/git_root isn't
+// discarded outright: if it's the only recent session on disk, there's no
+// real ambiguity about which project it belongs to, so it's used anyway.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -423,9 +438,7 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
+	var candidates []copilotSessionCandidate
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -442,34 +455,55 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
+		id := entry.Name()
+		matches := false
+
+		if meta, err := parseSessionMeta(entryPath); err == nil && meta != nil {
+			if meta.ID != "" {
+				id = meta.ID
+			}
+			matches = (meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)) ||
+				(meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath))
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		candidates = append(candidates, copilotSessionCandidate{
+			dir:     entryPath,
+			id:      id,
+			modTime: modTime,
+			matches: matches,
+		})
+	}
+
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	var best *copilotSessionCandidate
+	for i := range candidates {
+		c := &candidates[i]
+		if !c.matches {
 			continue
 		}
-
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+		if best == nil || c.modTime.After(best.modTime) {
+			best = c
 		}
 	}
 
-	if bestDir == "" {
+	// No session reports a matching workspace. If there's exactly one recent
+	// session, assume it belongs to this project rather than discarding it.
+	if best == nil && len(candidates) == 1 {
+		best = &candidates[0]
+	}
+
+	if best == nil {
 		return nil, nil
 	}
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
+		SessionID:      best.id,
+		TranscriptPath: GetTranscriptPath(best.dir),
+		StartedAt:      best.modTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
