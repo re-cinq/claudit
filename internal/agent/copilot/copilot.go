@@ -202,6 +202,9 @@ type copilotEventData struct {
 	ToolUseID string          `json:"toolUseId,omitempty"`
 	ToolName  string          `json:"toolName,omitempty"`
 	Result    json.RawMessage `json:"result,omitempty"`
+
+	// For session.start events
+	CWD string `json:"cwd,omitempty"`
 }
 
 // copilotToolRequest represents a tool request in an assistant message.
@@ -427,6 +430,13 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestSessionID string
 	var bestModTime time.Time
 
+	// fallbackDir tracks the most recently active session directory
+	// regardless of whether we could confirm its cwd, in case workspace.yaml
+	// is missing or in a format we don't recognise (e.g. newer/older Copilot
+	// CLI versions). Used only if no cwd-matched session is found.
+	var fallbackDir string
+	var fallbackModTime time.Time
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -442,10 +452,16 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
+
+		if fallbackDir == "" || modTime.After(fallbackModTime) {
+			fallbackDir = entryPath
+			fallbackModTime = modTime
+		}
+
+		// Check if this session directory has a workspace.yaml
 		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
+		if err != nil || meta == nil || meta.CWD == "" {
 			continue
 		}
 
@@ -460,16 +476,27 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		}
 	}
 
-	if bestDir == "" {
-		return nil, nil
+	if bestDir != "" {
+		return &agent.SessionInfo{
+			SessionID:      bestSessionID,
+			TranscriptPath: GetTranscriptPath(bestDir),
+			StartedAt:      bestModTime.Format(time.RFC3339),
+			ProjectPath:    projectPath,
+		}, nil
 	}
 
-	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
-		ProjectPath:    projectPath,
-	}, nil
+	// No session directory carried a usable workspace.yaml cwd match. Rather
+	// than reporting no session at all, fall back to the most recently
+	// active session directory, using its directory name as the session ID
+	// (the same convention shiftlog itself uses when writing session state).
+	if fallbackDir != "" {
+		return &agent.SessionInfo{
+			SessionID:      filepath.Base(fallbackDir),
+			TranscriptPath: GetTranscriptPath(fallbackDir),
+			StartedAt:      fallbackModTime.Format(time.RFC3339),
+			ProjectPath:    projectPath,
+		}, nil
+	}
+
+	return nil, nil
 }
-
-
