@@ -409,9 +409,27 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
-// scanForRecentSession scans Copilot's session state directory for recent session directories.
+// scanForRecentSession scans Copilot's session state directories for a recent
+// session matching projectPath. It checks the active session-state directory
+// first (for a session whose process is still running), then falls back to
+// history-session-state, where newer Copilot CLI versions persist a session
+// once its process has exited — the case exercised by the git post-commit
+// hook (`shiftlog store --manual`), which always runs after the agent CLI
+// that created the session has already terminated.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionStateDir()
+	if info, err := scanSessionStateDir(projectPath, GetSessionStateDir); err != nil {
+		return nil, err
+	} else if info != nil {
+		return info, nil
+	}
+
+	return scanSessionStateDir(projectPath, GetHistorySessionStateDir)
+}
+
+// scanSessionStateDir scans a single Copilot session-state style directory
+// (as returned by dirFn) for the most recent session matching projectPath.
+func scanSessionStateDir(projectPath string, dirFn func() (string, error)) (*agent.SessionInfo, error) {
+	sessionDir, err := dirFn()
 	if err != nil {
 		return nil, nil
 	}
@@ -471,5 +489,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-

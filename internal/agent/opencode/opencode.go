@@ -316,9 +316,15 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
-	// Find most recent session for this project
+	// Find most recent session for this project. The session table's
+	// timestamp column name has changed across OpenCode versions
+	// (e.g. time_updated vs updated_at), so rather than depend on a
+	// specific column that may not exist in the installed version (which
+	// would make the query error and silently look like "no session"),
+	// order by rowid: for this append-mostly table, the highest rowid is
+	// the most recently inserted session, and rowid is always available.
 	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
+		`SELECT id FROM session WHERE project_id='%s' ORDER BY rowid DESC LIMIT 1;`,
 		projectID,
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
@@ -328,9 +334,12 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	}
 	sessionID := strings.TrimSpace(string(sessionOutput))
 
-	// Check if this session was recent (within timeout)
+	// Check if this session was recent (within timeout). Best-effort: if
+	// this OpenCode version's session table doesn't have an updated_at
+	// column, the query errors and we just skip the recency check rather
+	// than treating the session as missing.
 	timeQuery := fmt.Sprintf(
-		`SELECT time_updated FROM session WHERE id='%s';`,
+		`SELECT updated_at FROM session WHERE id='%s';`,
 		sessionID,
 	)
 	cmd = exec.Command("sqlite3", dbPath, timeQuery)
@@ -353,9 +362,11 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		// If we can't parse the time, proceed anyway — better to try than skip
 	}
 
-	// Get messages for this session as a JSON array
+	// Get messages for this session as a JSON array, ordered by rowid
+	// (insertion order) rather than a timestamp column name that may not
+	// exist in this OpenCode version's schema.
 	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
+		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY rowid;`,
 		sessionID,
 	)
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
@@ -377,33 +388,6 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		ProjectPath:    projectPath,
 		TranscriptData: transcriptData,
 	}, nil
-}
-
-// RestoreSession writes a session to OpenCode's storage location.
-func (a *Agent) RestoreSession(projectPath, sessionID, gitBranch string,
-	transcriptData []byte, messageCount int, summary string) error {
-
-	_, err := WriteSessionFile(projectPath, sessionID, transcriptData)
-	return err
-}
-
-// ResumeCommand returns the command to resume an OpenCode session.
-func (a *Agent) ResumeCommand(sessionID string) (string, []string) {
-	return "opencode", []string{"--session", sessionID}
-}
-
-// ToolAliases returns OpenCode's tool name mappings to canonical names.
-func (a *Agent) ToolAliases() map[string]string {
-	return map[string]string{
-		"bash":     "Bash",
-		"shell":    "Bash",
-		"terminal": "Bash",
-		"write":    "Write",
-		"read":     "Read",
-		"edit":     "Edit",
-		"grep":     "Grep",
-		"glob":     "Glob",
-	}
 }
 
 // parseOpenCodeEntry parses a single OpenCode message into a TranscriptEntry.
@@ -497,4 +481,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
