@@ -1,18 +1,20 @@
 package copilot
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
-// sessionMeta represents lightweight metadata from a Copilot session workspace.yaml.
+// sessionMeta represents lightweight metadata from a Copilot session directory.
 type sessionMeta struct {
-	ID      string `yaml:"id"`
-	CWD     string `yaml:"cwd"`
-	GitRoot string `yaml:"git_root,omitempty"`
+	ID      string
+	CWD     string
+	GitRoot string
 }
 
 // GetCopilotDir returns the path to Copilot's config/data directory.
@@ -33,20 +35,86 @@ func GetSessionStateDir() (string, error) {
 	return filepath.Join(copilotDir, "session-state"), nil
 }
 
-// parseSessionMeta reads a workspace.yaml from a Copilot session directory.
+// sessionMetaFileNames are the candidate filenames Copilot CLI has used across
+// versions to store per-session metadata within a session-state directory.
+// Newer CLI releases have moved away from the original "workspace.yaml".
+var sessionMetaFileNames = []string{
+	"workspace.yaml",
+	"workspace.yml",
+	"workspace.json",
+	"session.yaml",
+	"session.json",
+	"state.json",
+	"metadata.json",
+}
+
+// Candidate key names Copilot CLI has used for session metadata fields across versions.
+var (
+	metaIDKeys      = []string{"id", "sessionId", "session_id", "sessionID"}
+	metaCWDKeys     = []string{"cwd", "cwdPath", "cwd_path", "workingDirectory", "working_directory", "dir", "directory"}
+	metaGitRootKeys = []string{"git_root", "gitRoot", "repoRoot", "repo_root"}
+)
+
+// parseSessionMeta reads per-session metadata from a Copilot session directory.
+// Copilot CLI has used different filenames/schemas for this file across
+// versions, so several candidates are tried before giving up.
 func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
-	path := filepath.Join(sessionDir, "workspace.yaml")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
+	var lastErr error = os.ErrNotExist
+
+	for _, name := range sessionMetaFileNames {
+		data, err := os.ReadFile(filepath.Join(sessionDir, name))
+		if err != nil {
+			if !os.IsNotExist(err) {
+				lastErr = err
+			}
+			continue
+		}
+
+		raw, err := decodeMetaFile(name, data)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		return &sessionMeta{
+			ID:      firstStringValue(raw, metaIDKeys),
+			CWD:     firstStringValue(raw, metaCWDKeys),
+			GitRoot: firstStringValue(raw, metaGitRootKeys),
+		}, nil
 	}
 
-	var meta sessionMeta
-	if err := yaml.Unmarshal(data, &meta); err != nil {
-		return nil, err
+	return nil, lastErr
+}
+
+// decodeMetaFile decodes a metadata file's contents into a generic map,
+// trying JSON (by extension or content sniffing) before falling back to YAML.
+func decodeMetaFile(name string, data []byte) (map[string]interface{}, error) {
+	raw := map[string]interface{}{}
+
+	looksLikeJSON := strings.HasSuffix(name, ".json") || strings.HasPrefix(strings.TrimSpace(string(data)), "{")
+	if looksLikeJSON {
+		if err := json.Unmarshal(data, &raw); err == nil {
+			return raw, nil
+		}
 	}
 
-	return &meta, nil
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+// firstStringValue returns the first non-empty string value found in raw for
+// any of the given candidate keys.
+func firstStringValue(raw map[string]interface{}, keys []string) string {
+	for _, k := range keys {
+		if v, ok := raw[k]; ok {
+			if s, ok := v.(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	return ""
 }
 
 // GetTranscriptPath returns the path to the events.jsonl transcript within a session directory.
@@ -81,4 +149,3 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-
