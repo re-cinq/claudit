@@ -449,7 +449,17 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		// Prefer matching on the session's git root, since DiscoverSession is
+		// always called with the repo root (not necessarily the directory the
+		// CLI process was actually invoked from). Fall back to raw cwd when
+		// git_root isn't populated by the CLI.
+		matched := false
+		if meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath) {
+			matched = true
+		} else if meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath) {
+			matched = true
+		}
+		if !matched {
 			continue
 		}
 
@@ -471,5 +481,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
