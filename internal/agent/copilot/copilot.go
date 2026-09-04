@@ -427,6 +427,16 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestSessionID string
 	var bestModTime time.Time
 
+	// fallback tracks the most recent session directory whose metadata is
+	// missing, unparseable, or has no usable cwd (e.g. workspace.yaml format
+	// drift across Copilot CLI versions). It is only used when no session
+	// can be positively matched to projectPath, so a confirmed match always
+	// wins, but a lone recent session can still be discovered when its
+	// metadata schema is unrecognized.
+	var fallbackDir string
+	var fallbackSessionID string
+	var fallbackModTime time.Time
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -445,7 +455,16 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
 		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
+
+		if err != nil || meta == nil || meta.CWD == "" {
+			if fallbackDir == "" || modTime.After(fallbackModTime) {
+				fallbackDir = entryPath
+				fallbackSessionID = entry.Name()
+				if meta != nil && meta.ID != "" {
+					fallbackSessionID = meta.ID
+				}
+				fallbackModTime = modTime
+			}
 			continue
 		}
 
@@ -460,16 +479,23 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		}
 	}
 
-	if bestDir == "" {
+	if bestDir != "" {
+		return &agent.SessionInfo{
+			SessionID:      bestSessionID,
+			TranscriptPath: GetTranscriptPath(bestDir),
+			StartedAt:      bestModTime.Format(time.RFC3339),
+			ProjectPath:    projectPath,
+		}, nil
+	}
+
+	if fallbackDir == "" {
 		return nil, nil
 	}
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
+		SessionID:      fallbackSessionID,
+		TranscriptPath: GetTranscriptPath(fallbackDir),
+		StartedAt:      fallbackModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
