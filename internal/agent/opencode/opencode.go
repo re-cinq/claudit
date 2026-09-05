@@ -252,15 +252,30 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
+//
+// The primary strategy matches by directory name (dataDir/storage/session/<projectID>),
+// where projectID is the git root commit hash. If that directory doesn't
+// exist or contains nothing recent (e.g. because a newer OpenCode CLI
+// version computes project IDs differently or reorganizes the storage
+// layout), we fall back to scanning every project subdirectory and matching
+// sessions by their embedded "directory" field instead of by directory name.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionDir(projectPath)
-	if err != nil {
-		return nil, nil
+	if err == nil {
+		if session := scanSessionDirForRecent(sessionDir, projectPath); session != nil {
+			return session, nil
+		}
 	}
 
+	return discoverFlatFileSessionByContent(projectPath)
+}
+
+// scanSessionDirForRecent scans a single project's session directory for the
+// most recently modified session file within the recent-session timeout.
+func scanSessionDirForRecent(sessionDir, projectPath string) *agent.SessionInfo {
 	dirEntries, err := os.ReadDir(sessionDir)
 	if err != nil {
-		return nil, nil
+		return nil
 	}
 
 	now := time.Now()
@@ -290,10 +305,94 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}
 
 	if bestSessionID == "" {
-		return nil, nil
+		return nil
 	}
 
 	// The transcript path for OpenCode is the message directory
+	msgDir, _ := GetMessageDir(bestSessionID)
+
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: msgDir,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}
+}
+
+// discoverFlatFileSessionByContent scans every project subdirectory under
+// OpenCode's flat-file session storage and matches sessions by their
+// embedded "directory" field. This is a fallback for when OpenCode's
+// project ID scheme (currently assumed to be the git root commit hash) no
+// longer matches the directory layout it actually uses on disk, which can
+// happen across OpenCode CLI version updates.
+func discoverFlatFileSessionByContent(projectPath string) (*agent.SessionInfo, error) {
+	sessionsRoot, err := GetSessionsRootDir()
+	if err != nil {
+		return nil, nil
+	}
+
+	projectDirs, err := os.ReadDir(sessionsRoot)
+	if err != nil {
+		return nil, nil
+	}
+
+	now := time.Now()
+	recentTimeout := agent.RecentSessionTimeout
+	var bestSessionID string
+	var bestModTime time.Time
+
+	for _, projectDir := range projectDirs {
+		if !projectDir.IsDir() {
+			continue
+		}
+
+		dirPath := filepath.Join(sessionsRoot, projectDir.Name())
+		sessionFiles, err := os.ReadDir(dirPath)
+		if err != nil {
+			continue
+		}
+
+		for _, f := range sessionFiles {
+			if f.IsDir() || !strings.HasSuffix(f.Name(), ".json") {
+				continue
+			}
+
+			info, err := f.Info()
+			if err != nil {
+				continue
+			}
+
+			modTime := info.ModTime()
+			if now.Sub(modTime) > recentTimeout {
+				continue
+			}
+
+			data, err := os.ReadFile(filepath.Join(dirPath, f.Name()))
+			if err != nil {
+				continue
+			}
+
+			var meta struct {
+				Directory string `json:"directory"`
+			}
+			if err := json.Unmarshal(data, &meta); err != nil || meta.Directory == "" {
+				continue
+			}
+			if !agent.PathsEqual(meta.Directory, projectPath) {
+				continue
+			}
+
+			if bestSessionID == "" || modTime.After(bestModTime) {
+				bestSessionID = strings.TrimSuffix(f.Name(), ".json")
+				bestModTime = modTime
+			}
+		}
+	}
+
+	if bestSessionID == "" {
+		return nil, nil
+	}
+
 	msgDir, _ := GetMessageDir(bestSessionID)
 
 	return &agent.SessionInfo{
@@ -497,4 +596,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-

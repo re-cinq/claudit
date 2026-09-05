@@ -52,6 +52,18 @@ func GetProjectID(projectPath string) string {
 	return "global"
 }
 
+// GetSessionsRootDir returns the top-level session storage directory
+// (dataDir/storage/session), which contains one subdirectory per project ID.
+// Used as a fallback discovery root when a specific project's directory
+// (as computed by GetSessionDir) doesn't match what's on disk.
+func GetSessionsRootDir() (string, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dataDir, "storage", "session"), nil
+}
+
 // GetSessionDir returns the session storage directory for a project.
 func GetSessionDir(projectPath string) (string, error) {
 	dataDir, err := GetDataDir()
