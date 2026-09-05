@@ -252,42 +252,74 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
+// It scans every project bucket under storage/session (not only the one
+// keyed by our locally-computed project ID), matching sessions by the
+// directory/projectID recorded inside each session file when available.
+// OpenCode's project bucket naming/identification scheme has changed
+// across releases, so trusting only our own GetProjectID computation to
+// pick the directory to look in is not reliable.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
-	dirEntries, err := os.ReadDir(sessionDir)
-	if err != nil {
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	if _, err := os.Stat(sessionRoot); err != nil {
 		return nil, nil
 	}
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
+	expectedProjectID := GetProjectID(projectPath)
+
 	var bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
+	_ = filepath.WalkDir(sessionRoot, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
 		}
 
-		info, err := entry.Info()
+		info, err := d.Info()
 		if err != nil {
-			continue
+			return nil
 		}
 
 		modTime := info.ModTime()
 		if now.Sub(modTime) > recentTimeout {
-			continue
+			return nil
+		}
+
+		// Default assumption: the session lives under a directory named
+		// after our computed project ID (the historical layout).
+		matched := filepath.Base(filepath.Dir(path)) == expectedProjectID
+
+		// If the session file itself records its directory or project ID,
+		// prefer that over the bucket name, since it reflects what OpenCode
+		// actually used regardless of any naming scheme changes.
+		if data, readErr := os.ReadFile(path); readErr == nil {
+			var meta sessionInfo
+			if json.Unmarshal(data, &meta) == nil {
+				switch {
+				case meta.Directory != "":
+					matched = agent.PathsEqual(meta.Directory, projectPath)
+				case meta.ProjectID != "":
+					matched = meta.ProjectID == expectedProjectID
+				}
+			}
+		}
+
+		if !matched {
+			return nil
 		}
 
 		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
+			bestSessionID = strings.TrimSuffix(d.Name(), ".json")
 			bestModTime = modTime
 		}
-	}
+		return nil
+	})
 
 	if bestSessionID == "" {
 		return nil, nil
@@ -454,7 +486,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +528,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
