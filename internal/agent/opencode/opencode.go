@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -305,6 +306,9 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 }
 
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
+// OpenCode's session/message tables use the same camelCase column names as its
+// JS/TS domain objects (e.g. projectID, sessionID, timeCreated, timeUpdated) rather
+// than snake_case, so queries must match that naming exactly.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
@@ -318,7 +322,7 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 
 	// Find most recent session for this project
 	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
+		`SELECT id FROM session WHERE projectID='%s' ORDER BY timeUpdated DESC LIMIT 1;`,
 		projectID,
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
@@ -330,7 +334,7 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
-		`SELECT time_updated FROM session WHERE id='%s';`,
+		`SELECT timeUpdated FROM session WHERE id='%s';`,
 		sessionID,
 	)
 	cmd = exec.Command("sqlite3", dbPath, timeQuery)
@@ -355,7 +359,7 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 
 	// Get messages for this session as a JSON array
 	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
+		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE sessionID='%s' ORDER BY timeCreated;`,
 		sessionID,
 	)
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
@@ -497,4 +501,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
