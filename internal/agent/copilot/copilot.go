@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -410,66 +411,194 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+// Copilot's on-disk session layout and metadata field names have changed across
+// versions, so this prefers an exact match (session directory whose recorded
+// working directory equals projectPath) but falls back to progressively looser
+// heuristics: the most recently active session directory of any kind, and
+// finally the most recently modified transcript-like file anywhere under
+// Copilot's config directory.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
+	if err == nil {
+		if info := scanSessionStateDir(sessionDir, projectPath); info != nil {
+			return info, nil
+		}
+	}
+
+	return scanForAnyRecentTranscript(projectPath)
+}
+
+// sessionCandidate is a session directory considered during discovery.
+type sessionCandidate struct {
+	sessionID      string
+	transcriptPath string
+	modTime        time.Time
+	cwdMatch       bool
+}
+
+// scanSessionStateDir looks for a session directory under sessionDir. It prefers
+// one whose recorded working directory matches projectPath, but falls back to
+// the most recently active session directory overall if no metadata match is
+// found (e.g. because workspace.yaml's schema no longer matches what we parse).
+func scanSessionStateDir(sessionDir, projectPath string) *agent.SessionInfo {
+	entries, err := os.ReadDir(sessionDir)
 	if err != nil {
-		return nil, nil
+		return nil
+	}
+
+	now := time.Now()
+	recentTimeout := agent.RecentSessionTimeout
+
+	var candidates []sessionCandidate
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		entryPath := filepath.Join(sessionDir, entry.Name())
+		transcriptPath := findTranscriptFile(entryPath)
+		if transcriptPath == "" {
+			continue
+		}
+
+		modTime := fileModTime(transcriptPath)
+		if now.Sub(modTime) > recentTimeout {
+			continue
+		}
+
+		sessionID := entry.Name()
+		cwdMatch := false
+		if meta, err := parseSessionMeta(entryPath); err == nil && meta != nil {
+			if meta.ID != "" {
+				sessionID = meta.ID
+			}
+			if meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath) {
+				cwdMatch = true
+			}
+		}
+
+		candidates = append(candidates, sessionCandidate{
+			sessionID:      sessionID,
+			transcriptPath: transcriptPath,
+			modTime:        modTime,
+			cwdMatch:       cwdMatch,
+		})
+	}
+
+	best := pickMostRecentCandidate(candidates, true)
+	if best == nil {
+		best = pickMostRecentCandidate(candidates, false)
+	}
+	if best == nil {
+		return nil
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      best.sessionID,
+		TranscriptPath: best.transcriptPath,
+		StartedAt:      best.modTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}
+}
+
+// pickMostRecentCandidate returns the most recently active candidate. When
+// matchOnly is true, only candidates whose working directory matched are
+// considered.
+func pickMostRecentCandidate(candidates []sessionCandidate, matchOnly bool) *sessionCandidate {
+	var best *sessionCandidate
+	for i := range candidates {
+		c := &candidates[i]
+		if matchOnly && !c.cwdMatch {
+			continue
+		}
+		if best == nil || c.modTime.After(best.modTime) {
+			best = c
+		}
+	}
+	return best
+}
+
+// findTranscriptFile locates the transcript file within a Copilot session
+// directory. Copilot has historically used events.jsonl; if that's missing,
+// fall back to the most recently modified .jsonl file in the directory to
+// tolerate naming changes.
+func findTranscriptFile(sessionDir string) string {
+	preferred := GetTranscriptPath(sessionDir)
+	if _, err := os.Stat(preferred); err == nil {
+		return preferred
 	}
 
 	entries, err := os.ReadDir(sessionDir)
+	if err != nil {
+		return ""
+	}
+
+	var bestPath string
+	var bestModTime time.Time
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			continue
+		}
+		candidatePath := filepath.Join(sessionDir, entry.Name())
+		modTime := fileModTime(candidatePath)
+		if bestPath == "" || modTime.After(bestModTime) {
+			bestPath = candidatePath
+			bestModTime = modTime
+		}
+	}
+	return bestPath
+}
+
+// scanForAnyRecentTranscript walks Copilot's config directory looking for the
+// most recently modified .jsonl transcript file within the recency window.
+// This is a last-resort fallback used when the expected session-state
+// directory layout can't be found or parsed at all.
+func scanForAnyRecentTranscript(projectPath string) (*agent.SessionInfo, error) {
+	copilotDir, err := GetCopilotDir()
 	if err != nil {
 		return nil, nil
 	}
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
+
+	var bestPath string
 	var bestModTime time.Time
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
+	_ = filepath.WalkDir(copilotDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".jsonl") {
+			return nil
 		}
-
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		modTime := info.ModTime()
+		modTime := fileModTime(path)
 		if now.Sub(modTime) > recentTimeout {
-			continue
+			return nil
 		}
-
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
-		}
-
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
-		}
-
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
+		if bestPath == "" || modTime.After(bestModTime) {
+			bestPath = path
 			bestModTime = modTime
 		}
-	}
+		return nil
+	})
 
-	if bestDir == "" {
+	if bestPath == "" {
 		return nil, nil
 	}
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
+		SessionID:      strings.TrimSuffix(filepath.Base(bestPath), ".jsonl"),
+		TranscriptPath: bestPath,
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
 
-
+// fileModTime returns the modification time of path, or the zero time if it
+// cannot be determined.
+func fileModTime(path string) time.Time {
+	info, err := os.Stat(path)
+	if err != nil {
+		return time.Time{}
+	}
+	return info.ModTime()
+}
+```
