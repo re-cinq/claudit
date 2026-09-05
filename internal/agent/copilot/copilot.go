@@ -410,6 +410,10 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+// Copilot CLI has changed its on-disk session layout across releases (e.g. nesting
+// session directories one level deeper under a workspace bucket), so this walks up to
+// one extra directory level and tolerates schema drift in workspace.yaml via
+// parseSessionMeta's flexible field lookup.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -432,31 +436,35 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		info, err := entry.Info()
+		entryPath := filepath.Join(sessionDir, entry.Name())
+
+		if id, modTime, ok := matchCopilotSessionDir(entryPath, projectPath, now, recentTimeout); ok {
+			if bestDir == "" || modTime.After(bestModTime) {
+				bestDir = entryPath
+				bestSessionID = id
+				bestModTime = modTime
+			}
+			continue
+		}
+
+		// Some Copilot CLI versions nest session directories one level
+		// deeper, e.g. <workspace-hash>/<sessionID>/workspace.yaml.
+		nested, err := os.ReadDir(entryPath)
 		if err != nil {
 			continue
 		}
-
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
-
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
-		}
-
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
-		}
-
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+		for _, ne := range nested {
+			if !ne.IsDir() {
+				continue
+			}
+			nestedPath := filepath.Join(entryPath, ne.Name())
+			if id, modTime, ok := matchCopilotSessionDir(nestedPath, projectPath, now, recentTimeout); ok {
+				if bestDir == "" || modTime.After(bestModTime) {
+					bestDir = nestedPath
+					bestSessionID = id
+					bestModTime = modTime
+				}
+			}
 		}
 	}
 
@@ -472,4 +480,34 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	}, nil
 }
 
+// matchCopilotSessionDir checks whether dir is a recent Copilot session directory
+// (has a workspace.yaml whose recorded cwd matches projectPath) and returns its
+// session ID and modification time if so. Falls back to the directory's own name
+// as the session ID when workspace.yaml doesn't expose one under a known key.
+func matchCopilotSessionDir(dir, projectPath string, now time.Time, recentTimeout time.Duration) (id string, modTime time.Time, ok bool) {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return "", time.Time{}, false
+	}
 
+	modTime = info.ModTime()
+	if now.Sub(modTime) > recentTimeout {
+		return "", time.Time{}, false
+	}
+
+	meta, err := parseSessionMeta(dir)
+	if err != nil || meta == nil {
+		return "", time.Time{}, false
+	}
+
+	if meta.CWD == "" || !agent.PathsEqual(meta.CWD, projectPath) {
+		return "", time.Time{}, false
+	}
+
+	id = meta.ID
+	if id == "" {
+		id = filepath.Base(dir)
+	}
+
+	return id, modTime, true
+}

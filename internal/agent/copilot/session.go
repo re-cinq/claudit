@@ -15,6 +15,16 @@ type sessionMeta struct {
 	GitRoot string `yaml:"git_root,omitempty"`
 }
 
+// sessionIDKeys and sessionCWDKeys list the field names known to have been used
+// across Copilot CLI releases for a session's ID and working directory. Newer
+// CLI versions have renamed or nested these fields, so several candidates are
+// probed instead of relying on a single fixed key.
+var (
+	sessionIDKeys   = []string{"id", "session_id", "sessionId", "sessionID"}
+	sessionCWDKeys  = []string{"cwd", "cwd_path", "cwdPath", "working_directory", "workingDirectory", "directory", "workspace_dir", "workspaceDir", "path", "workspace"}
+	sessionNestKeys = []string{"workspace", "session", "meta", "metadata"}
+)
+
 // GetCopilotDir returns the path to Copilot's config/data directory.
 func GetCopilotDir() (string, error) {
 	home, err := os.UserHomeDir()
@@ -33,7 +43,22 @@ func GetSessionStateDir() (string, error) {
 	return filepath.Join(copilotDir, "session-state"), nil
 }
 
+// lookupYAMLString returns the first non-empty string value found in m under any of keys.
+func lookupYAMLString(m map[string]interface{}, keys []string) string {
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			if s, ok := v.(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
 // parseSessionMeta reads a workspace.yaml from a Copilot session directory.
+// It tolerates schema drift across Copilot CLI versions by probing several
+// known field names/locations for the session ID and working directory
+// instead of requiring an exact key match.
 func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 	path := filepath.Join(sessionDir, "workspace.yaml")
 	data, err := os.ReadFile(path)
@@ -41,12 +66,35 @@ func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 		return nil, err
 	}
 
-	var meta sessionMeta
-	if err := yaml.Unmarshal(data, &meta); err != nil {
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, err
 	}
 
-	return &meta, nil
+	meta := &sessionMeta{
+		ID:  lookupYAMLString(raw, sessionIDKeys),
+		CWD: lookupYAMLString(raw, sessionCWDKeys),
+	}
+	if gr, ok := raw["git_root"].(string); ok {
+		meta.GitRoot = gr
+	}
+
+	// Some Copilot CLI versions nest workspace metadata under a sub-key
+	// instead of storing it at the top level.
+	for _, nestKey := range sessionNestKeys {
+		nested, ok := raw[nestKey].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if meta.ID == "" {
+			meta.ID = lookupYAMLString(nested, sessionIDKeys)
+		}
+		if meta.CWD == "" {
+			meta.CWD = lookupYAMLString(nested, sessionCWDKeys)
+		}
+	}
+
+	return meta, nil
 }
 
 // GetTranscriptPath returns the path to the events.jsonl transcript within a session directory.
@@ -81,4 +129,3 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-
