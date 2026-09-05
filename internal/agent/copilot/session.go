@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -33,7 +34,37 @@ func GetSessionStateDir() (string, error) {
 	return filepath.Join(copilotDir, "session-state"), nil
 }
 
+// cwdKeys lists the field names Copilot CLI has used across versions to
+// record a session's working directory. Newer releases have moved this
+// value around (top-level rename, or nested under a "workspace" object), so
+// several candidates are checked instead of a single fixed key.
+var cwdKeys = []string{
+	"cwd", "workspace_cwd", "workspaceCwd", "directory",
+	"workingDirectory", "working_dir", "folder", "root", "path",
+}
+
+// extractCWD searches a parsed workspace.yaml document for a working
+// directory value, checking known top-level keys and a nested "workspace" object.
+func extractCWD(raw map[string]interface{}) string {
+	for _, key := range cwdKeys {
+		if v, ok := raw[key].(string); ok && v != "" {
+			return v
+		}
+	}
+	if ws, ok := raw["workspace"].(map[string]interface{}); ok {
+		for _, key := range cwdKeys {
+			if v, ok := ws[key].(string); ok && v != "" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
 // parseSessionMeta reads a workspace.yaml from a Copilot session directory.
+// It parses into a generic map first so it can tolerate field renames/moves
+// (see extractCWD) rather than failing outright when Copilot's exact schema
+// shifts between versions.
 func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 	path := filepath.Join(sessionDir, "workspace.yaml")
 	data, err := os.ReadFile(path)
@@ -41,12 +72,21 @@ func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 		return nil, err
 	}
 
-	var meta sessionMeta
-	if err := yaml.Unmarshal(data, &meta); err != nil {
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, err
 	}
 
-	return &meta, nil
+	meta := &sessionMeta{}
+	if id, ok := raw["id"].(string); ok {
+		meta.ID = id
+	}
+	meta.CWD = extractCWD(raw)
+	if gitRoot, ok := raw["git_root"].(string); ok {
+		meta.GitRoot = gitRoot
+	}
+
+	return meta, nil
 }
 
 // GetTranscriptPath returns the path to the events.jsonl transcript within a session directory.
@@ -81,4 +121,4 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-
+```
