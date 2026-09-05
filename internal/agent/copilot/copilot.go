@@ -410,6 +410,12 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// Workspace matching is best-effort: newer Copilot CLI releases have shuffled which of
+// cwd/git_root actually gets populated in workspace.yaml, so both are checked. If no
+// session's metadata matches the project (e.g. a future release renames these fields
+// again) but exactly one recent session directory exists, it is used anyway — metadata
+// drift on the CLI side shouldn't hide an otherwise unambiguous session.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -426,6 +432,14 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestDir string
 	var bestSessionID string
 	var bestModTime time.Time
+	matched := false
+
+	// Fallback candidate: the single most recently modified session directory,
+	// regardless of whether its metadata matched. Only used when it's unambiguous.
+	var recentDir string
+	var recentSessionID string
+	var recentModTime time.Time
+	recentCount := 0
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -442,26 +456,46 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
+
+		recentCount++
+		recentDir = entryPath
+		recentSessionID = entry.Name()
+		recentModTime = modTime
+
+		// Check if this session directory has a workspace.yaml
 		meta, err := parseSessionMeta(entryPath)
 		if err != nil || meta == nil {
 			continue
 		}
+		if meta.ID != "" {
+			recentSessionID = meta.ID
+		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		workspaceMatches := (meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)) ||
+			(meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath))
+		if !workspaceMatches {
 			continue
 		}
 
-		if bestDir == "" || modTime.After(bestModTime) {
+		if !matched || modTime.After(bestModTime) {
 			bestDir = entryPath
 			bestSessionID = meta.ID
 			bestModTime = modTime
+			matched = true
 		}
 	}
 
-	if bestDir == "" {
-		return nil, nil
+	if !matched {
+		// No session's recorded workspace matched the project. If there's exactly
+		// one recent session directory it's overwhelmingly likely to be ours;
+		// otherwise we can't safely guess between multiple candidates.
+		if recentCount != 1 {
+			return nil, nil
+		}
+		bestDir = recentDir
+		bestSessionID = recentSessionID
+		bestModTime = recentModTime
 	}
 
 	return &agent.SessionInfo{
@@ -471,5 +505,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
