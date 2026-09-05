@@ -1,9 +1,12 @@
+```go
 package agent
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -168,6 +171,74 @@ func ScanDirForRecentSession(sessionDir, ext string, skipNames []string, project
 	}, nil
 }
 
+// SQLiteQuery runs a query against a SQLite database via the sqlite3 CLI and
+// returns each non-empty output line. Several agent CLIs (Copilot, OpenCode)
+// have moved session/transcript storage into SQLite in newer releases, so this
+// is shared plumbing rather than something each agent package reimplements.
+func SQLiteQuery(dbPath, query string) ([]string, error) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		return nil, fmt.Errorf("sqlite3 not found in PATH")
+	}
+
+	cmd := exec.Command("sqlite3", dbPath, query)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	var lines []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines, nil
+}
+
+// SQLiteTables returns all table names in a SQLite database.
+func SQLiteTables(dbPath string) ([]string, error) {
+	return SQLiteQuery(dbPath, "SELECT name FROM sqlite_master WHERE type='table';")
+}
+
+// SQLiteTableColumns returns the column names of a SQLite table via PRAGMA table_info.
+func SQLiteTableColumns(dbPath, table string) ([]string, error) {
+	lines, err := SQLiteQuery(dbPath, fmt.Sprintf("PRAGMA table_info(%s);", table))
+	if err != nil {
+		return nil, err
+	}
+
+	var cols []string
+	for _, line := range lines {
+		fields := strings.Split(line, "|")
+		if len(fields) >= 2 {
+			cols = append(cols, fields[1])
+		}
+	}
+	return cols, nil
+}
+
+// SQLiteFindColumn returns the first column whose name contains all of the
+// given substrings (case-insensitive), or "" if none match. This lets callers
+// locate columns such as a session ID or payload field without depending on
+// an exact, version-specific column name that upstream CLIs can rename.
+func SQLiteFindColumn(cols []string, substrs ...string) string {
+	for _, c := range cols {
+		lower := strings.ToLower(c)
+		matched := true
+		for _, s := range substrs {
+			if !strings.Contains(lower, s) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return c
+		}
+	}
+	return ""
+}
+
 // Name identifies a coding agent CLI.
 type Name string
 
@@ -236,3 +307,4 @@ type Agent interface {
 	// Rendering: map tool names for display
 	ToolAliases() map[string]string
 }
+```

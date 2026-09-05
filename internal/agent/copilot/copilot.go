@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -150,6 +151,7 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 
 	sessionID := hook.SessionID
 	transcriptPath := hook.TranscriptPath
+	var transcriptData []byte
 
 	// If no session info from generic fields, try CWD-based discovery
 	if sessionID == "" && hook.CWD != "" {
@@ -157,6 +159,7 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 		if err == nil && si != nil {
 			sessionID = si.SessionID
 			transcriptPath = si.TranscriptPath
+			transcriptData = si.TranscriptData
 		}
 	}
 
@@ -165,6 +168,7 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 		TranscriptPath: transcriptPath,
 		ToolName:       toolName,
 		Command:        command,
+		TranscriptData: transcriptData,
 	}, nil
 }
 
@@ -464,12 +468,29 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		return nil, nil
 	}
 
+	// Newer Copilot CLI releases no longer write events.jsonl into the
+	// session directory; the transcript instead lives in the shared
+	// session-store.db SQLite database. Prefer the file if present (older
+	// CLI versions), otherwise fall back to querying the database so
+	// sessions are still discoverable.
+	transcriptPath := GetTranscriptPath(bestDir)
+	var transcriptData []byte
+	if _, statErr := os.Stat(transcriptPath); statErr != nil {
+		if data, dbErr := readSessionStoreTranscript(bestSessionID); dbErr == nil {
+			transcriptData = data
+		}
+		transcriptPath = ""
+		if len(transcriptData) == 0 {
+			transcriptData = []byte("[]")
+		}
+	}
+
 	return &agent.SessionInfo{
 		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
+		TranscriptPath: transcriptPath,
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
+		TranscriptData: transcriptData,
 	}, nil
 }
-
-
+```
