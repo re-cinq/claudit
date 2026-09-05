@@ -427,6 +427,15 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestSessionID string
 	var bestModTime time.Time
 
+	// Fallback candidate: a recent session whose metadata didn't record a
+	// path we can compare against projectPath at all (some CLI versions omit
+	// cwd/git_root for non-interactive "-p" runs). Only used if nothing
+	// actually matches by path — better to attribute the session we have
+	// than to silently drop the commit's conversation.
+	var fallbackDir string
+	var fallbackSessionID string
+	var fallbackModTime time.Time
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -449,15 +458,33 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		// Match against either the recorded cwd or git_root: newer Copilot
+		// CLI versions have been observed to populate git_root instead of
+		// (or in addition to) cwd, especially for repos where the session
+		// wasn't started exactly at cwd.
+		matchesPath := (meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)) ||
+			(meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath))
+
+		if matchesPath {
+			if bestDir == "" || modTime.After(bestModTime) {
+				bestDir = entryPath
+				bestSessionID = meta.ID
+				bestModTime = modTime
+			}
 			continue
 		}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+		if meta.CWD == "" && meta.GitRoot == "" {
+			if fallbackDir == "" || modTime.After(fallbackModTime) {
+				fallbackDir = entryPath
+				fallbackSessionID = meta.ID
+				fallbackModTime = modTime
+			}
 		}
+	}
+
+	if bestDir == "" {
+		bestDir, bestSessionID, bestModTime = fallbackDir, fallbackSessionID, fallbackModTime
 	}
 
 	if bestDir == "" {
@@ -471,5 +498,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
