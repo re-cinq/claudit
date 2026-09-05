@@ -8,7 +8,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// sessionMeta represents lightweight metadata from a Copilot session workspace.yaml.
+// sessionMeta represents lightweight metadata from a Copilot session workspace file.
 type sessionMeta struct {
 	ID      string `yaml:"id"`
 	CWD     string `yaml:"cwd"`
@@ -33,20 +33,71 @@ func GetSessionStateDir() (string, error) {
 	return filepath.Join(copilotDir, "session-state"), nil
 }
 
-// parseSessionMeta reads a workspace.yaml from a Copilot session directory.
+// sessionMetaFilenames lists the workspace metadata filenames we know Copilot
+// CLI has used, tried in order. Different Copilot CLI releases have used
+// different filenames/extensions for this file, so we probe for all of them.
+var sessionMetaFilenames = []string{
+	"workspace.yaml",
+	"workspace.yml",
+	"workspace.json",
+	"session.yaml",
+	"session.json",
+	"metadata.yaml",
+	"metadata.json",
+}
+
+// sessionMetaFieldAliases maps our sessionMeta fields to the set of key
+// names Copilot CLI has used for them across releases.
+var (
+	sessionMetaIDKeys      = []string{"id", "session_id", "sessionId"}
+	sessionMetaCWDKeys     = []string{"cwd", "workspace", "workspace_path", "workspacePath", "directory", "cwd_path"}
+	sessionMetaGitRootKeys = []string{"git_root", "gitRoot"}
+)
+
+// parseSessionMeta reads a workspace metadata file from a Copilot session directory.
+// It tolerates the metadata file being named/encoded differently across
+// Copilot CLI releases (YAML or JSON, various filenames) and the fields
+// inside it being renamed, by probing a set of known candidates for each.
 func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
-	path := filepath.Join(sessionDir, "workspace.yaml")
-	data, err := os.ReadFile(path)
+	var data []byte
+	var err error
+	for _, name := range sessionMetaFilenames {
+		data, err = os.ReadFile(filepath.Join(sessionDir, name))
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
 
-	var meta sessionMeta
-	if err := yaml.Unmarshal(data, &meta); err != nil {
+	// yaml.v3 parses JSON as well (JSON is a valid subset of YAML), so a
+	// single decode path covers every filename above.
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, err
 	}
 
-	return &meta, nil
+	meta := &sessionMeta{
+		ID:      firstStringField(raw, sessionMetaIDKeys),
+		CWD:     firstStringField(raw, sessionMetaCWDKeys),
+		GitRoot: firstStringField(raw, sessionMetaGitRootKeys),
+	}
+
+	return meta, nil
+}
+
+// firstStringField returns the first non-empty string value found in raw
+// under any of the given keys.
+func firstStringField(raw map[string]interface{}, keys []string) string {
+	for _, k := range keys {
+		if v, ok := raw[k]; ok {
+			if s, ok := v.(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	return ""
 }
 
 // GetTranscriptPath returns the path to the events.jsonl transcript within a session directory.
@@ -81,4 +132,3 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-
