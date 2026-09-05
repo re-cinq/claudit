@@ -1,3 +1,4 @@
+```go
 package opencode
 
 import (
@@ -304,6 +305,123 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}, nil
 }
 
+// sqliteSchema captures the table/column names discoverFromSQLite needs.
+// OpenCode has renamed these across releases (e.g. snake_case vs camelCase,
+// or restructured tables entirely), so we resolve them at runtime instead of
+// hardcoding a single version's names.
+type sqliteSchema struct {
+	sessionTable   string
+	sessionID      string
+	sessionProject string
+	sessionOrder   string
+
+	messageTable   string
+	messageID      string
+	messageSession string
+	messageData    string
+	messageOrder   string
+}
+
+// defaultSQLiteSchema is the last known-good schema (validated against a real
+// running OpenCode v1.1.60 instance). It's used both as the starting point for
+// resolution and as the fallback when introspection turns up nothing better,
+// so behavior is unchanged when the schema hasn't moved.
+func defaultSQLiteSchema() sqliteSchema {
+	return sqliteSchema{
+		sessionTable:   "session",
+		sessionID:      "id",
+		sessionProject: "project_id",
+		sessionOrder:   "time_updated",
+		messageTable:   "message",
+		messageID:      "id",
+		messageSession: "session_id",
+		messageData:    "data",
+		messageOrder:   "time_created",
+	}
+}
+
+// resolveSQLiteSchema inspects the actual table/column names in the OpenCode
+// database and adapts the default schema to match, so column renames between
+// OpenCode versions don't silently break session discovery.
+func resolveSQLiteSchema(dbPath string) sqliteSchema {
+	schema := defaultSQLiteSchema()
+
+	tables := querySQLiteRows(dbPath, `SELECT name FROM sqlite_master WHERE type='table';`)
+	if t := pickTable(tables, "session", "message"); t != "" {
+		schema.sessionTable = t
+	}
+	if t := pickTable(tables, "message", "session"); t != "" {
+		schema.messageTable = t
+	}
+
+	sessionCols := querySQLiteRows(dbPath, fmt.Sprintf(`SELECT name FROM pragma_table_info('%s');`, schema.sessionTable))
+	if len(sessionCols) > 0 {
+		schema.sessionID = pickColumn(sessionCols, schema.sessionID, "id")
+		schema.sessionProject = pickColumn(sessionCols, schema.sessionProject, "project")
+		schema.sessionOrder = pickColumn(sessionCols, schema.sessionOrder, "update", "modif")
+	}
+
+	messageCols := querySQLiteRows(dbPath, fmt.Sprintf(`SELECT name FROM pragma_table_info('%s');`, schema.messageTable))
+	if len(messageCols) > 0 {
+		schema.messageID = pickColumn(messageCols, schema.messageID, "id")
+		schema.messageSession = pickColumn(messageCols, schema.messageSession, "session")
+		schema.messageData = pickColumn(messageCols, schema.messageData, "data", "content", "part", "body")
+		schema.messageOrder = pickColumn(messageCols, schema.messageOrder, "create", "time")
+	}
+
+	return schema
+}
+
+// querySQLiteRows runs a query against the OpenCode database and returns each
+// output line, or nil on any error (schema resolution treats this as "no
+// information available" and falls back to defaults).
+func querySQLiteRows(dbPath, query string) []string {
+	cmd := exec.Command("sqlite3", dbPath, query)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	var rows []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			rows = append(rows, line)
+		}
+	}
+	return rows
+}
+
+// pickTable returns the first table name that contains `prefer` but not
+// `avoid` (case-insensitive), or "" if nothing matches.
+func pickTable(tables []string, prefer, avoid string) string {
+	for _, t := range tables {
+		lower := strings.ToLower(t)
+		if strings.Contains(lower, prefer) && !strings.Contains(lower, avoid) {
+			return t
+		}
+	}
+	return ""
+}
+
+// pickColumn keeps `fallback` if it's still present in cols (verbatim, so an
+// unchanged schema resolves identically to before); otherwise it returns the
+// first column matching one of the given substrings, or `fallback` if none match.
+func pickColumn(cols []string, fallback string, substrings ...string) string {
+	for _, c := range cols {
+		if strings.EqualFold(c, fallback) {
+			return c
+		}
+	}
+	for _, sub := range substrings {
+		for _, c := range cols {
+			if strings.Contains(strings.ToLower(c), sub) {
+				return c
+			}
+		}
+	}
+	return fallback
+}
+
 // discoverFromSQLite queries the OpenCode SQLite database for the most recent session.
 func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionInfo, error) {
 	dbPath := filepath.Join(dataDir, "opencode.db")
@@ -316,10 +434,12 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 		return nil, nil
 	}
 
+	schema := resolveSQLiteSchema(dbPath)
+
 	// Find most recent session for this project
 	sessionQuery := fmt.Sprintf(
-		`SELECT id FROM session WHERE project_id='%s' ORDER BY time_updated DESC LIMIT 1;`,
-		projectID,
+		`SELECT %s FROM %s WHERE %s='%s' ORDER BY %s DESC LIMIT 1;`,
+		schema.sessionID, schema.sessionTable, schema.sessionProject, projectID, schema.sessionOrder,
 	)
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, sessionQuery)
 	sessionOutput, err := cmd.Output()
@@ -330,8 +450,8 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 
 	// Check if this session was recent (within timeout)
 	timeQuery := fmt.Sprintf(
-		`SELECT time_updated FROM session WHERE id='%s';`,
-		sessionID,
+		`SELECT %s FROM %s WHERE %s='%s';`,
+		schema.sessionOrder, schema.sessionTable, schema.sessionID, sessionID,
 	)
 	cmd = exec.Command("sqlite3", dbPath, timeQuery)
 	timeOutput, err := cmd.Output()
@@ -355,8 +475,8 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 
 	// Get messages for this session as a JSON array
 	msgQuery := fmt.Sprintf(
-		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
-		sessionID,
+		`SELECT json_group_array(json_patch(%s, json_object('id', %s))) FROM %s WHERE %s='%s' ORDER BY %s;`,
+		schema.messageData, schema.messageID, schema.messageTable, schema.messageSession, sessionID, schema.messageOrder,
 	)
 	cmd = exec.Command("sqlite3", dbPath, msgQuery)
 	msgOutput, err := cmd.Output()
@@ -454,7 +574,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +616,4 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
+```
