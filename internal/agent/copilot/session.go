@@ -34,6 +34,10 @@ func GetSessionStateDir() (string, error) {
 }
 
 // parseSessionMeta reads a workspace.yaml from a Copilot session directory.
+// Copilot CLI has used slightly different field layouts across releases
+// (flat keys, camelCase keys, or fields nested under a "workspace" key), so
+// this parses into a generic map and checks several known key variants
+// rather than binding to one exact schema.
 func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 	path := filepath.Join(sessionDir, "workspace.yaml")
 	data, err := os.ReadFile(path)
@@ -41,12 +45,41 @@ func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 		return nil, err
 	}
 
-	var meta sessionMeta
-	if err := yaml.Unmarshal(data, &meta); err != nil {
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, err
 	}
 
-	return &meta, nil
+	meta := &sessionMeta{
+		ID:      stringFromKeys(raw, "id", "sessionId", "session_id"),
+		CWD:     stringFromKeys(raw, "cwd", "workingDirectory", "working_dir", "directory"),
+		GitRoot: stringFromKeys(raw, "git_root", "gitRoot"),
+	}
+
+	// Some releases nest workspace fields under a top-level "workspace" key.
+	if meta.CWD == "" || meta.ID == "" {
+		if ws, ok := raw["workspace"].(map[string]interface{}); ok {
+			if meta.CWD == "" {
+				meta.CWD = stringFromKeys(ws, "cwd", "directory", "workingDirectory")
+			}
+			if meta.ID == "" {
+				meta.ID = stringFromKeys(ws, "id", "sessionId", "session_id")
+			}
+		}
+	}
+
+	return meta, nil
+}
+
+// stringFromKeys returns the first non-empty string value found in m for
+// the given keys.
+func stringFromKeys(m map[string]interface{}, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := m[k].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // GetTranscriptPath returns the path to the events.jsonl transcript within a session directory.
@@ -81,4 +114,3 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-

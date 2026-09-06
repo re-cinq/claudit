@@ -230,7 +230,9 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first tries flat file storage (pre-v1.2), then falls back to SQLite
+// (v1.2+), then falls back to a broader recency-based scan of the whole
+// data directory for layouts that don't match either known scheme.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
@@ -241,14 +243,22 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 		return session, nil
 	}
 
-	// Fall back to SQLite (OpenCode v1.2+)
 	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
 
+	// Fall back to SQLite (OpenCode v1.2+)
 	projectID := GetProjectID(projectPath)
-	return discoverFromSQLite(dataDir, projectID, projectPath)
+	if sqliteSession, err := discoverFromSQLite(dataDir, projectID, projectPath); err == nil && sqliteSession != nil {
+		return sqliteSession, nil
+	}
+
+	// Last resort: OpenCode has reorganized its on-disk storage layout
+	// across releases (e.g. adding/removing a project-scoped directory
+	// segment), so scan the whole data directory for the most recently
+	// modified session file instead of relying on one exact path scheme.
+	return discoverFromRecentFile(dataDir, projectPath)
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
@@ -379,6 +389,78 @@ func discoverFromSQLite(dataDir, projectID, projectPath string) (*agent.SessionI
 	}, nil
 }
 
+// discoverFromRecentFile performs a resilient fallback scan across the
+// entire OpenCode data directory for the most recently modified session
+// file, without assuming an exact directory nesting (e.g. whether sessions
+// are scoped under a project-id directory or stored flat). It looks for
+// JSON files inside any directory literally or effectively named "session"
+// (or "sessions"), and derives the sibling message directory from the same
+// parent, since OpenCode has historically kept "session" and "message"
+// storage as siblings under a common directory.
+func discoverFromRecentFile(dataDir, projectPath string) (*agent.SessionInfo, error) {
+	now := time.Now()
+	recentTimeout := agent.RecentSessionTimeout
+
+	var bestPath string
+	var bestModTime time.Time
+
+	_ = filepath.WalkDir(dataDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		parent := filepath.Base(filepath.Dir(path))
+		if parent != "session" && parent != "sessions" {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > recentTimeout {
+			return nil
+		}
+
+		if bestPath != "" && !modTime.After(bestModTime) {
+			return nil
+		}
+
+		bestPath = path
+		bestModTime = modTime
+		return nil
+	})
+
+	if bestPath == "" {
+		return nil, nil
+	}
+
+	sessionID := strings.TrimSuffix(filepath.Base(bestPath), ".json")
+	storageDir := filepath.Dir(filepath.Dir(bestPath)) // parent of the "session"/"sessions" dir
+
+	msgDir := filepath.Join(storageDir, "message", sessionID)
+	if _, err := os.Stat(msgDir); err != nil {
+		if alt := filepath.Join(storageDir, "messages", sessionID); dirExists(alt) {
+			msgDir = alt
+		}
+	}
+
+	return &agent.SessionInfo{
+		SessionID:      sessionID,
+		TranscriptPath: msgDir,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
+}
+
+// dirExists reports whether path exists and is a directory.
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
 // RestoreSession writes a session to OpenCode's storage location.
 func (a *Agent) RestoreSession(projectPath, sessionID, gitBranch string,
 	transcriptData []byte, messageCount int, summary string) error {
@@ -497,4 +579,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-

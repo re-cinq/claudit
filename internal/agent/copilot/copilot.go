@@ -416,9 +416,23 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		return nil, nil
 	}
 
+	if info := scanSessionStateDir(sessionDir, projectPath); info != nil {
+		return info, nil
+	}
+
+	// Fall back to a broader scan of the whole Copilot data directory:
+	// newer Copilot CLI releases have changed the session-state directory
+	// layout and/or metadata schema, so locate the most recently modified
+	// transcript directly instead of relying on one exact known path.
+	return scanCopilotDirForRecentTranscript(projectPath)
+}
+
+// scanSessionStateDir looks for a session directory under sessionDir whose
+// workspace metadata matches projectPath.
+func scanSessionStateDir(sessionDir, projectPath string) *agent.SessionInfo {
 	entries, err := os.ReadDir(sessionDir)
 	if err != nil {
-		return nil, nil
+		return nil
 	}
 
 	now := time.Now()
@@ -449,19 +463,25 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		// Only filter on CWD when we were able to parse one; if the
+		// metadata schema changed and we couldn't determine a CWD, don't
+		// discard the session outright.
+		if meta.CWD != "" && !agent.PathsEqual(meta.CWD, projectPath) {
 			continue
 		}
 
 		if bestDir == "" || modTime.After(bestModTime) {
 			bestDir = entryPath
 			bestSessionID = meta.ID
+			if bestSessionID == "" {
+				bestSessionID = entry.Name()
+			}
 			bestModTime = modTime
 		}
 	}
 
 	if bestDir == "" {
-		return nil, nil
+		return nil
 	}
 
 	return &agent.SessionInfo{
@@ -469,7 +489,58 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		TranscriptPath: GetTranscriptPath(bestDir),
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
-	}, nil
+	}
 }
 
+// scanCopilotDirForRecentTranscript performs a resilient fallback scan
+// across the whole Copilot data directory for the most recently modified
+// transcript file, independent of the expected session-state directory
+// name or workspace metadata schema. This tolerates Copilot CLI releases
+// that restructure their on-disk session layout.
+func scanCopilotDirForRecentTranscript(projectPath string) (*agent.SessionInfo, error) {
+	copilotDir, err := GetCopilotDir()
+	if err != nil {
+		return nil, nil
+	}
 
+	now := time.Now()
+	recentTimeout := agent.RecentSessionTimeout
+	var bestPath string
+	var bestModTime time.Time
+
+	_ = filepath.WalkDir(copilotDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || d.Name() != "events.jsonl" {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > recentTimeout {
+			return nil
+		}
+
+		if bestPath == "" || modTime.After(bestModTime) {
+			bestPath = path
+			bestModTime = modTime
+		}
+		return nil
+	})
+
+	if bestPath == "" {
+		return nil, nil
+	}
+
+	sessionDir := filepath.Dir(bestPath)
+	sessionID := filepath.Base(sessionDir)
+
+	return &agent.SessionInfo{
+		SessionID:      sessionID,
+		TranscriptPath: bestPath,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
+}
