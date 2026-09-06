@@ -227,8 +227,15 @@ func (a *Agent) ParseTranscriptFile(path string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent Copilot CLI session.
+// Copilot CLI persists session state (workspace.yaml, events.jsonl) with a
+// small delay relative to process exit in newer releases, so discovery is
+// polled briefly rather than attempted only once. This matters most for
+// callers like the post-commit git hook, which invoke discovery immediately
+// after the Copilot process has already returned.
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
-	return scanForRecentSession(projectPath)
+	return agent.PollForSession(func() (*agent.SessionInfo, error) {
+		return scanForRecentSession(projectPath)
+	})
 }
 
 // RestoreSession writes a transcript to Copilot CLI's expected location.
@@ -471,5 +478,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-

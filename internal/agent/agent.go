@@ -13,6 +13,36 @@ import (
 // during session discovery across all agents.
 const RecentSessionTimeout = 5 * time.Minute
 
+// sessionPollAttempts and sessionPollInterval bound how long PollForSession
+// retries a discovery function before giving up.
+const (
+	sessionPollAttempts = 6
+	sessionPollInterval = 500 * time.Millisecond
+)
+
+// PollForSession retries a session discovery function a few times with a
+// short delay between attempts. Some agent CLIs persist session state
+// (session files, SQLite rows) slightly asynchronously relative to process
+// exit, so a discovery call made immediately after the CLI process returns
+// (e.g. from a post-commit git hook) can race ahead of that write. Polling
+// briefly makes discovery resilient to that lag without materially slowing
+// down the common case where the session is already on disk.
+func PollForSession(discover func() (*SessionInfo, error)) (*SessionInfo, error) {
+	for attempt := 0; attempt < sessionPollAttempts; attempt++ {
+		session, err := discover()
+		if err != nil {
+			return nil, err
+		}
+		if session != nil {
+			return session, nil
+		}
+		if attempt < sessionPollAttempts-1 {
+			time.Sleep(sessionPollInterval)
+		}
+	}
+	return nil, nil
+}
+
 // IsGitCommitCommand checks whether a shell command string represents a git commit.
 func IsGitCommitCommand(command string) bool {
 	return strings.Contains(command, "git commit") ||
