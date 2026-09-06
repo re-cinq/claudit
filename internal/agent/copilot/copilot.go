@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -202,6 +203,16 @@ type copilotEventData struct {
 	ToolUseID string          `json:"toolUseId,omitempty"`
 	ToolName  string          `json:"toolName,omitempty"`
 	Result    json.RawMessage `json:"result,omitempty"`
+
+	// For session.start events. Some Copilot CLI releases only record the
+	// session id / working directory inline in the transcript rather than in
+	// a separate workspace metadata file, so these are captured as a fallback
+	// for session discovery.
+	ID               string `json:"id,omitempty"`
+	SessionID        string `json:"session_id,omitempty"`
+	CWD              string `json:"cwd,omitempty"`
+	Directory        string `json:"directory,omitempty"`
+	WorkingDirectory string `json:"workingDirectory,omitempty"`
 }
 
 // copilotToolRequest represents a tool request in an assistant message.
@@ -409,14 +420,57 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
-// scanForRecentSession scans Copilot's session state directory for recent session directories.
-func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionStateDir()
+// sessionStartMeta extracts session id / working directory from a
+// session.start event at the head of an events.jsonl transcript. Some
+// Copilot CLI releases only record this metadata inline in the transcript
+// rather than in a separate workspace file, so this is used as a fallback
+// when no workspace metadata file is found (or it lacks a cwd).
+func sessionStartMeta(transcriptPath string) *sessionMeta {
+	f, err := os.Open(transcriptPath)
 	if err != nil {
-		return nil, nil
+		return nil
 	}
+	defer func() { _ = f.Close() }()
 
-	entries, err := os.ReadDir(sessionDir)
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		var event copilotEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			continue
+		}
+		if event.Type != "session.start" {
+			continue
+		}
+
+		meta := &sessionMeta{
+			IDField:         event.Data.ID,
+			SessionIDField:  event.Data.SessionID,
+			CWDField:        event.Data.CWD,
+			DirectoryField:  event.Data.Directory,
+			WorkingDirField: event.Data.WorkingDirectory,
+		}
+		if meta.ID() == "" && meta.CWD() == "" {
+			return nil
+		}
+		return meta
+	}
+	return nil
+}
+
+// scanForRecentSession scans Copilot's known session state directories for
+// recent session directories matching projectPath. Copilot CLI has renamed
+// its session state directory and metadata fields across releases, so every
+// known directory name is scanned and, when the workspace metadata file is
+// missing or incomplete, the transcript's own session.start event is used as
+// a fallback source of the working directory.
+func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
+	stateDirs, err := SessionStateDirs()
 	if err != nil {
 		return nil, nil
 	}
@@ -427,36 +481,59 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-
-		info, err := entry.Info()
+	for _, sessionDir := range stateDirs {
+		entries, err := os.ReadDir(sessionDir)
 		if err != nil {
 			continue
 		}
 
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
 
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
-		}
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
-		}
+			modTime := info.ModTime()
+			if now.Sub(modTime) > recentTimeout {
+				continue
+			}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+			entryPath := filepath.Join(sessionDir, entry.Name())
+
+			cwd := ""
+			sessionID := ""
+			if meta, err := parseSessionMeta(entryPath); err == nil && meta != nil {
+				cwd = meta.CWD()
+				sessionID = meta.ID()
+			}
+
+			if cwd == "" {
+				if meta := sessionStartMeta(GetTranscriptPath(entryPath)); meta != nil {
+					cwd = meta.CWD()
+					if sessionID == "" {
+						sessionID = meta.ID()
+					}
+				}
+			}
+
+			if cwd == "" || !agent.PathsEqual(cwd, projectPath) {
+				continue
+			}
+
+			if sessionID == "" {
+				// The directory name is the session id in every known layout.
+				sessionID = entry.Name()
+			}
+
+			if bestDir == "" || modTime.After(bestModTime) {
+				bestDir = entryPath
+				bestSessionID = sessionID
+				bestModTime = modTime
+			}
 		}
 	}
 
@@ -471,5 +548,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```
