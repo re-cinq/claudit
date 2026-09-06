@@ -410,6 +410,11 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+// It matches sessions to projectPath via workspace.yaml's cwd field when available, but falls
+// back to the most recently modified session directory when no metadata matches (or can't be
+// parsed) — this keeps discovery working even if a newer Copilot CLI version renames or
+// restructures the workspace.yaml schema, since the directory name and its mtime remain
+// reliable signals regardless of the metadata format inside it.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -427,6 +432,10 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestSessionID string
 	var bestModTime time.Time
 
+	var fallbackDir string
+	var fallbackSessionID string
+	var fallbackModTime time.Time
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -442,10 +451,21 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
+
+		// Track the most recently modified session directory regardless of
+		// whether its metadata matches, as a fallback candidate. This covers
+		// newer Copilot CLI versions that change the workspace.yaml schema
+		// (e.g. rename or drop the cwd field) in a way we can't parse.
+		if fallbackDir == "" || modTime.After(fallbackModTime) {
+			fallbackDir = entryPath
+			fallbackSessionID = entry.Name()
+			fallbackModTime = modTime
+		}
+
+		// Check if this session directory has a workspace.yaml matching projectPath.
 		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
+		if err != nil || meta == nil || meta.CWD == "" {
 			continue
 		}
 
@@ -453,11 +473,22 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
+		sessionID := meta.ID
+		if sessionID == "" {
+			sessionID = entry.Name()
+		}
+
 		if bestDir == "" || modTime.After(bestModTime) {
 			bestDir = entryPath
-			bestSessionID = meta.ID
+			bestSessionID = sessionID
 			bestModTime = modTime
 		}
+	}
+
+	if bestDir == "" {
+		bestDir = fallbackDir
+		bestSessionID = fallbackSessionID
+		bestModTime = fallbackModTime
 	}
 
 	if bestDir == "" {
@@ -466,10 +497,44 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	return &agent.SessionInfo{
 		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
+		TranscriptPath: resolveTranscriptPath(bestDir),
 		StartedAt:      bestModTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
 
+// resolveTranscriptPath returns the events.jsonl path within a session directory,
+// falling back to the most recently modified .jsonl file in that directory if
+// events.jsonl doesn't exist (in case a newer Copilot CLI version renames it).
+func resolveTranscriptPath(sessionDir string) string {
+	primary := GetTranscriptPath(sessionDir)
+	if _, err := os.Stat(primary); err == nil {
+		return primary
+	}
 
+	entries, err := os.ReadDir(sessionDir)
+	if err != nil {
+		return primary
+	}
+
+	var best string
+	var bestModTime time.Time
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if best == "" || info.ModTime().After(bestModTime) {
+			best = filepath.Join(sessionDir, entry.Name())
+			bestModTime = info.ModTime()
+		}
+	}
+
+	if best != "" {
+		return best
+	}
+	return primary
+}

@@ -252,41 +252,95 @@ func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) 
 }
 
 // discoverFromFlatFiles tries the legacy flat file session discovery.
+// It scans every project subdirectory under storage/session (not just the one
+// computed by GetProjectID) and matches by each session file's own "directory"
+// field when the directory name doesn't match our computed project ID. This
+// keeps discovery working even if a newer OpenCode CLI version computes
+// project IDs differently than GetProjectID assumes. Falls back to the most
+// recently modified session across all projects if nothing matches by ID or
+// by content.
 func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, error) {
-	sessionDir, err := GetSessionDir(projectPath)
+	dataDir, err := GetDataDir()
 	if err != nil {
 		return nil, nil
 	}
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
 
-	dirEntries, err := os.ReadDir(sessionDir)
+	projectDirs, err := os.ReadDir(sessionRoot)
 	if err != nil {
 		return nil, nil
 	}
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
+	expectedProjectID := GetProjectID(projectPath)
+
 	var bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range dirEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+	var fallbackSessionID string
+	var fallbackModTime time.Time
+	var fallbackSet bool
+
+	for _, pd := range projectDirs {
+		if !pd.IsDir() {
 			continue
 		}
-
-		info, err := entry.Info()
+		projectDirPath := filepath.Join(sessionRoot, pd.Name())
+		fileEntries, err := os.ReadDir(projectDirPath)
 		if err != nil {
 			continue
 		}
 
-		modTime := info.ModTime()
-		if now.Sub(modTime) > recentTimeout {
-			continue
-		}
+		for _, fe := range fileEntries {
+			if fe.IsDir() || !strings.HasSuffix(fe.Name(), ".json") {
+				continue
+			}
 
-		if bestSessionID == "" || modTime.After(bestModTime) {
-			bestSessionID = strings.TrimSuffix(entry.Name(), ".json")
-			bestModTime = modTime
+			info, err := fe.Info()
+			if err != nil {
+				continue
+			}
+
+			modTime := info.ModTime()
+			if now.Sub(modTime) > recentTimeout {
+				continue
+			}
+
+			sessionID := strings.TrimSuffix(fe.Name(), ".json")
+
+			// Track the most recently modified session across all projects as
+			// a last-resort fallback candidate.
+			if !fallbackSet || modTime.After(fallbackModTime) {
+				fallbackSessionID = sessionID
+				fallbackModTime = modTime
+				fallbackSet = true
+			}
+
+			// Fast path: the project directory name matches our computed ID.
+			isMatch := pd.Name() == expectedProjectID
+			if !isMatch {
+				// Fall back to reading the session file's own "directory" field,
+				// in case OpenCode's project ID algorithm differs from ours.
+				data, err := os.ReadFile(filepath.Join(projectDirPath, fe.Name()))
+				if err == nil {
+					var meta sessionInfo
+					if json.Unmarshal(data, &meta) == nil && meta.Directory != "" {
+						isMatch = agent.PathsEqual(meta.Directory, projectPath)
+					}
+				}
+			}
+
+			if isMatch && (bestSessionID == "" || modTime.After(bestModTime)) {
+				bestSessionID = sessionID
+				bestModTime = modTime
+			}
 		}
+	}
+
+	if bestSessionID == "" {
+		bestSessionID = fallbackSessionID
+		bestModTime = fallbackModTime
 	}
 
 	if bestSessionID == "" {
@@ -497,4 +551,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
