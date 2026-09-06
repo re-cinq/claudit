@@ -1,3 +1,4 @@
+<complete corrected file content>
 package copilot
 
 import (
@@ -410,6 +411,13 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// Session metadata (workspace.yaml) is treated as a best-effort hint rather than a hard
+// requirement: newer Copilot CLI releases have been observed to change or omit the metadata
+// file's cwd field, so a session whose metadata can't be parsed or doesn't carry a usable cwd
+// is still considered a candidate (identified by its directory name) rather than discarded
+// outright. Sessions with an explicit, mismatching cwd are still excluded, to avoid picking up
+// an unrelated project's session when metadata is available and reliable.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -426,6 +434,7 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestDir string
 	var bestSessionID string
 	var bestModTime time.Time
+	var bestConfirmed bool
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -442,21 +451,40 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
+
+		// A session directory is only a real candidate if it has a transcript to read,
+		// regardless of whether its metadata file could be parsed.
+		if _, err := os.Stat(GetTranscriptPath(entryPath)); err != nil {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
+		sessionID := entry.Name()
+		confirmed := false
+
+		if meta, metaErr := parseSessionMeta(entryPath); metaErr == nil && meta != nil {
+			if meta.ID != "" {
+				sessionID = meta.ID
+			}
+			if meta.CWD != "" {
+				// Metadata explicitly names a cwd: only accept an exact match so we
+				// don't pick up an unrelated project's session.
+				if !agent.PathsEqual(meta.CWD, projectPath) {
+					continue
+				}
+				confirmed = true
+			}
 		}
 
-		if bestDir == "" || modTime.After(bestModTime) {
+		better := bestDir == "" ||
+			(confirmed && !bestConfirmed) ||
+			(confirmed == bestConfirmed && modTime.After(bestModTime))
+
+		if better {
 			bestDir = entryPath
-			bestSessionID = meta.ID
+			bestSessionID = sessionID
 			bestModTime = modTime
+			bestConfirmed = confirmed
 		}
 	}
 
@@ -471,5 +499,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+</complete>
