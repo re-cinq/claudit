@@ -409,7 +409,27 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 	return ""
 }
 
+// copilotSessionCandidate is a recent session directory considered during discovery.
+type copilotSessionCandidate struct {
+	dir       string
+	sessionID string
+	modTime   time.Time
+	hasCWD    bool
+	cwdMatch  bool
+}
+
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// Copilot CLI has changed its per-session metadata format across versions, so this
+// deliberately doesn't require the metadata file to exist or to contain a "cwd" field:
+//   - The session directory name is treated as the session ID (matching WriteSessionFile),
+//     with metadata able to override it when present.
+//   - If at least one candidate session reports a usable cwd, we still require an exact
+//     cwd match, to correctly disambiguate between concurrent sessions for different
+//     projects.
+//   - If none of the recent candidates can report a cwd at all (e.g. the metadata field
+//     was renamed or the file itself was renamed/removed), we fall back to the most
+//     recently active session rather than failing discovery entirely.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -423,9 +443,8 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
+
+	var candidates []copilotSessionCandidate
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -437,39 +456,72 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
+		entryPath := filepath.Join(sessionDir, entry.Name())
 		modTime := info.ModTime()
+
+		// The transcript file may have been written after the directory itself,
+		// so use whichever is more recent to decide if this session is "active".
+		if tInfo, err := os.Stat(findTranscriptFile(entryPath)); err == nil && tInfo.ModTime().After(modTime) {
+			modTime = tInfo.ModTime()
+		}
+
 		if now.Sub(modTime) > recentTimeout {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
-			continue
+		sessionID := entry.Name()
+		hasCWD := false
+		cwdMatch := false
+		if meta, err := parseSessionMeta(entryPath); err == nil && meta != nil {
+			if meta.ID != "" {
+				sessionID = meta.ID
+			}
+			if meta.CWD != "" {
+				hasCWD = true
+				cwdMatch = agent.PathsEqual(meta.CWD, projectPath)
+			}
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
-		}
+		candidates = append(candidates, copilotSessionCandidate{
+			dir:       entryPath,
+			sessionID: sessionID,
+			modTime:   modTime,
+			hasCWD:    hasCWD,
+			cwdMatch:  cwdMatch,
+		})
+	}
 
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	anyHasCWD := false
+	for _, c := range candidates {
+		if c.hasCWD {
+			anyHasCWD = true
+			break
 		}
 	}
 
-	if bestDir == "" {
+	var best *copilotSessionCandidate
+	for i := range candidates {
+		c := &candidates[i]
+		if anyHasCWD && !c.cwdMatch {
+			continue
+		}
+		if best == nil || c.modTime.After(best.modTime) {
+			best = c
+		}
+	}
+
+	if best == nil {
 		return nil, nil
 	}
 
 	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
+		SessionID:      best.sessionID,
+		TranscriptPath: findTranscriptFile(best.dir),
+		StartedAt:      best.modTime.Format(time.RFC3339),
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
