@@ -230,10 +230,26 @@ func (a *Agent) parseMessageDir(dir string) (*agent.Transcript, error) {
 }
 
 // DiscoverSession finds an active or recent OpenCode session.
-// It first tries flat file storage (pre-v1.2), then falls back to SQLite (v1.2+).
+// It first tries flat file storage keyed by our computed project ID
+// (pre-v1.2), then falls back to a broad scan matching on the session
+// file's embedded "directory" field (handles OpenCode versions that key
+// project directories differently than our GetProjectID assumes), and
+// finally falls back to SQLite (v1.2+).
 func (a *Agent) DiscoverSession(projectPath string) (*agent.SessionInfo, error) {
 	// Try flat file storage first (pre-v1.2 OpenCode)
 	session, err := a.discoverFromFlatFiles(projectPath)
+	if err != nil {
+		return nil, err
+	}
+	if session != nil {
+		return session, nil
+	}
+
+	// Broad fallback: scan all session files under storage/session
+	// (whether nested under a project-ID directory or stored flat) and
+	// match by the "directory" field embedded in the file itself, rather
+	// than relying on our own project-ID scheme matching the CLI's.
+	session, err = scanAllSessionDirs(projectPath)
 	if err != nil {
 		return nil, err
 	}
@@ -294,6 +310,101 @@ func (a *Agent) discoverFromFlatFiles(projectPath string) (*agent.SessionInfo, e
 	}
 
 	// The transcript path for OpenCode is the message directory
+	msgDir, _ := GetMessageDir(bestSessionID)
+
+	return &agent.SessionInfo{
+		SessionID:      bestSessionID,
+		TranscriptPath: msgDir,
+		StartedAt:      bestModTime.Format(time.RFC3339),
+		ProjectPath:    projectPath,
+	}, nil
+}
+
+// scanAllSessionDirs scans every session file under storage/session,
+// whether it lives directly in that directory (flat layout) or nested one
+// level under a project-ID subdirectory (as discoverFromFlatFiles assumes),
+// and matches by the "directory" field recorded inside the file. This is
+// more resilient than discoverFromFlatFiles to OpenCode versions that
+// changed how project directories are keyed on disk, since it matches on
+// the actual working directory the CLI recorded rather than an ID we
+// compute ourselves.
+func scanAllSessionDirs(projectPath string) (*agent.SessionInfo, error) {
+	dataDir, err := GetDataDir()
+	if err != nil {
+		return nil, nil
+	}
+
+	sessionRoot := filepath.Join(dataDir, "storage", "session")
+	rootEntries, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		return nil, nil
+	}
+
+	now := time.Now()
+	var bestSessionID string
+	var bestModTime time.Time
+
+	considerFile := func(dir string, f os.DirEntry) {
+		if f.IsDir() || !strings.HasSuffix(f.Name(), ".json") {
+			return
+		}
+
+		info, err := f.Info()
+		if err != nil {
+			return
+		}
+
+		modTime := info.ModTime()
+		if now.Sub(modTime) > agent.RecentSessionTimeout {
+			return
+		}
+
+		data, err := os.ReadFile(filepath.Join(dir, f.Name()))
+		if err != nil {
+			return
+		}
+
+		var s sessionInfo
+		if err := json.Unmarshal(data, &s); err != nil {
+			return
+		}
+
+		if s.Directory == "" || !agent.PathsEqual(s.Directory, projectPath) {
+			return
+		}
+
+		if bestSessionID == "" || modTime.After(bestModTime) {
+			sessionID := strings.TrimSuffix(f.Name(), ".json")
+			if s.ID != "" {
+				sessionID = s.ID
+			}
+			bestSessionID = sessionID
+			bestModTime = modTime
+		}
+	}
+
+	for _, entry := range rootEntries {
+		if !entry.IsDir() {
+			// Flat layout: session files live directly under storage/session/.
+			considerFile(sessionRoot, entry)
+			continue
+		}
+
+		// Nested layout: session files live under storage/session/<projectID>/.
+		nestedDir := filepath.Join(sessionRoot, entry.Name())
+		nestedEntries, err := os.ReadDir(nestedDir)
+		if err != nil {
+			continue
+		}
+		for _, f := range nestedEntries {
+			considerFile(nestedDir, f)
+		}
+	}
+
+	if bestSessionID == "" {
+		return nil, nil
+	}
+
 	msgDir, _ := GetMessageDir(bestSessionID)
 
 	return &agent.SessionInfo{
@@ -497,4 +608,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
