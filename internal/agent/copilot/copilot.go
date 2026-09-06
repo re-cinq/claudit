@@ -410,6 +410,9 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+// The session ID and working directory are normally read from workspace.yaml, but some Copilot
+// CLI versions don't write that file (or omit the cwd field), so this also falls back to
+// deriving the session ID from the directory name and the cwd from the transcript's own events.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -423,9 +426,9 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 
 	now := time.Now()
 	recentTimeout := agent.RecentSessionTimeout
-	var bestDir string
-	var bestSessionID string
-	var bestModTime time.Time
+
+	var bestMatch, bestUnknown *agent.SessionInfo
+	var bestMatchTime, bestUnknownTime time.Time
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -442,34 +445,93 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		// Check if this session directory has a workspace.yaml
 		entryPath := filepath.Join(sessionDir, entry.Name())
-		meta, err := parseSessionMeta(entryPath)
-		if err != nil || meta == nil {
+		transcriptPath := GetTranscriptPath(entryPath)
+
+		// workspace.yaml is written by some Copilot CLI versions with session
+		// metadata (id, cwd). Newer versions may omit the file or the cwd field,
+		// so fall back to the directory name for the session ID and to the
+		// transcript's own events for the working directory.
+		sessionID := entry.Name()
+		cwd := ""
+		if meta, err := parseSessionMeta(entryPath); err == nil && meta != nil {
+			if meta.ID != "" {
+				sessionID = meta.ID
+			}
+			cwd = meta.CWD
+		}
+		if cwd == "" {
+			cwd = cwdFromTranscript(transcriptPath)
+		}
+
+		candidate := &agent.SessionInfo{
+			SessionID:      sessionID,
+			TranscriptPath: transcriptPath,
+			StartedAt:      modTime.Format(time.RFC3339),
+			ProjectPath:    projectPath,
+		}
+
+		if cwd != "" {
+			if !agent.PathsEqual(cwd, projectPath) {
+				continue
+			}
+			if bestMatch == nil || modTime.After(bestMatchTime) {
+				bestMatch = candidate
+				bestMatchTime = modTime
+			}
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
-		}
-
-		if bestDir == "" || modTime.After(bestModTime) {
-			bestDir = entryPath
-			bestSessionID = meta.ID
-			bestModTime = modTime
+		// No cwd information could be determined for this session; keep it as a
+		// lower-confidence fallback rather than excluding it outright.
+		if bestUnknown == nil || modTime.After(bestUnknownTime) {
+			bestUnknown = candidate
+			bestUnknownTime = modTime
 		}
 	}
 
-	if bestDir == "" {
-		return nil, nil
+	if bestMatch != nil {
+		return bestMatch, nil
 	}
-
-	return &agent.SessionInfo{
-		SessionID:      bestSessionID,
-		TranscriptPath: GetTranscriptPath(bestDir),
-		StartedAt:      bestModTime.Format(time.RFC3339),
-		ProjectPath:    projectPath,
-	}, nil
+	return bestUnknown, nil
 }
 
+// cwdFromTranscript recovers the working directory a Copilot session was started in
+// by scanning its transcript events. Used as a fallback when workspace.yaml is missing
+// or has no cwd field. Checks both a top-level "cwd" field (matching the postToolUse
+// hook payload shape) and a nested "data.cwd" field.
+func cwdFromTranscript(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = f.Close() }()
 
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		var evt struct {
+			Cwd  string `json:"cwd"`
+			Data struct {
+				Cwd string `json:"cwd"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal([]byte(line), &evt); err != nil {
+			continue
+		}
+		if evt.Cwd != "" {
+			return evt.Cwd
+		}
+		if evt.Data.Cwd != "" {
+			return evt.Data.Cwd
+		}
+	}
+
+	return ""
+}
