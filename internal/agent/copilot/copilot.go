@@ -20,7 +20,7 @@ func init() {
 // Agent implements the agent.Agent interface for GitHub Copilot CLI.
 type Agent struct{}
 
-func (a *Agent) Name() agent.Name   { return agent.Copilot }
+func (a *Agent) Name() agent.Name    { return agent.Copilot }
 func (a *Agent) DisplayName() string { return "Copilot CLI" }
 
 // ConfigureHooks sets up Copilot CLI hooks in .github/hooks/shiftlog.json.
@@ -119,10 +119,10 @@ func (a *Agent) DiagnoseHooks(repoRoot string) []agent.DiagnosticCheck {
 func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 	var hook struct {
 		// Generic format fields
-		SessionID      string `json:"session_id"`
-		TranscriptPath string `json:"transcript_path"`
+		SessionID       string `json:"session_id"`
+		TranscriptPath  string `json:"transcript_path"`
 		GenericToolName string `json:"tool_name"`
-		ToolInput      struct {
+		ToolInput       struct {
 			Command string `json:"command"`
 		} `json:"tool_input"`
 
@@ -410,13 +410,11 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+// It walks recursively rather than assuming session directories sit directly under
+// the session-state root, since newer Copilot CLI releases have changed how deeply
+// session directories are nested (e.g. grouping by workspace) without notice.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
-	if err != nil {
-		return nil, nil
-	}
-
-	entries, err := os.ReadDir(sessionDir)
 	if err != nil {
 		return nil, nil
 	}
@@ -427,30 +425,27 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestSessionID string
 	var bestModTime time.Time
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
+	_ = filepath.Walk(sessionDir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info.IsDir() || info.Name() != "workspace.yaml" {
+			return nil
 		}
 
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
+		// Use the workspace.yaml file's own mtime rather than its parent
+		// directory's mtime: the directory may have been created once and
+		// never touched again while the file itself keeps getting updated.
 		modTime := info.ModTime()
 		if now.Sub(modTime) > recentTimeout {
-			continue
+			return nil
 		}
 
-		// Check if this session directory has a workspace.yaml
-		entryPath := filepath.Join(sessionDir, entry.Name())
+		entryPath := filepath.Dir(path)
 		meta, err := parseSessionMeta(entryPath)
 		if err != nil || meta == nil {
-			continue
+			return nil
 		}
 
 		if !agent.PathsEqual(meta.CWD, projectPath) {
-			continue
+			return nil
 		}
 
 		if bestDir == "" || modTime.After(bestModTime) {
@@ -458,7 +453,8 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			bestSessionID = meta.ID
 			bestModTime = modTime
 		}
-	}
+		return nil
+	})
 
 	if bestDir == "" {
 		return nil, nil
@@ -471,5 +467,3 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
