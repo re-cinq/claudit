@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -410,6 +411,14 @@ func extractCommand(toolName string, toolArgs json.RawMessage) string {
 }
 
 // scanForRecentSession scans Copilot's session state directory for recent session directories.
+//
+// Copilot CLI has, across versions, renamed or dropped the fields used to
+// record a session's working directory in workspace.yaml (see
+// parseSessionMeta). To stay robust to that drift, sessions whose working
+// directory is known are matched exactly against projectPath; sessions
+// where the working directory can't be determined at all are still
+// considered, but only used if no exact match exists, preferring the most
+// recently active one.
 func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	sessionDir, err := GetSessionStateDir()
 	if err != nil {
@@ -426,6 +435,7 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 	var bestDir string
 	var bestSessionID string
 	var bestModTime time.Time
+	var bestIsExactMatch bool
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -449,14 +459,26 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 			continue
 		}
 
-		if !agent.PathsEqual(meta.CWD, projectPath) {
+		exactMatch := (meta.CWD != "" && agent.PathsEqual(meta.CWD, projectPath)) ||
+			(meta.GitRoot != "" && agent.PathsEqual(meta.GitRoot, projectPath))
+
+		// If we can positively identify this session as belonging to a
+		// different project, skip it to avoid attaching the wrong
+		// conversation to a commit.
+		knowsLocation := meta.CWD != "" || meta.GitRoot != ""
+		if knowsLocation && !exactMatch {
 			continue
 		}
 
-		if bestDir == "" || modTime.After(bestModTime) {
+		better := bestDir == "" ||
+			(exactMatch && !bestIsExactMatch) ||
+			(exactMatch == bestIsExactMatch && modTime.After(bestModTime))
+
+		if better {
 			bestDir = entryPath
 			bestSessionID = meta.ID
 			bestModTime = modTime
+			bestIsExactMatch = exactMatch
 		}
 	}
 
@@ -471,5 +493,4 @@ func scanForRecentSession(projectPath string) (*agent.SessionInfo, error) {
 		ProjectPath:    projectPath,
 	}, nil
 }
-
-
+```

@@ -1,3 +1,4 @@
+```go
 package copilot
 
 import (
@@ -14,6 +15,18 @@ type sessionMeta struct {
 	CWD     string `yaml:"cwd"`
 	GitRoot string `yaml:"git_root,omitempty"`
 }
+
+// sessionIDKeys lists known/possible YAML keys used across Copilot CLI
+// versions to identify a session. Newer releases have been observed to
+// rename these fields, so we try several candidates in priority order.
+var sessionIDKeys = []string{"id", "session_id", "sessionId", "sessionID"}
+
+// sessionCWDKeys lists known/possible YAML keys used across Copilot CLI
+// versions to record the working directory a session was started in.
+var sessionCWDKeys = []string{"cwd", "cwd_path", "workingDirectory", "working_directory", "directory", "workspaceFolder", "workspace_folder"}
+
+// sessionGitRootKeys lists known/possible YAML keys for the git repo root.
+var sessionGitRootKeys = []string{"git_root", "gitRoot"}
 
 // GetCopilotDir returns the path to Copilot's config/data directory.
 func GetCopilotDir() (string, error) {
@@ -34,6 +47,11 @@ func GetSessionStateDir() (string, error) {
 }
 
 // parseSessionMeta reads a workspace.yaml from a Copilot session directory.
+//
+// Copilot CLI has renamed fields in workspace.yaml across versions. To stay
+// compatible, this parses the document generically and looks up known
+// aliases for the session ID, working directory, and git root instead of
+// relying on a single fixed key.
 func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 	path := filepath.Join(sessionDir, "workspace.yaml")
 	data, err := os.ReadFile(path)
@@ -41,12 +59,27 @@ func parseSessionMeta(sessionDir string) (*sessionMeta, error) {
 		return nil, err
 	}
 
-	var meta sessionMeta
-	if err := yaml.Unmarshal(data, &meta); err != nil {
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, err
 	}
 
-	return &meta, nil
+	return &sessionMeta{
+		ID:      firstStringValue(raw, sessionIDKeys),
+		CWD:     firstStringValue(raw, sessionCWDKeys),
+		GitRoot: firstStringValue(raw, sessionGitRootKeys),
+	}, nil
+}
+
+// firstStringValue returns the first non-empty string value found in raw
+// under any of the given keys.
+func firstStringValue(raw map[string]interface{}, keys []string) string {
+	for _, key := range keys {
+		if v, ok := raw[key].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // GetTranscriptPath returns the path to the events.jsonl transcript within a session directory.
@@ -81,4 +114,4 @@ func WriteSessionFile(sessionID string, data []byte) (string, error) {
 	eventsPath := GetTranscriptPath(sessionDir)
 	return eventsPath, os.WriteFile(eventsPath, data, 0600)
 }
-
+```
